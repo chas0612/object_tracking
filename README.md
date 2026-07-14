@@ -2,6 +2,11 @@
 
 Autonomous dexterous manipulation pipeline: perception, planning, and execution.
 
+For the reproducible offline capture pipeline (undistort → SAM3 → FoundPose →
+GoTrack), see [the dedicated setup manual](docs/offline_capture_pipeline_setup.md).
+The older component setup notes below cover broader/legacy paths and are not the
+installation source of truth for that pipeline.
+
 ## Project Structure
 
 ```

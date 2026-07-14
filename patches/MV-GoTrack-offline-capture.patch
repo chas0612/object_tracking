@@ -1,0 +1,387 @@
+diff --git a/archive/run_multiview_gotrack_anchor_online_multi_object.py b/archive/run_multiview_gotrack_anchor_online_multi_object.py
+index 3fffebf..0f6b8c8 100644
+--- a/archive/run_multiview_gotrack_anchor_online_multi_object.py
++++ b/archive/run_multiview_gotrack_anchor_online_multi_object.py
+@@ -475,6 +475,17 @@ def parse_args() -> argparse.Namespace:
+         default=["0"] if torch.cuda.is_available() else ["cpu"],
+     )
+     parser.add_argument("--camera-ids", type=str, nargs="*", default=None)
++    parser.add_argument(
++        "--camera-micro-batch-size",
++        type=int,
++        default=0,
++        help=(
++            "Maximum number of camera views per GPU refinement call. "
++            "0 keeps the legacy all-views-per-device batch. Positive values "
++            "process view chunks sequentially with the same frame initial pose, "
++            "then merge all view observations for one triangulation/pose fit."
++        ),
++    )
+     parser.add_argument("--object-names", type=str, nargs="+", required=True)
+     parser.add_argument("--object-ids", type=int, nargs="+", required=True)
+     parser.add_argument("--mesh-paths", type=str, nargs="+", required=True)
+@@ -1703,13 +1714,36 @@ def _run_workers_for_timestep_anchor_multi(
+     include_debug_images: bool,
+     worker_mode: str,
+ ) -> dict[str, dict[str, dict[str, Any]]]:
+-    per_object_records: dict[str, dict[str, dict[str, Any]]] = {
+-        object_state.object_name: {} for object_state in active_objects
+-    }
+-    if worker_mode == "serial" or len(device_states) <= 1:
+-        for device_state in device_states:
+-            device_results = _process_group_for_timestep_anchor_multi(
+-                device_state=device_state,
++    def process_device_camera_chunks(
++        device_state: DeviceState,
++    ) -> dict[str, dict[str, dict[str, Any]]]:
++        """Run one device's camera views in sequential GPU micro-batches.
++
++        Every chunk receives the identical ``init_pose_world_by_object`` for
++        this timestep.  The caller merges their per-camera outputs before
++        constructing anchor observations, so triangulation and rigid fitting
++        still use all selected views exactly once.
++        """
++        results_for_device: dict[str, dict[str, dict[str, Any]]] = {
++            object_state.object_name: {} for object_state in active_objects
++        }
++        requested_size = int(getattr(args, "camera_micro_batch_size", 0))
++        camera_ids = list(device_state.camera_ids)
++        chunk_size = len(camera_ids) if requested_size <= 0 else requested_size
++        for start in range(0, len(camera_ids), chunk_size):
++            chunk_ids = camera_ids[start:start + chunk_size]
++            # A lightweight state shares the loaded model/GPU with the parent
++            # state, while limiting only the per-call camera list.  Do not
++            # carry pose/template batch caches across chunks: they are keyed
++            # by the full sample set and can retain sizeable frame tensors.
++            chunk_state = DeviceState(
++                device=device_state.device,
++                device_name=device_state.device_name,
++                model=device_state.model,
++                camera_ids=chunk_ids,
++            )
++            chunk_results = _process_group_for_timestep_anchor_multi(
++                device_state=chunk_state,
+                 active_objects=active_objects,
+                 frame_batch=frame_batch,
+                 extrinsics_map=extrinsics_map,
+@@ -1718,6 +1752,16 @@ def _run_workers_for_timestep_anchor_multi(
+                 args=args,
+                 include_debug_images=include_debug_images,
+             )
++            for object_name, camera_records in chunk_results.items():
++                results_for_device[object_name].update(camera_records)
++        return results_for_device
++
++    per_object_records: dict[str, dict[str, dict[str, Any]]] = {
++        object_state.object_name: {} for object_state in active_objects
++    }
++    if worker_mode == "serial" or len(device_states) <= 1:
++        for device_state in device_states:
++            device_results = process_device_camera_chunks(device_state)
+             for object_name, camera_records in device_results.items():
+                 per_object_records[object_name].update(camera_records)
+         return per_object_records
+@@ -1725,15 +1769,7 @@ def _run_workers_for_timestep_anchor_multi(
+     executor = _get_stage_c_device_thread_pool(len(device_states))
+     futures = [
+         executor.submit(
+-            _process_group_for_timestep_anchor_multi,
+-            device_state=device_state,
+-            active_objects=active_objects,
+-            frame_batch=frame_batch,
+-            extrinsics_map=extrinsics_map,
+-            init_pose_world_by_object=init_pose_world_by_object,
+-            init_pose_source_by_object=init_pose_source_by_object,
+-            args=args,
+-            include_debug_images=include_debug_images,
++            process_device_camera_chunks, device_state,
+         )
+         for device_state in device_states
+     ]
+@@ -1841,6 +1877,7 @@ def _write_object_outputs(
+         "mesh_path": str(object_state.mesh_path),
+         "mesh_scale": float(args.mesh_scale),
+         "input_resize_scale": float(args.input_resize_scale),
++        "camera_micro_batch_size": int(args.camera_micro_batch_size),
+         "unit_scale_mode": str(args.unit_scale_mode),
+         "resolved_mesh_scale": float(object_state.unit_scale_info.resolved_mesh_scale),
+         "translation_scale_to_gotrack": float(
+@@ -1991,6 +2028,8 @@ def _write_object_outputs(
+ 
+ def main() -> None:
+     args = parse_args()
++    if int(args.camera_micro_batch_size) < 0:
++        raise ValueError("--camera-micro-batch-size must be >= 0")
+     args.tensorrt_backend = _canonical_tensorrt_backend(args.tensorrt_backend)
+     _validate_object_arguments(args)
+     run_start_time = time.perf_counter()
+@@ -2010,7 +2049,8 @@ def main() -> None:
+         raise ValueError("No cameras matched the requested inputs.")
+     _status_print(
+         "[gotrack_multiview_anchor_online_multi_object] discovered cameras="
+-        f"{camera_ids} requested_devices={args.gpus}"
++        f"{camera_ids} requested_devices={args.gpus} "
++        f"camera_micro_batch_size={args.camera_micro_batch_size}"
+     )
+ 
+     captures = _open_captures(
+@@ -2761,6 +2801,7 @@ def main() -> None:
+         "triangulation_worker_mode_resolved": str(triangulation_worker_mode),
+         "devices": [state.device_name for state in device_states],
+         "camera_groups": {state.device_name: state.camera_ids for state in device_states},
++        "camera_micro_batch_size": int(args.camera_micro_batch_size),
+         "template_renderer_backend_requested": str(args.template_renderer_backend),
+         "forward_precision": str(args.forward_precision),
+         "tensorrt_compute_flow": bool(args.tensorrt_compute_flow),
+diff --git a/utils/renderer_nvdiffrast.py b/utils/renderer_nvdiffrast.py
+index 44a2a4e..27a6e98 100644
+--- a/utils/renderer_nvdiffrast.py
++++ b/utils/renderer_nvdiffrast.py
+@@ -3,7 +3,7 @@
+ 
+ # pyre-strict
+ 
+-"""nvdiffrast-based renderer with a safe pyrender fallback."""
++"""CUDA nvdiffrast renderer used by the offline FoundPose/GoTrack pipeline."""
+ 
+ from __future__ import annotations
+ 
+@@ -15,7 +15,7 @@ import torch
+ import trimesh
+ from PIL import Image
+ 
+-from utils import logging, renderer as pyrender_renderer
++from utils import logging
+ from utils import renderer_base, structs, torch_helpers, transform3d
+ 
+ logger = logging.get_logger(__name__)
+@@ -25,26 +25,6 @@ _DEFAULT_BASE_COLOR = (0.7, 0.7, 0.7)
+ 
+ 
+ class NvdiffrastRasterizer(renderer_base.RendererBase):
+-    def _install_pyrender_fallback(
+-        self,
+-        model_path: Optional[str],
+-        kwargs: Dict[str, Any],
+-    ) -> None:
+-        """Initialize the pyrender delegate used when nvdiffrast is unavailable.
+-
+-        Callers that support both renderer backends pre-register meter-scale
+-        GSO meshes through ``renderer.object_meshes`` before calling
+-        ``add_object_model``.  Keep renderer caches shared with the delegate so
+-        fallback rendering observes those preloaded meshes instead of attempting
+-        a second lazy load with no ``model_path`` configured.
+-        """
+-        self._delegate = pyrender_renderer.PyrenderRasterizer(
+-            model_path=model_path,
+-            **kwargs,
+-        )
+-        self._delegate.object_meshes = self.object_meshes
+-        self.object_scenes = self._delegate.object_scenes
+-
+     def __init__(
+         self,
+         model_path: Optional[str] = None,
+@@ -64,7 +44,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         # does not spend minutes or tens of GB on a single material image.
+         self.max_texture_size = int(kwargs.pop("max_texture_size", 512) or 0)
+         self.backend_name = "nvdiffrast_cuda"
+-        self.is_fallback = False
+         self.object_meshes: Dict[int, trimesh.Trimesh] = {}
+         self._mesh_cache: Dict[int, Dict[str, torch.Tensor]] = {}
+         self._contexts: Dict[int, Any] = {}
+@@ -74,29 +53,17 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         )
+         self.device = requested_device
+ 
+-        try:
+-            import nvdiffrast.torch as dr  # type: ignore
+-
+-            self._dr = dr
+-        except Exception:
+-            logger.warning(
+-                "nvdiffrast is not available; falling back to PyrenderRasterizer."
+-            )
+-            self.backend_name = "nvdiffrast_unavailable_pyrender_fallback"
+-            self.is_fallback = True
+-            self._install_pyrender_fallback(model_path, kwargs)
+-            return
+-
+         if requested_device.type != "cuda" or not torch.cuda.is_available():
+-            logger.warning(
+-                "nvdiffrast requires CUDA; falling back to PyrenderRasterizer."
++            raise RuntimeError(
++                "NvdiffrastRasterizer requires CUDA; got "
++                f"requested_device={requested_device}, cuda_available={torch.cuda.is_available()}."
+             )
+-            self.backend_name = "nvdiffrast_cpu_requested_pyrender_fallback"
+-            self.is_fallback = True
+-            self._install_pyrender_fallback(model_path, kwargs)
+-            return
+ 
+-        self._delegate = None
++        try:
++            import nvdiffrast.torch as dr  # type: ignore
++        except Exception as exc:
++            raise RuntimeError("NvdiffrastRasterizer requires importable nvdiffrast.") from exc
++        self._dr = dr
+         self.device = torch.device(
+             "cuda",
+             requested_device.index
+@@ -140,11 +107,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+             return np.asarray(self._resize_pil_texture_if_needed(material_image))
+         return self._resize_texture_array_if_needed(np.asarray(material_image))
+ 
+-    def __getattr__(self, name: str) -> Any:
+-        if self.is_fallback:
+-            return getattr(self._delegate, name)
+-        raise AttributeError(name)
+-
+     def _get_context(self) -> Any:
+         device_index = int(
+             self.device.index if self.device.index is not None else torch.cuda.current_device()
+@@ -248,9 +210,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+ 
+     def free_object_buffers(self, obj_id: int) -> None:
+         """Release GPU buffers for a single object."""
+-        if self.is_fallback:
+-            self._delegate.object_scenes.pop(obj_id, None)
+-            return
+         self._mesh_cache.pop(obj_id, None)
+ 
+     def add_object_model(
+@@ -260,17 +219,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         mesh_color: Optional[structs.Color] = None,
+         **kwargs: Any,
+     ) -> None:
+-        if self.is_fallback:
+-            if obj_id in self.object_meshes:
+-                self._delegate.object_meshes[obj_id] = self.object_meshes[obj_id]
+-            self._delegate.add_object_model(
+-                obj_id=obj_id,
+-                model_path=model_path,
+-                mesh_color=mesh_color,
+-                **kwargs,
+-            )
+-            return
+-
+         if obj_id in self._mesh_cache:
+             return
+ 
+@@ -544,15 +492,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         return_tensors: bool = False,
+         background: Optional[structs.Color] = None,
+     ) -> structs.Collection:
+-        if self.is_fallback:
+-            return self._render_object_models_batch_with_fallback(
+-                obj_ids=obj_ids,
+-                camera_models_c2w=camera_models_c2w,
+-                render_types=render_types,
+-                return_tensors=return_tensors,
+-                background=background,
+-            )
+-
+         if len(obj_ids) != len(camera_models_c2w):
+             raise ValueError("Number of object ids and cameras must match.")
+ 
+@@ -617,64 +556,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         output.depths = depths if return_tensors else torch_helpers.tensor_to_array(depths)
+         return output
+ 
+-    def _render_object_models_batch_with_fallback(
+-        self,
+-        obj_ids: Sequence[int],
+-        camera_models_c2w: Sequence[structs.CameraModel],
+-        render_types: Sequence[renderer_base.RenderType],
+-        return_tensors: bool = False,
+-        background: Optional[structs.Color] = None,
+-    ) -> structs.Collection:
+-        if len(obj_ids) != len(camera_models_c2w):
+-            raise ValueError("Number of object ids and cameras must match.")
+-        if len(obj_ids) == 0:
+-            raise ValueError("At least one object render is required.")
+-
+-        height = int(camera_models_c2w[0].height)
+-        width = int(camera_models_c2w[0].width)
+-        rgbs = torch.zeros((len(obj_ids), 3, height, width), dtype=torch.float32)
+-        masks = torch.zeros((len(obj_ids), height, width), dtype=torch.bool)
+-        depths = torch.zeros((len(obj_ids), height, width), dtype=torch.float32)
+-
+-        for sample_id, (obj_id, camera_model) in enumerate(
+-            zip(obj_ids, camera_models_c2w)
+-        ):
+-            rendered = self._delegate.render_object_model(
+-                obj_id=int(obj_id),
+-                camera_model_c2w=camera_model,
+-                render_types=render_types,
+-                return_tensors=True,
+-                background=background,
+-            )
+-            if renderer_base.RenderType.COLOR in render_types:
+-                color = rendered[renderer_base.RenderType.COLOR]
+-                if not isinstance(color, torch.Tensor):
+-                    color = torch_helpers.array_to_tensor(color)
+-                if color.ndim != 3:
+-                    raise ValueError(
+-                        f"Expected color render to be 3D, got shape {tuple(color.shape)}"
+-                    )
+-                if color.shape[0] == 3 and color.shape[-1] != 3:
+-                    rgbs[sample_id] = color.float()
+-                else:
+-                    rgbs[sample_id] = color.permute(2, 0, 1).float()
+-            if renderer_base.RenderType.MASK in render_types:
+-                mask = rendered[renderer_base.RenderType.MASK]
+-                if not isinstance(mask, torch.Tensor):
+-                    mask = torch_helpers.array_to_tensor(mask)
+-                masks[sample_id] = mask.bool()
+-            if renderer_base.RenderType.DEPTH in render_types:
+-                depth = rendered[renderer_base.RenderType.DEPTH]
+-                if not isinstance(depth, torch.Tensor):
+-                    depth = torch_helpers.array_to_tensor(depth)
+-                depths[sample_id] = depth.float()
+-
+-        output = structs.Collection()
+-        output.rgbs = rgbs if return_tensors else torch_helpers.tensor_to_array(rgbs)
+-        output.masks = masks if return_tensors else torch_helpers.tensor_to_array(masks)
+-        output.depths = depths if return_tensors else torch_helpers.tensor_to_array(depths)
+-        return output
+-
+     def render_object_model(
+         self,
+         obj_id: int,
+@@ -684,16 +565,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         background: Optional[structs.Color] = None,
+         **kwargs: Any,
+     ) -> Dict[renderer_base.RenderType, structs.ArrayData]:
+-        if self.is_fallback:
+-            return self._delegate.render_object_model(
+-                obj_id=obj_id,
+-                camera_model_c2w=camera_model_c2w,
+-                render_types=render_types,
+-                return_tensors=return_tensors,
+-                background=background,
+-                **kwargs,
+-            )
+-
+         batch = self.render_object_models_batch(
+             obj_ids=[obj_id],
+             camera_models_c2w=[camera_model_c2w],
+@@ -731,17 +602,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         background: Optional[structs.Color] = None,
+         **kwargs: Any,
+     ) -> Dict[renderer_base.RenderType, structs.ArrayData]:
+-        if self.is_fallback:
+-            return self._delegate.render_meshes(
+-                meshes_in_w=meshes_in_w,
+-                camera_model_c2w=camera_model_c2w,
+-                render_types=render_types,
+-                mesh_colors=mesh_colors,
+-                return_tensors=return_tensors,
+-                background=background,
+-                **kwargs,
+-            )
+-
+         vertices_list = []
+         faces_list = []
+         colors_list = []
+

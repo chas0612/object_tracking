@@ -12,6 +12,12 @@ Usage:
         --capture_dir /home/mingi/shared_data/RSS2026_Mingi/experiment/selected_100/apple/20260206_181110 \
         --prompt "object on the checkerboard"
 
+    # SAM3 image model — only frame 0 for FoundPose initialization (low memory)
+    conda activate sam3
+    python -u src/process/mask.py \
+        --capture_dir ~/shared_data/capture/eccv2026/inspire_dftp/apple/0 \
+        --frame-index 0 --prompt apple --gpu 0
+
     # YOLOE — single episode
     conda activate foundationpose
     python -u src/process/mask.py --method yoloe \
@@ -31,6 +37,7 @@ Usage:
 """
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -164,6 +171,97 @@ def process_episode_yoloe(seg, capture_dir, prompt, batch_size=50, skip=3, seria
     return done + skipped, failed, len(all_serials)
 
 
+def process_episode_sam3_frame(
+    seg, capture_dir, prompt, frame_index, output_dir, serials=None, video_dir=None,
+):
+    """Segment one frame from every camera with SAM3's image model.
+
+    This deliberately does not use the SAM3 video predictor.  It is intended
+    for FoundPose initialization, which needs one synchronized RGB/mask pair
+    per view rather than a mask for every video frame.
+
+    Results are isolated under ``output_dir`` so they never overwrite the
+    capture's existing ``obj_mask`` videos or seed-tracking outputs.
+    """
+    capture_dir = Path(capture_dir)
+    video_dir = Path(video_dir).expanduser() if video_dir else capture_dir / "videos"
+    if not video_dir.is_dir():
+        raise FileNotFoundError(f"Video directory not found: {video_dir}")
+    output_dir = Path(output_dir)
+    images_dir = output_dir / "images"
+    masks_dir = output_dir / "masks"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    masks_dir.mkdir(parents=True, exist_ok=True)
+
+    all_serials = sorted(p.stem for p in video_dir.glob("*.avi"))
+    if serials:
+        wanted = set(serials)
+        all_serials = [s for s in all_serials if s in wanted]
+
+    done = failed = skipped = 0
+    for cam_idx, serial in enumerate(all_serials):
+        image_path = images_dir / f"{serial}.png"
+        mask_path = masks_dir / f"{serial}.png"
+        if image_path.exists() and mask_path.exists() and mask_path.stat().st_size > 0:
+            print(f"  cam [{cam_idx+1}/{len(all_serials)}] {serial}: exists, skip", flush=True)
+            skipped += 1
+            continue
+
+        video_path = video_dir / f"{serial}.avi"
+        cap = cv2.VideoCapture(str(video_path))
+        try:
+            if not cap.isOpened():
+                raise RuntimeError("could not open video")
+            n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if frame_index >= n_frames:
+                raise ValueError(f"frame {frame_index} is outside 0..{n_frames - 1}")
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+            ok, bgr = cap.read()
+            if not ok or bgr is None:
+                raise RuntimeError(f"could not decode frame {frame_index}")
+        except Exception as exc:
+            print(f"  cam [{cam_idx+1}/{len(all_serials)}] {serial}: FAILED ({exc})", flush=True)
+            failed += 1
+            continue
+        finally:
+            cap.release()
+
+        cv2.imwrite(str(image_path), bgr)
+        t0 = time.perf_counter()
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        mask = seg.segment(rgb, prompt)
+        dt = time.perf_counter() - t0
+        if mask is None or not mask.any():
+            # Keep the RGB input for diagnosis, but do not write a fake mask:
+            # downstream FoundPose can use only the cameras that succeeded.
+            print(f"  cam [{cam_idx+1}/{len(all_serials)}] {serial}: no mask ({dt:.2f}s)", flush=True)
+            failed += 1
+            continue
+
+        cv2.imwrite(str(mask_path), mask)
+        done += 1
+        print(
+            f"  cam [{cam_idx+1}/{len(all_serials)}] {serial}: "
+            f"{int((mask > 0).sum())} px ({dt:.2f}s)",
+            flush=True,
+        )
+
+    metadata = {
+        "source_capture_dir": str(capture_dir.resolve()),
+        "source_video_dir": str(video_dir.resolve()),
+        "frame_index": int(frame_index),
+        "prompt": prompt,
+        "method": "sam3_image",
+        "serials_requested": all_serials,
+        "masks_written": int(done),
+        "masks_skipped": int(skipped),
+        "masks_failed": int(failed),
+    }
+    with open(output_dir / "metadata.json", "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+    return done + skipped, failed, len(all_serials)
+
+
 # ── Format time ──────────────────────────────────────────────────────────────
 
 def _format_time(seconds):
@@ -204,6 +302,21 @@ examples:
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--serials", nargs="+", default=None,
                         help="Only process these camera serials")
+    parser.add_argument(
+        "--frame-index", type=int, default=None,
+        help=("Run SAM3 image segmentation on only this video frame instead of "
+              "propagating masks through every frame. Intended for FoundPose init."),
+    )
+    parser.add_argument(
+        "--frame-output-dir", type=str, default=None,
+        help=("Output directory for --frame-index. Default: "
+              "<capture_dir>/foundpose_frame_<index:06d>/. Contains images/ and masks/."),
+    )
+    parser.add_argument(
+        "--video-dir", type=str, default=None,
+        help=("Video directory for --frame-index. Default: <capture_dir>/videos. "
+              "Use <capture_dir>/undistorted_video for calibration-consistent FoundPose inputs."),
+    )
 
     # Batch-mode options
     parser.add_argument("--objects", nargs="*", default=None,
@@ -220,11 +333,24 @@ examples:
                         help="YOLOE frame skip (default: 3)")
     args = parser.parse_args()
 
+    if args.frame_index is not None:
+        if args.capture_dir is None:
+            parser.error("--frame-index requires --capture_dir (batch mode is not supported)")
+        if args.frame_index < 0:
+            parser.error("--frame-index must be non-negative")
+        if args.method != "sam3":
+            parser.error("--frame-index currently supports only --method sam3")
+
     # Load segmentor
     if args.method == "sam3":
-        from autodex.perception import Sam3Segmentor
-        print(f"Loading SAM3 on GPU {args.gpu}...", flush=True)
-        seg = Sam3Segmentor(gpu=args.gpu)
+        if args.frame_index is None:
+            from autodex.perception import Sam3Segmentor
+            print(f"Loading SAM3 video model on GPU {args.gpu}...", flush=True)
+            seg = Sam3Segmentor(gpu=args.gpu)
+        else:
+            from autodex.perception import Sam3ImageSegmentor
+            print(f"Loading SAM3 image model on GPU {args.gpu}...", flush=True)
+            seg = Sam3ImageSegmentor(gpu=args.gpu)
     else:
         from autodex.perception import YoloeSegmentor
         print(f"Loading YOLOE on GPU {args.gpu} (conf={args.conf})...", flush=True)
@@ -241,7 +367,25 @@ examples:
 
     if args.capture_dir:
         # Single episode mode
-        done, failed, total = _run_episode(args.capture_dir)
+        if args.frame_index is None:
+            done, failed, total = _run_episode(args.capture_dir)
+        else:
+            output_dir = (
+                Path(args.frame_output_dir).expanduser()
+                if args.frame_output_dir
+                else Path(args.capture_dir).expanduser()
+                / f"foundpose_frame_{args.frame_index:06d}"
+            )
+            print(f"Single-frame SAM3: frame={args.frame_index}, output={output_dir}", flush=True)
+            done, failed, total = process_episode_sam3_frame(
+                seg=seg,
+                capture_dir=args.capture_dir,
+                prompt=args.prompt,
+                frame_index=args.frame_index,
+                output_dir=output_dir,
+                serials=args.serials,
+                video_dir=args.video_dir,
+            )
         print(f"\nDone! {done}/{total} cameras, {failed} failed.", flush=True)
     else:
         # Batch mode

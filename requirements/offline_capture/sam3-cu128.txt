@@ -1,0 +1,4 @@
+# Runtime specification validated for frame-0 SAM3 mask extraction.
+# Torch wheels are installed separately from the PyTorch CUDA 12.8 index.
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
