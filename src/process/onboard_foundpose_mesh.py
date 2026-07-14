@@ -128,7 +128,7 @@ def main() -> int:
     parser.add_argument("--reference-camera-id", default=None,
                         help="Default: lowest camera ID in the reference intrinsics JSON.")
     parser.add_argument("--overwrite", action="store_true",
-                        help="Explicitly replace an incomplete/old cache. Never needed for a completed cache.")
+                        help="Deprecated compatibility flag. Existing caches are never replaced automatically.")
     parser.add_argument("--dry-run", action="store_true", help="Print resolved paths and command only.")
     args = parser.parse_args()
 
@@ -144,30 +144,39 @@ def main() -> int:
 
     if not ONBOARD_SCRIPT.is_file():
         raise FileNotFoundError(f"FoundPose onboarding script not found: {ONBOARD_SCRIPT}")
-    if repre_path.is_file() and not args.overwrite:
+    if repre_path.is_file():
         print(f"[skip] completed FoundPose cache: {repre_path}", flush=True)
         return 0
-    if output_root.exists() and not args.overwrite:
+    if output_root.exists():
         raise FileExistsError(
             f"Refusing to modify an existing incomplete cache: {output_root}\n"
-            "Inspect it, then use --overwrite only if replacement is intended."
+            "It is preserved. Choose another output root or inspect it manually."
         )
+
+    # Build outside the final cache path and publish only a complete repre.pth.
+    # This makes retries safe after an exception or SSH interruption: a partial
+    # onboarding never looks like a reusable cache to FoundPoseInit.
+    output_root.parent.mkdir(parents=True, exist_ok=True)
+    staging_root = output_root.parent / (
+        f".{object_name}.foundpose_assets.staging.{socket.gethostname()}.{os.getpid()}"
+    )
+    if staging_root.exists():
+        raise FileExistsError(f"Unexpected existing staging directory: {staging_root}")
 
     command = [
         sys.executable, str(ONBOARD_SCRIPT),
         "--mesh-path", str(mesh_path), "--object-id", "1",
-        "--dataset-name", object_name, "--output-root", str(output_root),
+        "--dataset-name", object_name, "--output-root", str(staging_root),
         "--reference-intrinsics-json", str(intrinsics_path),
         "--reference-camera-id", camera_id,
         "--reference-image-scale", "1.0", "--mesh-scale", "1000.0",
         "--min-num-viewpoints", "57", "--num-inplane-rotations", "14",
         "--ssaa-factor", "4.0", "--pca-components", "256", "--cluster-num", "2048",
     ]
-    if output_root.exists():
-        command.append("--overwrite")
     print("[foundpose-onboard] object:", object_name, flush=True)
     print("[foundpose-onboard] mesh:", mesh_path, flush=True)
     print("[foundpose-onboard] cache:", output_root, flush=True)
+    print("[foundpose-onboard] staging:", staging_root, flush=True)
     print("[foundpose-onboard] reference:", intrinsics_path, "camera", camera_id, flush=True)
     print("[foundpose-onboard] command:", " ".join(command), flush=True)
     if args.dry_run:
@@ -179,12 +188,14 @@ def main() -> int:
         env = dict(os.environ, PYOPENGL_PLATFORM=os.environ.get("PYOPENGL_PLATFORM", "egl"),
                    EGL_PLATFORM=os.environ.get("EGL_PLATFORM", "surfaceless"))
         subprocess.run(command, check=True, cwd=str(GOTRACK_ROOT), env=env)
-        if not repre_path.is_file():
-            raise RuntimeError(f"Onboarding exited successfully but repre is missing: {repre_path}")
+        staging_repre = staging_root / "object_repre" / "v1" / object_name / "1" / "repre.pth"
+        if not staging_repre.is_file():
+            raise RuntimeError(f"Onboarding exited successfully but repre is missing: {staging_repre}")
         manifest = {
             "object_name": object_name,
             "mesh": str(mesh_path),
             "assets_root": str(output_root),
+            "staging_root": str(staging_root),
             "reference_intrinsics_json": str(intrinsics_path),
             "reference_camera_id": camera_id,
             "mesh_scale": 1000.0,
@@ -192,9 +203,10 @@ def main() -> int:
             "elapsed_sec": time.perf_counter() - started,
             "hostname": socket.gethostname(),
         }
-        (output_root / "preprocess_manifest.json").write_text(
+        (staging_root / "preprocess_manifest.json").write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
+        staging_root.replace(output_root)
         print(f"[done] reusable FoundPose cache: {repre_path}", flush=True)
     finally:
         _release_lock(lock_dir)

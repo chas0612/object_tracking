@@ -56,6 +56,16 @@ if [[ "$INSTALL_GOTRACK" -eq 1 && ! -f "$GOTRACK_DIR/scripts/onboard_custom_mesh
     echo "Clone the approved private repository and apply its patch first." >&2
     exit 1
 fi
+if [[ "$INSTALL_GOTRACK" -eq 1 ]]; then
+    for project in "$GOTRACK_DIR/external/bop_toolkit" "$GOTRACK_DIR/external/dinov2"; do
+        if [[ ! -f "$project/pyproject.toml" && ! -f "$project/setup.py" ]]; then
+            echo "Required MV-GoTrack submodule is not initialized: $project" >&2
+            echo "Run:" >&2
+            echo "  git -C \"$GOTRACK_DIR\" submodule update --init --recursive" >&2
+            exit 1
+        fi
+    done
+fi
 
 ensure_env() {
     local name="$1" python_version="$2"
@@ -84,8 +94,12 @@ if [[ "$INSTALL_GOTRACK" -eq 1 ]]; then
     run_pip "$GOTRACK_ENV" install torch==2.11.0 torchvision==0.26.0 xformers==0.0.35 \
         --index-url https://download.pytorch.org/whl/cu128
     run_pip "$GOTRACK_ENV" install -r "$REPO_ROOT/requirements/offline_capture/gotrack-cu128.txt"
-    run_pip "$GOTRACK_ENV" install -e "$GOTRACK_DIR/external/bop_toolkit"
-    run_pip "$GOTRACK_ENV" install "$GOTRACK_DIR/external/dinov2"
+    # These third-party project metadata pins Torch/CUDA versions from their
+    # original research environments (Torch 2.0/cu117).  The offline pipeline
+    # instead uses the cu128 stack installed above, so install their source
+    # packages without allowing pip to replace torch, torchvision, or numpy.
+    run_pip "$GOTRACK_ENV" install --no-deps -e "$GOTRACK_DIR/external/bop_toolkit"
+    run_pip "$GOTRACK_ENV" install --no-deps "$GOTRACK_DIR/external/dinov2"
     run_pip "$GOTRACK_ENV" install \
         "git+https://github.com/NVlabs/nvdiffrast.git@253ac4fcea7de5f396371124af597e6cc957bfae" \
         --no-build-isolation

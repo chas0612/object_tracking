@@ -135,6 +135,34 @@ conda run --no-capture-output -n gotrack python -u \
 object별 output lock이 있으므로 여러 PC는 **서로 다른 object**를 동시에 처리할 수
 있다. 같은 object를 동시에 실행하지 않는다.
 
+### 여러 PC에 object 전처리 분배
+
+`inspire_dftp`처럼 camera calibration family가 capture campaign마다 다른 경우에는
+mesh 전역 cache를 공유하지 않는다. campaign의 각 `<object>/0/cam_param/intrinsics.json`을
+reference로 쓰고, cache는 episode 폴더들과 나란한
+`<campaign>/<object>/foundpose_assets/`에 저장한다. controller를 이 PC의 tmux 안에서
+실행한다. worker는 `local` 또는 `user@ip`로 지정하며, IP는 반드시 실제 장비 주소로
+바꾼다. 각 worker는 한 번에 object 하나만 처리한다. 개별 SSH/onboarding 실패는 다른
+object를 멈추지 않고 최대 3회 재시도된다. 완료 representation은 자동 skip되고
+상태/로그는 NAS mesh root에 저장되므로 같은 `--run-name`으로 재실행하면 이어서 진행한다.
+
+```bash
+tmux new -s foundpose-onboard
+cd "$REPO"
+python -u scripts/distribute_foundpose_onboard.py \
+  --scenario-root-rel capture/eccv2026/inspire_dftp \
+  --workers local capture13@192.168.0.<IP13> capture14@192.168.0.<IP14> \
+            capture15@192.168.0.<IP15> capture18@192.168.0.<IP18> \
+  --run-name onboarding_batch_01
+```
+
+다른 터미널에서는 SSH polling 없이 shared state만 읽어 진행 상황을 볼 수 있다.
+
+```bash
+watch -n 5 python scripts/foundpose_onboard_status.py \
+  --state-dir ~/shared_data/mesh_blender/.foundpose_onboard_runs/onboarding_batch_01
+```
+
 ## 4. Conda 환경
 
 ### 자동 환경 설치
@@ -156,6 +184,10 @@ imports를 검사한다. 이미 조직에서 관리하는 호환 SAM3 environmen
 `--skip-sam3`를 사용해도 된다. 일반 preflight는 외부 SAM3 checkout도 허용하며,
 setup script로 레포 내부 SAM3를 설치한 경우에만 그 경로를 엄격히 검사한다. 수동 검사는
 다음과 같다.
+
+MV-GoTrack의 BOP/DINOv2 metadata에는 원본 Torch 2.0/CUDA 11.7 pin이 남아 있다.
+설치 script는 이들의 source만 `--no-deps`로 설치하므로, `gotrack`의 Torch CUDA 12.8
+및 NumPy 2.x를 절대 downgrade하지 않는다.
 
 ```bash
 conda run -n gotrack python scripts/check_offline_capture_setup.py --component gotrack
