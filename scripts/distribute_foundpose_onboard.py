@@ -197,7 +197,7 @@ def _run_one(
             part if part.startswith("$HOME/") else shlex.quote(part) for part in remote_command
         )
         remote_script = f"set -euo pipefail; cd {remote_repo}; exec {rendered}"
-        command = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={args.connect_timeout}",
+        command = ["ssh", "-p", "77", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={args.connect_timeout}",
                    worker.ssh_target, remote_script]
         cwd = None
 
