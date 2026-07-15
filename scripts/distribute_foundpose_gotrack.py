@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import shutil
@@ -35,6 +36,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -49,9 +51,16 @@ def _now() -> str:
 
 
 def _atomic_json(path: Path, data: dict[str, Any]) -> None:
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    temp.replace(path)
+    # Several PCs can update different task files concurrently, and a retry
+    # can briefly make two workers touch the same task.  A fixed ``.tmp`` name
+    # lets one writer rename another writer's temporary file on shared NAS.
+    temp = path.with_name(f".{path.name}.{socket.gethostname()}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        temp.replace(path)
+    finally:
+        if temp.exists():
+            temp.unlink()
 
 
 def _read_json(path: Path) -> dict[str, Any]:
