@@ -83,6 +83,30 @@ def _cache_repre(cache_root: Path, object_name: str) -> Path:
     return cache_root / object_name / "foundpose_assets" / "object_repre" / "v1" / object_name / "1" / "repre.pth"
 
 
+def _load_prompt_map(path_value: str | None) -> dict[str, str]:
+    """Load one optional SAM3 object-prompt map without trusting its shape."""
+    if not path_value:
+        return {}
+    path = Path(path_value).expanduser()
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Object prompt map must be a JSON object: {path}")
+    return {str(key): value.strip() for key, value in payload.items()
+            if isinstance(value, str) and value.strip()}
+
+
+def _prompt_candidates(object_name: str, args: argparse.Namespace) -> list[str]:
+    """Prefer curated SAM3 text, then broad original text, then object name."""
+    candidates = [
+        args.object_prompts.get(object_name),
+        args.object_prompts_original.get(object_name),
+        object_name.replace("_", " "),
+    ]
+    return list(dict.fromkeys(prompt for prompt in candidates if prompt))
+
+
 def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[str]]:
     target_root = shared_root / args.target_root_rel
     cache_root = shared_root / args.cache_root_rel
@@ -141,6 +165,7 @@ def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[st
             "mesh_rel": str(mesh.relative_to(shared_root)),
             "assets_rel": str(repre.parents[4].relative_to(shared_root)),
             "cache_repre_rel": str(repre.relative_to(shared_root)),
+            "sam3_prompts": _prompt_candidates(object_name, args),
         })
     return tasks, skipped
 
@@ -218,9 +243,26 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
             _run_command(gotrack + ["src/process/undistort_capture_videos.py", "--capture-dir", str(episode)], log, REPO_ROOT)
             task["phase"] = "mask"
             _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
-            _run_command(sam3 + ["src/process/mask.py", "--capture_dir", str(episode), "--frame-index", "0",
-                                 "--prompt", task["object_name"].replace("_", " "), "--video-dir", str(episode / "undistorted_video"),
-                                 "--frame-output-dir", str(frame_dir)], log, REPO_ROOT)
+            prompts = task.get("sam3_prompts") or _prompt_candidates(task["object_name"], args)
+            task["sam3_attempted_prompts"] = []
+            masks_available = False
+            for prompt in prompts:
+                task["sam3_prompt_current"] = prompt
+                task["sam3_attempted_prompts"].append(prompt)
+                _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
+                _run_command(sam3 + ["src/process/mask.py", "--capture_dir", str(episode), "--frame-index", "0",
+                                     "--prompt", prompt, "--video-dir", str(episode / "undistorted_video"),
+                                     "--frame-output-dir", str(frame_dir)], log, REPO_ROOT)
+                metadata_path = frame_dir / "metadata.json"
+                metadata = _read_json(metadata_path) if metadata_path.is_file() else {}
+                masks_available = int(metadata.get("masks_written", 0)) + int(metadata.get("masks_skipped", 0)) > 0
+                if masks_available:
+                    task["sam3_prompt_used"] = prompt
+                    break
+                log.write(f"[sam3] no masks with prompt={prompt!r}; trying fallback\n")
+                log.flush()
+            if not masks_available:
+                raise RuntimeError(f"SAM3 produced no masks with prompts: {prompts}")
             task["phase"] = "foundpose"
             _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
             _run_command(gotrack + ["src/process/foundpose_init_capture.py", "--capture-dir", str(episode), "--frame-dir", str(frame_dir),
@@ -230,13 +272,16 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
             _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
             _run_command(gotrack + ["src/process/gotrack_capture.py", "--capture-dir", str(episode), "--video-dir", str(episode / "undistorted_video"),
                                     "--mesh", str(mesh), "--init-pose", str(init_dir / "init_pose_world.npy"), "--object-name", task["object_name"],
-                                    "--num-cameras", str(args.num_cameras), "--camera-micro-batch-size", str(args.camera_micro_batch_size),
+                                    "--num-cameras", str(args.num_cameras), "--allow-fewer-cameras",
+                                    "--camera-micro-batch-size", str(args.camera_micro_batch_size),
                                     "--max-video-duration-skew-sec", str(args.max_video_duration_skew_sec),
                                     "--max-frames", str(args.max_frames), "--output-dir", str(track_dir)], log, REPO_ROOT)
         task["status"] = "completed" if _track_done(task, attempt_dir) else "failed"
         task["reason"] = None if task["status"] == "completed" else "commands_succeeded_but_tracking_output_missing"
     except subprocess.CalledProcessError as exc:
         task.update({"status": "failed", "reason": f"returncode={exc.returncode}"})
+    except Exception as exc:
+        task.update({"status": "failed", "reason": f"{type(exc).__name__}: {exc}"})
     finally:
         task.update({"phase": "complete" if task.get("status") == "completed" else "failed", "finished_utc": _now(), "updated_utc": _now()})
         _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
@@ -322,9 +367,29 @@ def _status(schedule: Path) -> int:
     return 1 if counts.get("failed") else 0
 
 
+def _reset_running(schedule: Path, confirm_workers_stopped: bool) -> int:
+    """Release claims left by intentionally stopped detached workers."""
+    if not confirm_workers_stopped:
+        raise ValueError("--confirm-workers-stopped is required: resetting a live task can duplicate GPU work")
+    reset = 0
+    for path in sorted((schedule / "tasks").glob("*.json")):
+        task = _read_json(path)
+        if task.get("status") != "running":
+            continue
+        claim = schedule / "claims" / f"{task['task_id']}.lock"
+        if claim.exists():
+            shutil.rmtree(claim)
+        task.update({"status": "pending", "phase": "pending", "worker_id": None,
+                     "reason": "reset_after_worker_stop", "updated_utc": _now()})
+        _atomic_json(path, task)
+        reset += 1
+    print(f"[reset-running] released={reset}")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode", choices=("init", "worker", "launch", "status"), required=True)
+    p.add_argument("--mode", choices=("init", "worker", "launch", "status", "reset-running"), required=True)
     p.add_argument("--schedule-id", required=True)
     p.add_argument("--shared-root-rel", default="shared_data")
     p.add_argument("--target-root-rel", default=None, help="With --mode init: robot root under ~/shared_data; its immediate children are objects.")
@@ -335,16 +400,24 @@ def main() -> int:
     p.add_argument("--workers", nargs="+", default=None); p.add_argument("--worker-id", default=None)
     p.add_argument("--remote-repo-rel", default="object_tracking"); p.add_argument("--connect-timeout", type=int, default=10)
     p.add_argument("--gotrack-env", default="gotrack"); p.add_argument("--sam3-env", default="sam3")
+    p.add_argument("--object-prompts-json", default=str(Path.home() / "sam3/object_prompts.json"),
+                   help="Curated object-to-SAM3-prompt JSON. Missing file is allowed.")
+    p.add_argument("--object-prompts-original-json", default=str(Path.home() / "sam3/object_prompts_original.json"),
+                   help="Broader fallback object-to-SAM3-prompt JSON. Missing file is allowed.")
     p.add_argument("--num-cameras", type=int, default=22); p.add_argument("--camera-micro-batch-size", type=int, default=11)
     p.add_argument("--max-video-duration-skew-sec", type=float, default=1.0)
     p.add_argument("--max-frames", type=int, default=-1)
     p.add_argument("--max-attempts", type=int, default=2)
     p.add_argument("--retry-failed", action="store_true"); p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--confirm-workers-stopped", action="store_true",
+                   help="Required with --mode reset-running; confirms no worker can still own a task.")
     args = p.parse_args()
     if args.connect_timeout < 1 or args.num_cameras < 1 or args.camera_micro_batch_size < 0 or args.max_video_duration_skew_sec < 0 or args.max_frames == 0 or args.max_attempts < 1: raise ValueError("invalid worker/tracking option")
     roots = (args.cache_root_rel, args.mesh_root_rel) + ((args.target_root_rel,) if args.target_root_rel else ())
     if any(Path(x).is_absolute() or ".." in Path(x).parts for x in roots): raise ValueError("root paths must be safe relative paths")
     shared = Path.home() / args.shared_root_rel; schedule = _schedule_dir(shared, args.schedule_id)
+    args.object_prompts = _load_prompt_map(args.object_prompts_json)
+    args.object_prompts_original = _load_prompt_map(args.object_prompts_original_json)
     args.local_worker = args.mode == "worker" and (args.worker_id or socket.gethostname()).startswith("local")
     if args.mode == "init":
         if not args.target_root_rel: raise ValueError("--target-root-rel is required for --mode init")
@@ -354,6 +427,8 @@ def main() -> int:
     if args.mode == "launch":
         if not args.workers: raise ValueError("--workers is required for --mode launch")
         return _launch(args, schedule)
+    if args.mode == "reset-running":
+        return _reset_running(schedule, args.confirm_workers_stopped)
     return _status(schedule)
 
 

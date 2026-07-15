@@ -159,6 +159,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default=None,
                         help="Default: <capture-dir>/gotrack_tracking/ (new directory only).")
     parser.add_argument("--num-cameras", type=int, default=4, help="FPS-selected cameras to track.")
+    parser.add_argument("--allow-fewer-cameras", action="store_true",
+                        help="When automatic filtering leaves fewer than --num-cameras, track all eligible cameras instead of failing.")
     parser.add_argument("--camera-ids", nargs="*", default=None,
                         help="Use these camera IDs instead of FPS selection.")
     parser.add_argument("--gpus", nargs="+", default=["0"],
@@ -212,12 +214,17 @@ def main() -> int:
             raise ValueError(f"Requested cameras are excluded, missing, short, or duration outliers: {rejected}")
     else:
         if len(eligible) < args.num_cameras:
-            raise RuntimeError(f"Only {len(eligible)} eligible cameras, need {args.num_cameras}: {eligible}; rejected={rejected_cameras}")
-        selected = _select_cameras(capture_dir / "cam_param" / "extrinsics.json", eligible, args.num_cameras)
+            if not args.allow_fewer_cameras:
+                raise RuntimeError(f"Only {len(eligible)} eligible cameras, need {args.num_cameras}: {eligible}; rejected={rejected_cameras}")
+            print(f"[camera-filter] requested={args.num_cameras}, eligible={len(eligible)}; using all eligible cameras", flush=True)
+        selected = _select_cameras(
+            capture_dir / "cam_param" / "extrinsics.json", eligible, min(args.num_cameras, len(eligible)),
+        )
 
     manifest = {
         "capture_dir": str(capture_dir), "video_dir": str(video_dir), "mesh": str(mesh_path), "init_pose": str(init_pose_path),
-        "object_name": args.object_name, "selected_cameras": selected,
+        "object_name": args.object_name, "requested_num_cameras": args.num_cameras,
+        "allow_fewer_cameras": args.allow_fewer_cameras, "selected_cameras": selected,
         "manual_excluded_cameras": sorted(excluded), "rejected_cameras": rejected_cameras,
         "video_timings": video_timings, "median_video_duration_sec": median_duration,
         "min_video_frames": args.min_video_frames, "max_video_duration_skew_sec": args.max_video_duration_skew_sec,
