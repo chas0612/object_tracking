@@ -33,18 +33,18 @@ videos/ + cam_param/
    (Python 3.10, PyTorch 2.11.0+cu128, xformers 0.0.35)는 서로 다르다. 둘을 섞어
    설치하면 재현성이 없다.
 
-따라서 아래 절차의 출발점은 **top-level AutoDex 포크와 MV-GoTrack 포크를 각각
+따라서 아래 절차의 출발점은 **top-level object_tracking 포크와 MV-GoTrack checkout을 각각
 commit으로 고정한 뒤**이다. 설치 전에 다음 두 값을 release note 또는 manifest에
 기록한다.
 
 ```bash
-git -C /path/to/autodex rev-parse HEAD
-git -C /path/to/autodex/autodex/perception/thirdparty/MV-GoTrack rev-parse HEAD
+git -C "$HOME/object_tracking" rev-parse HEAD
+git -C "$HOME/object_tracking/autodex/perception/thirdparty/MV-GoTrack" rev-parse HEAD
 ```
 
-권장하는 최종 구조는 MV-GoTrack을 top-level repo의 git submodule로 등록하거나,
-최소한 `thirdparty/MV-GoTrack.lock`에 fork URL과 commit SHA를 추적하는 것이다.
-그 전까지는 "동일 pipeline"의 정확한 의미를 보장할 수 없다.
+MV-GoTrack은 현재 top-level과 **별도 git 경계**이며 top-level `.gitignore` 대상이다.
+필요한 private 변경은 [MV-GoTrack-offline-capture.patch](../patches/MV-GoTrack-offline-capture.patch)로
+관리한다. top-level commit에 MV-GoTrack 변경이 자동 포함된다고 가정하면 안 된다.
 
 ## 1. 시스템 전제
 
@@ -67,22 +67,27 @@ offline tracking pipeline의 필수 의존성이 아니다.
 
 ## 2. 코드 checkout
 
-`<AUTODEX_FORK_URL>`, `<AUTODEX_COMMIT>`, `<MV_GOTRACK_FORK_URL>`,
-`<MV_GOTRACK_COMMIT>`은 실험에 사용한 commit으로 치환한다. 아직 local-only인
-MV-GoTrack 수정은 먼저 그 fork에 commit/push해야 한다.
+현재 public repo와 검증된 private base를 쓰는 설치 예시는 아래와 같다. top-level의
+submodule은 정상 절차대로 초기화하되, **MV-GoTrack 자체에는 절대로**
+`--recurse-submodules`를 붙이거나 `git submodule update --init --recursive`를 실행하지 않는다.
+MV-GoTrack이 가리키는 과거 BOP submodule SHA `481265...`는 upstream에서 사라져 있다.
 
 ```bash
-export REPO="$HOME/src/autodex"
-git clone --recurse-submodules <AUTODEX_FORK_URL> "$REPO"
+export REPO="$HOME/object_tracking"
+git clone --recurse-submodules https://github.com/chas0612/object_tracking.git "$REPO"
 cd "$REPO"
-git checkout <AUTODEX_COMMIT>
+git checkout tracking-session-progress
 git submodule update --init --recursive
 
-mkdir -p autodex/perception/thirdparty
-git clone --recurse-submodules <MV_GOTRACK_FORK_URL> \
-  autodex/perception/thirdparty/MV-GoTrack
-git -C autodex/perception/thirdparty/MV-GoTrack checkout <MV_GOTRACK_COMMIT>
-git -C autodex/perception/thirdparty/MV-GoTrack submodule update --init --recursive
+export GOTRACK_DIR="$REPO/autodex/perception/thirdparty/MV-GoTrack"
+mkdir -p "$(dirname "$GOTRACK_DIR")"
+git clone https://github.com/gunhee1113/MV-GoTrack "$GOTRACK_DIR"
+git -C "$GOTRACK_DIR" checkout a9f033734c0bdf2d191265d22ea732a914c861f6
+
+git clone https://github.com/thodan/bop_toolkit.git "$GOTRACK_DIR/external/bop_toolkit"
+git -C "$GOTRACK_DIR/external/bop_toolkit" checkout cea62d651c7e395b2e1962b9749e4e89693c6ac4
+git clone https://github.com/facebookresearch/dinov2.git "$GOTRACK_DIR/external/dinov2"
+git -C "$GOTRACK_DIR/external/dinov2" checkout 7764ea0f912e53c92e82eb78a2a1631e92725fc8
 ```
 
 중요: 설치 스크립트가 clone한 repo에 `git reset --hard`를 실행해서는 안 된다.
@@ -107,23 +112,28 @@ pipeline에 적용하면 안 된다.
 
 ## 3. 모델 파일
 
-GoTrack checkpoint는 MV-GoTrack root에 정확히 이 이름으로 놓아야 한다.
-현재 검증한 파일의 SHA-256은 아래와 같다.
+GoTrack checkpoint는 MV-GoTrack root에 정확히 이 이름으로 놓아야 한다. Git LFS
+fetch 대신 공식 raw URL을 사용한다. 중단된 다운로드는 같은 명령을 재실행하면 이어받는다.
 
 ```bash
 export GOTRACK_DIR="$REPO/autodex/perception/thirdparty/MV-GoTrack"
-rsync -avP <ASSET_HOST>:/path/to/gotrack_checkpoint.pt \
-  "$GOTRACK_DIR/gotrack_checkpoint.pt"
+curl -L --fail --retry 3 --continue-at - \
+  -o "$GOTRACK_DIR/gotrack_checkpoint.pt.part" \
+  https://github.com/facebookresearch/gotrack/raw/refs/heads/main/gotrack_checkpoint.pt
+mv "$GOTRACK_DIR/gotrack_checkpoint.pt.part" "$GOTRACK_DIR/gotrack_checkpoint.pt"
 sha256sum "$GOTRACK_DIR/gotrack_checkpoint.pt"
 # f7d127abe2b8e37b1322a19115343286a6560700c6e02fc6080b4e2426a01086
 ```
 
 SAM3 weight는 조직의 승인된 Hugging Face cache 또는 shared weight store에서
 준비한다. 접근 token이 필요한 모델이면 새 PC에서도 해당 계정으로 login해야 한다.
-FoundPose `assets/object_repre/.../repre.pth`는 object mesh와 onboarding 옵션에
-종속된다. 기본 위치는 `~/shared_data/mesh_blender/<object>/foundpose_assets/`이며,
-모든 PC가 같은 NAS를 mount하면 자동으로 공유된다. 먼저 아래 전처리 CLI로 object당
-한 번 생성한다(현재 798-view onboarding은 object당 약 20–21분이었다).
+FoundPose `assets/object_repre/.../repre.pth`는 object mesh, onboarding 옵션 및
+reference calibration에 종속된다. 일반 cache의 기본 위치는
+`~/shared_data/mesh_blender/<object>/foundpose_assets/`이다. 다만
+`inspire_dftp`는 campaign calibration을 보존하기 위해
+`~/shared_data/capture/eccv2026/inspire_dftp/<object>/foundpose_assets/`를 사용한다.
+`foundpose_init_capture.py`는 episode 부모의 campaign cache를 자동으로 우선한다.
+먼저 아래 전처리 CLI로 object당 한 번 생성한다(57 viewpoints × 14 rotations = 798 templates).
 
 ```bash
 conda run --no-capture-output -n gotrack python -u \
@@ -146,6 +156,12 @@ reference로 쓰고, cache는 episode 폴더들과 나란한
 object를 멈추지 않고 최대 3회 재시도된다. 완료 representation은 자동 skip되고
 상태/로그는 NAS mesh root에 저장되므로 같은 `--run-name`으로 재실행하면 이어서 진행한다.
 
+이 연구실의 원격 SSH 포트는 `77`이며 scheduler가 이를 사용한다. 실행 전에 각 worker에
+host key를 등록하고 key-based login을 확인해야 한다. scheduler는 `BatchMode=yes`로
+실행하므로 비밀번호 또는 host-key 확인 prompt가 필요한 연결은 즉시 실패한다. SSAA=4는
+2048 기준 내부 약 8192×8192 render라 전력·발열 부담이 크다. 재개 첫 시도는 3대 이하로
+제한하고, 별도 tmux에서 GPU 온도·전력·RAM을 기록한다.
+
 ```bash
 tmux new -s foundpose-onboard
 cd "$REPO"
@@ -153,14 +169,14 @@ python -u scripts/distribute_foundpose_onboard.py \
   --scenario-root-rel capture/eccv2026/inspire_dftp \
   --workers local capture13@192.168.0.<IP13> capture14@192.168.0.<IP14> \
             capture15@192.168.0.<IP15> capture18@192.168.0.<IP18> \
-  --run-name onboarding_batch_01
+  --run-name inspire_dftp_onboarding_05
 ```
 
 다른 터미널에서는 SSH polling 없이 shared state만 읽어 진행 상황을 볼 수 있다.
 
 ```bash
 watch -n 5 python scripts/foundpose_onboard_status.py \
-  --state-dir ~/shared_data/mesh_blender/.foundpose_onboard_runs/onboarding_batch_01
+  --state-dir ~/shared_data/mesh_blender/.foundpose_onboard_runs/inspire_dftp_onboarding_05
 ```
 
 ## 4. Conda 환경
@@ -197,6 +213,24 @@ conda run -n sam3 python scripts/check_offline_capture_setup.py --component sam3
 Blackwell (SM120) GPU라면 위 설치 뒤 `scripts/setup_gotrack_blackwell_xformers.sh`를
 쓰되, `ENV_NAME=gotrack`, `CONDA_DIR=<실제 conda root>`를 명시한다. 이 script도
 현재는 build helper이며 코드/asset 설치 스크립트가 아니다.
+
+### 실패한 기존 설치 복구
+
+이미 `dinov2` 설치와 `nvdiffrast_cuda_context=ok`가 확인된 PC에서는 BOP/DINOv2를
+다시 설치하지 말고 checkpoint 다운로드와 preflight만 먼저 수행한다. 이전 설치가
+NumPy 1.x로 내려갔거나 DINOv2 metadata가 Torch를 바꿨다면 다음 순서로 복구한다.
+
+```bash
+conda run --no-capture-output -n gotrack python -m pip install --force-reinstall --no-deps numpy==2.2.6
+conda run --no-capture-output -n gotrack python -m pip install --no-deps -e "$GOTRACK_DIR/external/bop_toolkit"
+conda run --no-capture-output -n gotrack python -m pip install --no-deps "$GOTRACK_DIR/external/dinov2"
+conda run -n gotrack python scripts/check_offline_capture_setup.py \
+  --component gotrack --gotrack-dir "$GOTRACK_DIR"
+```
+
+`not our ref 481265...` 오류로 external source가 불완전할 때만 기존 디렉터리를
+timestamp 이름으로 보관한 뒤, 2절의 BOP/DINOv2 clone/checkout 명령을 다시 실행한다.
+`pip install "$GOTRACK_DIR/external/dinov2"`처럼 `--no-deps` 없는 설치는 금지한다.
 
 ## 5. 설치 검증
 
@@ -264,11 +298,60 @@ conda run --no-capture-output -n gotrack python -u \
   --output-dir "$TRACK_OUT"
 ```
 
+GoTrack은 모든 AVI의 frame count/FPS로 계산한 duration을 비교해 median에서 기본 1초 이상
+벗어난 camera만 자동 제외한다. 몇 frame 누락은 허용하며, 과거 특정 serial을 하드코딩해
+제외하지 않는다. `run_manifest.json`의 `video_timings`, `rejected_cameras`에서 판단 근거를
+확인할 수 있다. 필요하면 `--max-video-duration-skew-sec`으로 threshold를 조절하거나 `0`으로
+끄고, 정말 제외할 camera만 `--exclude-cameras`로 명시한다.
+
 GoTrack이 OOM이면 `--num-cameras 8`로 새로운 `--output-dir`에 재실행하거나,
 선택 camera 수보다 작은 `--camera-micro-batch-size`를 쓴다. 예를 들어 21개
 camera 전체 관측을 유지하면서 GPU refinement만 8개씩 처리하려면
 `--num-cameras 21 --camera-micro-batch-size 8`이다. 이 옵션이 동작하려면 해당
 변경을 포함한 **MV-GoTrack fork commit**이어야 한다.
+
+### 여러 PC에 다른 robot capture를 분배
+
+`scripts/distribute_foundpose_gotrack.py`는 robot 하나의 root
+`<robot-root>/<object>/<episode>`를 task로 분해한다. 각 task는 target robot의
+cache를 만들지 않고, 명시적으로
+`capture/eccv2026/inspire_dftp/<object>/foundpose_assets`의 `repre.pth`를 사용한다.
+worker는 shared-storage atomic claim으로 episode 하나씩만 점유하며, 다음 단계를
+순서대로 실행한다: undistort → SAM3 frame-0 mask → FoundPose init → GoTrack.
+GoTrack 재시도는 새 `attempt_NN` output directory를 사용하므로 partial output을
+덮어쓰지 않는다.
+
+먼저 dry-run으로 mesh/cache/episode 조건을 확인하고 queue를 만든다.
+
+```bash
+cd "$REPO"
+python -u scripts/distribute_foundpose_gotrack.py \
+  --mode init --schedule-id hand_taeyun_right_01 \
+  --target-root-rel capture/eccv2026/hand_taeyun/right \
+  --num-cameras 22 --camera-micro-batch-size 11 --max-frames -1 --dry-run
+
+python -u scripts/distribute_foundpose_gotrack.py \
+  --mode init --schedule-id hand_taeyun_right_01 \
+  --target-root-rel capture/eccv2026/hand_taeyun/right \
+  --num-cameras 22 --camera-micro-batch-size 11 --max-frames -1
+```
+
+그 다음 controller는 remote worker를 `nohup`으로 detach한다. controller가 종료돼도
+remote worker는 shared queue가 빌 때까지 계속 실행한다. SSH는 port 77과 key-based
+login이 준비되어 있어야 한다.
+
+```bash
+python -u scripts/distribute_foundpose_gotrack.py \
+  --mode launch --schedule-id hand_taeyun_right_01 \
+  --workers capture13@192.168.0.<IP13> capture14@192.168.0.<IP14> \
+            capture18@192.168.0.<IP18>
+
+python -u scripts/distribute_foundpose_gotrack.py \
+  --mode status --schedule-id hand_taeyun_right_01
+```
+
+실패 task는 기본으로 재시도하지 않는다. 원인을 log에서 확인한 뒤 worker 또는 launch에
+`--retry-failed`를 추가한다. task당 기본 최대 시도 횟수는 2회다.
 
 ## 7. 결과와 보존 규칙
 
@@ -276,8 +359,9 @@ camera 전체 관측을 유지하면서 GPU refinement만 8개씩 처리하려�
 <CAPTURE>/undistorted_video/                         # generated, raw videos/ 불변
 <FRAME_OUT>/images/*.png, masks/*.png               # SAM3 first-frame inputs
 <INIT_OUT>/init_pose_world.npy                      # FoundPose 6D initial world pose
-~/shared_data/mesh_blender/<OBJ>/foundpose_assets/object_repre/v1/<OBJ>/1/repre.pth
-                                                    # reusable per-object cache
+<CAPTURE 부모>/foundpose_assets/object_repre/v1/<OBJ>/1/repre.pth
+                                                    # campaign cache가 있으면 우선 사용
+~/shared_data/mesh_blender/<OBJ>/foundpose_assets/... # campaign cache가 없을 때 fallback
 <TRACK_OUT>/gotrack_output/<OBJ>/world_pose_records.json  # per-frame 6D world poses
 ```
 
@@ -289,13 +373,10 @@ camera 전체 관측을 유지하면서 GPU refinement만 8개씩 처리하려�
 
 - [ ] top-level의 `src/process/gotrack_capture.py`, `foundpose_init_capture.py`,
   `undistort_capture_videos.py`, grid renderer와 `mask.py` 변경을 commit한다.
-- [ ] MV-GoTrack의 `archive/run_multiview_gotrack_anchor_online_multi_object.py`
-  micro-batch 변경과 `utils/renderer_nvdiffrast.py` 변경을 별도 fork에 commit한다.
-- [ ] `utils/renderer_nvdiffrast.py.orig` 및 `.rej`는 patch 충돌 잔재이므로
-  커밋/배포하지 말고 renderer 최종본을 테스트한 뒤 제거한다.
-- [ ] `patches/MV-GoTrack-renderer-fix.patch`는 현재 local renderer diff와 일치하지
-  않는다. fork commit 방식으로 대체하거나, 최종 renderer commit에서 patch를 다시
-  생성한다.
+- [ ] MV-GoTrack base가 `a9f033734c0bdf2d191265d22ea732a914c861f6`이고,
+  `patches/MV-GoTrack-offline-capture.patch`가 적용됐는지 확인한다.
+- [ ] `utils/renderer_nvdiffrast.py.orig` 및 `.rej`가 있다면 patch 충돌 잔재다.
+  배포 전에 renderer 최종본을 검증하고 private checkout에서 제거한다.
 - [ ] 실제 새 PC에서 1-frame smoke test와 짧은 GoTrack run을 한 번 수행하고,
   AutoDex SHA, MV-GoTrack SHA, checkpoint SHA, `conda list --explicit`을 run manifest에
   기록한다.

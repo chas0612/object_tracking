@@ -23,6 +23,7 @@ import argparse
 import importlib.util
 import json
 import os
+import statistics
 import subprocess
 import sys
 from pathlib import Path
@@ -46,23 +47,55 @@ def _as_pose_4x4(path: Path) -> np.ndarray:
     return pose.astype(np.float64)
 
 
-def _video_frame_count(video_path: Path) -> int:
+def _video_timing(video_path: Path) -> dict[str, float | int]:
     cap = cv2.VideoCapture(str(video_path))
     try:
         if not cap.isOpened():
-            return 0
-        return int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            return {"frames": 0, "fps": 0.0, "duration_sec": 0.0}
+        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = float(cap.get(cv2.CAP_PROP_FPS))
+        # AVI has no independently useful per-frame capture timestamps exposed
+        # through OpenCV.  Frame count / encoded FPS is its usable timeline.
+        return {"frames": frames, "fps": fps, "duration_sec": frames / fps if fps > 0 else 0.0}
     finally:
         cap.release()
 
 
-def _eligible_cameras(videos_dir: Path, min_frames: int, excluded: set[str]) -> tuple[list[str], dict[str, int]]:
-    counts = {p.stem: _video_frame_count(p) for p in sorted(videos_dir.glob("*.avi"))}
-    eligible = sorted(
-        camera_id for camera_id, count in counts.items()
-        if count >= min_frames and camera_id not in excluded
-    )
-    return eligible, counts
+def _eligible_cameras(
+    videos_dir: Path, min_frames: int, excluded: set[str], max_duration_skew_sec: float,
+) -> tuple[list[str], dict[str, dict[str, float | int]], dict[str, str], float | None]:
+    """Keep normal-length videos and reject timeline outliers across cameras.
+
+    A few dropped frames are expected from the capture system.  We compare the
+    encoded video duration (frame_count / FPS) to the median of otherwise valid
+    cameras, rather than excluding a historical hard-coded serial.
+    """
+    timings = {p.stem: _video_timing(p) for p in sorted(videos_dir.glob("*.avi"))}
+    rejected: dict[str, str] = {}
+    baseline: list[float] = []
+    for camera_id, info in timings.items():
+        frames, fps, duration = int(info["frames"]), float(info["fps"]), float(info["duration_sec"])
+        if camera_id in excluded:
+            rejected[camera_id] = "manual_exclude"
+        elif frames < min_frames:
+            rejected[camera_id] = f"frames<{min_frames}"
+        elif fps <= 0 or duration <= 0:
+            rejected[camera_id] = "invalid_fps_or_duration"
+        else:
+            baseline.append(duration)
+    median_duration = statistics.median(baseline) if baseline else None
+    eligible: list[str] = []
+    for camera_id, info in timings.items():
+        if camera_id in rejected:
+            continue
+        duration = float(info["duration_sec"])
+        skew = abs(duration - median_duration) if median_duration is not None else 0.0
+        info["duration_skew_sec"] = skew
+        if max_duration_skew_sec > 0 and skew > max_duration_skew_sec:
+            rejected[camera_id] = f"duration_skew={skew:.3f}s>{max_duration_skew_sec:.3f}s"
+        else:
+            eligible.append(camera_id)
+    return sorted(eligible), timings, rejected, median_duration
 
 
 def _select_cameras(extrinsics_json: Path, available: list[str], number: int) -> list[str]:
@@ -130,10 +163,12 @@ def parse_args() -> argparse.Namespace:
                         help="Use these camera IDs instead of FPS selection.")
     parser.add_argument("--gpus", nargs="+", default=["0"],
                         help="CUDA device IDs for camera-group sharding, e.g. --gpus 0 1.")
-    parser.add_argument("--exclude-cameras", nargs="*", default=["23029839"],
-                        help="IDs to exclude (the known short video is excluded by default).")
+    parser.add_argument("--exclude-cameras", nargs="*", default=[],
+                        help="Optional camera IDs to exclude explicitly. Default: none.")
     parser.add_argument("--min-video-frames", type=int, default=100,
                         help="Reject videos shorter than this before selection.")
+    parser.add_argument("--max-video-duration-skew-sec", type=float, default=1.0,
+                        help="Reject videos whose frame_count/FPS duration differs from the valid-camera median by more than this. 0 disables it.")
     parser.add_argument("--max-frames", type=int, default=100,
                         help="Tracking length; default is a safe 100-frame smoke test, -1 means all frames.")
     parser.add_argument("--input-resize-scale", type=float, default=0.5)
@@ -156,8 +191,8 @@ def main() -> int:
         raise FileNotFoundError("--capture-dir/--video-dir must exist, and --mesh/--init-pose must be files.")
     if not GOTRACK_RUNNER.is_file():
         raise FileNotFoundError(f"GoTrack runner not found: {GOTRACK_RUNNER}")
-    if args.num_cameras < 1 or args.min_video_frames < 1 or args.camera_micro_batch_size < 0:
-        raise ValueError("--num-cameras/--min-video-frames must be positive and --camera-micro-batch-size must be >= 0.")
+    if args.num_cameras < 1 or args.min_video_frames < 1 or args.camera_micro_batch_size < 0 or args.max_video_duration_skew_sec < 0:
+        raise ValueError("--num-cameras/--min-video-frames must be positive, and batch/skew options must be non-negative.")
 
     output_dir = (Path(args.output_dir).expanduser().resolve() if args.output_dir else
                   capture_dir / "gotrack_tracking")
@@ -166,23 +201,27 @@ def main() -> int:
 
     pose = _as_pose_4x4(init_pose_path)
     excluded = set(args.exclude_cameras)
-    eligible, frame_counts = _eligible_cameras(video_dir, args.min_video_frames, excluded)
+    eligible, video_timings, rejected_cameras, median_duration = _eligible_cameras(
+        video_dir, args.min_video_frames, excluded, args.max_video_duration_skew_sec,
+    )
     requested = list(args.camera_ids) if args.camera_ids else None
     if requested:
         selected = sorted(set(requested))
         rejected = [camera_id for camera_id in selected if camera_id not in eligible]
         if rejected:
-            raise ValueError(f"Requested cameras are excluded, missing, or too short: {rejected}")
+            raise ValueError(f"Requested cameras are excluded, missing, short, or duration outliers: {rejected}")
     else:
         if len(eligible) < args.num_cameras:
-            raise RuntimeError(f"Only {len(eligible)} eligible cameras, need {args.num_cameras}: {eligible}")
+            raise RuntimeError(f"Only {len(eligible)} eligible cameras, need {args.num_cameras}: {eligible}; rejected={rejected_cameras}")
         selected = _select_cameras(capture_dir / "cam_param" / "extrinsics.json", eligible, args.num_cameras)
 
     manifest = {
         "capture_dir": str(capture_dir), "video_dir": str(video_dir), "mesh": str(mesh_path), "init_pose": str(init_pose_path),
         "object_name": args.object_name, "selected_cameras": selected,
-        "excluded_cameras": sorted(excluded), "video_frame_counts": frame_counts,
-        "min_video_frames": args.min_video_frames, "max_frames": args.max_frames,
+        "manual_excluded_cameras": sorted(excluded), "rejected_cameras": rejected_cameras,
+        "video_timings": video_timings, "median_video_duration_sec": median_duration,
+        "min_video_frames": args.min_video_frames, "max_video_duration_skew_sec": args.max_video_duration_skew_sec,
+        "max_frames": args.max_frames,
         "gpus": args.gpus, "camera_micro_batch_size": args.camera_micro_batch_size,
     }
     if args.dry_run:

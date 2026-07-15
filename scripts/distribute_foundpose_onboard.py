@@ -186,7 +186,7 @@ def _run_one(
         remote_repo = f'$HOME/{args.remote_repo_rel.strip("/")}'
         remote_shared = f'$HOME/{args.shared_root_rel.strip("/")}'
         remote_command = [
-            "conda", "run", "--no-capture-output", "-n", args.gotrack_env, "python", "-u",
+            "$HOME/anaconda3/bin/conda", "run", "--no-capture-output", "-n", args.gotrack_env, "python", "-u",
             "src/process/onboard_foundpose_mesh.py", "--object-name", object_name,
             "--mesh-root", f"{remote_shared}/mesh_blender",
             "--output-root", f"{remote_shared}/{output_root_rel.lstrip('/')}",
