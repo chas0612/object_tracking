@@ -99,13 +99,18 @@ def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[st
     # avoid rglob/os.walk: shared campaign roots can contain terabytes of video
     # and prior outputs, and discovery must not traverse those trees.
     episode_dirs: list[Path] = []
+    generated_dirs = {
+        "foundpose_assets", "undistorted_video", "object_tracking_foundpose_gotrack",
+        "gotrack_tracking", "gotrack_output",
+    }
     for object_dir in sorted(target_root.iterdir()):
         if not object_dir.is_dir() or object_dir.name.startswith("."):
             continue
         if objects and object_dir.name not in objects:
             continue
         for episode_dir in sorted(object_dir.iterdir()):
-            if episode_dir.is_dir() and not episode_dir.name.startswith("."):
+            if (episode_dir.is_dir() and not episode_dir.name.startswith(".")
+                    and episode_dir.name not in generated_dirs):
                 episode_dirs.append(episode_dir)
     for episode_dir in episode_dirs:
         try:
