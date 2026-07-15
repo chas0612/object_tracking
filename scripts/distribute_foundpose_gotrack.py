@@ -200,7 +200,10 @@ def _claim_task(schedule_dir: Path, worker_id: str, retry_failed: bool, max_atte
         status = task.get("status", "pending")
         if status not in ({"pending"} | ({"failed"} if retry_failed else set())):
             continue
-        if int(task.get("attempts", 0)) >= max_attempts:
+        # ``pending`` also represents a task recovered after an intentional
+        # worker stop.  It must be claimable even when the interrupted attempt
+        # already reached the normal failed-attempt ceiling.
+        if status == "failed" and int(task.get("attempts", 0)) >= max_attempts:
             continue
         claim = schedule_dir / "claims" / f"{task['task_id']}.lock"
         # A failed task deliberately retains its claim as an audit record.  A
