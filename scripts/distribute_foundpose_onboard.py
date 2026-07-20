@@ -170,7 +170,7 @@ def _run_one(
     log_path: Path,
 ) -> tuple[int, str]:
     shared_root = Path.home() / args.shared_root_rel
-    mesh_root = shared_root / "mesh_blender"
+    mesh_root = shared_root / args.mesh_root_rel
     reference_json = shared_root / reference_intrinsics_rel
     output_root = shared_root / output_root_rel
     local_command = [
@@ -188,7 +188,7 @@ def _run_one(
         remote_command = [
             "$HOME/anaconda3/bin/conda", "run", "--no-capture-output", "-n", args.gotrack_env, "python", "-u",
             "src/process/onboard_foundpose_mesh.py", "--object-name", object_name,
-            "--mesh-root", f"{remote_shared}/mesh_blender",
+            "--mesh-root", f"{remote_shared}/{args.mesh_root_rel.strip('/')}",
             "--output-root", f"{remote_shared}/{output_root_rel.lstrip('/')}",
             "--reference-intrinsics-json", f"{remote_shared}/{reference_intrinsics_rel.lstrip('/')}",
         ]
@@ -215,7 +215,7 @@ def main() -> int:
     parser.add_argument("--objects", nargs="*", default=[])
     parser.add_argument("--objects-file", default=None, help="One object per line; # starts comments.")
     parser.add_argument("--all-mesh-objects", action="store_true",
-                        help="Onboard every immediate mesh_blender subdirectory with an .obj/.ply/.glb mesh.")
+                        help="Onboard every immediate --mesh-root-rel subdirectory with an .obj/.ply/.glb mesh.")
     parser.add_argument("--scenario-root-rel", default=None,
                         help="Restrict to a campaign root under shared_data. Each <object>/0 calibration is "
                              "used and assets are saved as <object>/foundpose_assets.")
@@ -230,6 +230,8 @@ def main() -> int:
     parser.set_defaults(auto_reference_intrinsics=True)
     parser.add_argument("--shared-root-rel", default="shared_data",
                         help="Shared storage relative to each worker HOME. Default: shared_data")
+    parser.add_argument("--mesh-root-rel", default="mesh_new",
+                        help="Mesh evidence root under ~/shared_data. Default: mesh_new")
     parser.add_argument("--remote-repo-rel", default="object_tracking",
                         help="Repository relative to remote HOME. Default: object_tracking")
     parser.add_argument("--gotrack-env", default="gotrack")
@@ -250,15 +252,25 @@ def main() -> int:
         raise ValueError("--scenario-root-rel must be a safe path relative to shared_data")
 
     shared_root = Path.home() / args.shared_root_rel
-    mesh_root = shared_root / "mesh_blender"
+    if args.mesh_root_rel.startswith("/") or ".." in Path(args.mesh_root_rel).parts:
+        raise ValueError("--mesh-root-rel must be a safe path relative to shared_data")
+    mesh_root = shared_root / args.mesh_root_rel
     if not mesh_root.is_dir():
         raise FileNotFoundError(f"Mesh root is missing: {mesh_root}")
     if args.scenario_root_rel:
-        if args.objects or args.objects_file or args.all_mesh_objects:
-            raise ValueError("--scenario-root-rel cannot be combined with --objects, --objects-file, or --all-mesh-objects")
+        if args.objects_file or args.all_mesh_objects:
+            raise ValueError("--scenario-root-rel cannot be combined with --objects-file or --all-mesh-objects")
         objects, reference_by_object, output_by_object = _scenario_object_paths(
             shared_root=shared_root, mesh_root=mesh_root, scenario_root_rel=args.scenario_root_rel,
         )
+        if args.objects:
+            requested = list(dict.fromkeys(args.objects))
+            unknown = sorted(set(requested) - set(objects))
+            if unknown:
+                raise ValueError(f"Requested scenario objects have no episode-0 calibration or mesh: {unknown}")
+            objects = [obj for obj in objects if obj in set(requested)]
+            reference_by_object = {obj: reference_by_object[obj] for obj in objects}
+            output_by_object = {obj: output_by_object[obj] for obj in objects}
     else:
         objects = _load_objects(args, mesh_root)
         reference_by_object = _reference_intrinsics_by_object(
@@ -274,7 +286,10 @@ def main() -> int:
     if len({worker.name for worker in workers}) != len(workers):
         raise ValueError("Worker names must be unique")
     run_name = args.run_name or datetime.now().strftime("foundpose_%Y%m%d_%H%M%S")
-    state_dir = mesh_root / ".foundpose_onboard_runs" / run_name
+    # Keep durable scheduler state in its historical shared location.  The
+    # selected mesh evidence root may be mesh_new, but it should not split run
+    # logs away from the existing mesh_blender onboarding history.
+    state_dir = shared_root / "mesh_blender" / ".foundpose_onboard_runs" / run_name
     state_path = state_dir / "state.json"
     logs_dir = state_dir / "logs"
     if state_path.exists():

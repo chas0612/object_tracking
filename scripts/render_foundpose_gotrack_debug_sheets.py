@@ -37,6 +37,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-cameras", type=int, default=6)
     parser.add_argument("--frame-indices", nargs="*", type=int, default=None)
     parser.add_argument("--limit", type=int, default=0, help="0 means every completed task.")
+    parser.add_argument("--force", action="store_true",
+                        help="Replace existing episode and central sheets for selected completed tasks.")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -72,6 +74,12 @@ def main() -> int:
         records = attempt / "gotrack_tracking/gotrack_output" / str(task["object_name"]) / "world_pose_records.json"
         output = output_dir / f"{task_id}.jpg"
         episode_output = episode / f"gotrack_debug_sheet_{args.schedule_id}_{attempt.name}.jpg"
+        if args.force and not args.dry_run:
+            # Only touch the two known output paths for this scheduler task.
+            # This avoids recursively scanning every capture directory on NAS.
+            for existing in (episode_output, output):
+                if existing.is_symlink() or existing.is_file():
+                    existing.unlink()
         if output.is_file() and episode_output.is_file():
             print(f"[{number}/{len(tasks)}] skip existing {task_id}", flush=True)
             skipped += 1

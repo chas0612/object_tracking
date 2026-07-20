@@ -129,11 +129,11 @@ sha256sum "$GOTRACK_DIR/gotrack_checkpoint.pt"
 SAM3 weight는 조직의 승인된 Hugging Face cache 또는 shared weight store에서
 준비한다. 접근 token이 필요한 모델이면 새 PC에서도 해당 계정으로 login해야 한다.
 FoundPose `assets/object_repre/.../repre.pth`는 object mesh, onboarding 옵션 및
-reference calibration에 종속된다. 일반 cache의 기본 위치는
-`~/shared_data/mesh_blender/<object>/foundpose_assets/`이다. 다만
-`inspire_dftp`는 campaign calibration을 보존하기 위해
-`~/shared_data/capture/eccv2026/inspire_dftp/<object>/foundpose_assets/`를 사용한다.
-`foundpose_init_capture.py`는 episode 부모의 campaign cache를 자동으로 우선한다.
+reference calibration에 종속된다. canonical cache의 기본 위치는
+`~/shared_data/mesh_new/<object>/foundpose_assets/`이다. 현재 canonical template은
+`inspire_dftp/<object>/0` calibration으로 만든다. 다른 intrinsic group에서도 runtime은
+각 view의 calibration을 사용하지만, 성능 검증 전에는 같은 cache가 완전히 동등하다고
+가정하지 않는다. `foundpose_init_capture.py`는 mesh 옆 canonical cache를 자동으로 우선한다.
 먼저 아래 전처리 CLI로 object당 한 번 생성한다(57 viewpoints × 14 rotations = 798 templates).
 
 ```bash
@@ -148,10 +148,8 @@ object별 output lock이 있으므로 여러 PC는 **서로 다른 object**를 �
 
 ### 여러 PC에 object 전처리 분배
 
-`inspire_dftp`처럼 camera calibration family가 capture campaign마다 다른 경우에는
-mesh 전역 cache를 공유하지 않는다. campaign의 각 `<object>/0/cam_param/intrinsics.json`을
-reference로 쓰고, cache는 episode 폴더들과 나란한
-`<campaign>/<object>/foundpose_assets/`에 저장한다. controller를 이 PC의 tmux 안에서
+`inspire_dftp`의 각 `<object>/0/cam_param/intrinsics.json`을 reference로 쓰고, cache는
+`mesh_new/<object>/foundpose_assets/`에 저장한다. controller를 이 PC의 tmux 안에서
 실행한다. worker는 `local` 또는 `user@ip`로 지정하며, IP는 반드시 실제 장비 주소로
 바꾼다. 각 worker는 한 번에 object 하나만 처리한다. 개별 SSH/onboarding 실패는 다른
 object를 멈추지 않고 최대 3회 재시도된다. 완료 representation은 자동 skip되고
@@ -201,6 +199,15 @@ imports를 검사한다. 이미 조직에서 관리하는 호환 SAM3 environmen
 `--skip-sam3`를 사용해도 된다. 일반 preflight는 외부 SAM3 checkout도 허용하며,
 setup script로 레포 내부 SAM3를 설치한 경우에만 그 경로를 엄격히 검사한다. 수동 검사는
 다음과 같다.
+
+GoTrack 완료 뒤의 자동 debug sheet와 Viser 확인은 gotrack environment의
+`transforms3d`, `viser[urdf]`도 사용한다. 최신 setup script는 이를 함께 설치한다.
+이미 만들어 둔 worker environment에는 다음 한 번만 실행하면 된다.
+
+```bash
+conda run --no-capture-output -n gotrack python -m pip install \
+  transforms3d==0.4.2 "viser[urdf]==1.0.30"
+```
 
 MV-GoTrack의 BOP/DINOv2 metadata에는 원본 Torch 2.0/CUDA 11.7 pin이 남아 있다.
 설치 script는 이들의 source만 `--no-deps`로 설치하므로, `gotrack`의 Torch CUDA 12.8
@@ -325,7 +332,7 @@ GoTrack이 OOM이면 `--num-cameras 8`로 새로운 `--output-dir`에 재실행�
 `scripts/distribute_foundpose_gotrack.py`는 robot 하나의 root
 `<robot-root>/<object>/<episode>`를 task로 분해한다. 각 task는 target robot의
 cache를 만들지 않고, 명시적으로
-`capture/eccv2026/inspire_dftp/<object>/foundpose_assets`의 `repre.pth`를 사용한다.
+`mesh_new/<object>/foundpose_assets`의 `repre.pth`를 사용한다.
 worker는 shared-storage atomic claim으로 episode 하나씩만 점유하며, 다음 단계를
 순서대로 실행한다: undistort → SAM3 frame-30 mask → FoundPose init → GoTrack
 정방향+역방향 병합. `--init-frame-index`로 seed를 바꿀 수 있다.
@@ -407,10 +414,10 @@ conda run --no-capture-output -n gotrack python -u \
   --gotrack-records "$RECORDS" --port 8080
 ```
 
-Viser는 gotrack environment에 별도로 필요하다.
+Viser는 gotrack environment에 포함되며, 기존 environment를 수동 보완할 때만 다음을 실행한다.
 
 ```bash
-conda run -n gotrack python -m pip install "viser[urdf]"
+conda run -n gotrack python -m pip install "viser[urdf]==1.0.30"
 ```
 
 Inspire capture에서는 `C2R.npy`를 사용해 robot-base 좌표계가 기본 scene frame이 된다.
@@ -432,9 +439,8 @@ FoundationPose 수정이 포함된 commit을 받고 있는지 먼저 확인한�
 <CAPTURE>/undistorted_video/                         # generated, raw videos/ 불변
 <FRAME_OUT>/images/*.png, masks/*.png               # SAM3 first-frame inputs
 <INIT_OUT>/init_pose_world.npy                      # FoundPose 6D initial world pose
-<CAPTURE 부모>/foundpose_assets/object_repre/v1/<OBJ>/1/repre.pth
-                                                    # campaign cache가 있으면 우선 사용
-~/shared_data/mesh_blender/<OBJ>/foundpose_assets/... # campaign cache가 없을 때 fallback
+~/shared_data/mesh_new/<OBJ>/foundpose_assets/object_repre/v1/<OBJ>/1/repre.pth
+                                                    # canonical cache, mesh 옆에서 우선 사용
 <TRACK_OUT>/gotrack_output/<OBJ>/world_pose_records.json  # per-frame 6D world poses
 ```
 

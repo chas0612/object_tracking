@@ -98,8 +98,8 @@ def main() -> int:
     parser.add_argument("--output-dir", default=None,
                         help="Default: <frame-dir>/foundpose_init/")
     parser.add_argument("--assets-root", default=None,
-                        help="Default: <capture parent>/foundpose_assets when present, otherwise "
-                             "<mesh parent>/foundpose_assets.")
+                        help="Default: <mesh parent>/foundpose_assets when present, otherwise "
+                             "<capture parent>/foundpose_assets.")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--force-onboard", action="store_true")
     parser.add_argument("--skip-silhouette", action="store_true",
@@ -116,10 +116,11 @@ def main() -> int:
     # A campaign-local cache matches its calibration family. Fall back to the
     # mesh-local cache for existing captures that have no campaign cache yet.
     campaign_assets_root = capture_dir.parent / "foundpose_assets"
+    mesh_assets_root = mesh_path.parent / "foundpose_assets"
     assets_root = (
         Path(args.assets_root).expanduser().resolve() if args.assets_root else
-        campaign_assets_root if campaign_assets_root.is_dir() else
-        mesh_path.parent / "foundpose_assets"
+        mesh_assets_root if mesh_assets_root.is_dir() else
+        campaign_assets_root
     )
     object_name = args.object_name or capture_dir.parent.name
     if not mesh_path.is_file():

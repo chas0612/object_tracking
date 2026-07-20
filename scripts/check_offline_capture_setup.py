@@ -94,7 +94,7 @@ def _run_gotrack(args: argparse.Namespace, errors: list[str], checks: list[str])
     for name in (
         "torch", "torchvision", "cv2", "numpy", "trimesh", "nvdiffrast.torch",
         "hydra", "omegaconf", "pytorch_lightning", "faiss", "kornia", "open3d",
-        "pyrender", "OpenGL", "bop_toolkit_lib", "dinov2",
+        "pyrender", "OpenGL", "bop_toolkit_lib", "dinov2", "transforms3d", "viser",
     ):
         _check_import(name, errors)
     try:

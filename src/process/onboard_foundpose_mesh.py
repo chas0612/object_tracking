@@ -4,7 +4,7 @@
 The cache is independent of a particular capture episode.  By default this
 script stores it next to the source mesh:
 
-    ~/shared_data/mesh_blender/<object>/foundpose_assets/
+    ~/shared_data/mesh_new/<object>/foundpose_assets/
 
 Run this once per object in the ``gotrack`` environment.  Different PCs can
 onboard different objects concurrently because each object has its own cache
@@ -31,7 +31,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GOTRACK_ROOT = REPO_ROOT / "autodex" / "perception" / "thirdparty" / "MV-GoTrack"
 ONBOARD_SCRIPT = GOTRACK_ROOT / "scripts" / "onboard_custom_mesh_for_foundpose.py"
-DEFAULT_MESH_ROOT = Path.home() / "shared_data" / "mesh_blender"
+DEFAULT_MESH_ROOT = Path.home() / "shared_data" / "mesh_new"
 
 
 def _validate_object_name(name: str) -> str:
@@ -115,7 +115,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--object-name", required=True, help="Object/FoundPose dataset tag.")
     parser.add_argument("--mesh-root", default=str(DEFAULT_MESH_ROOT),
-                        help="Default: ~/shared_data/mesh_blender")
+                        help="Default: ~/shared_data/mesh_new")
     parser.add_argument("--mesh", default=None,
                         help="Optional mesh override. Default: <mesh-root>/<object>/<object>.obj")
     parser.add_argument("--output-root", default=None,

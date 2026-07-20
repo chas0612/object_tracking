@@ -117,7 +117,11 @@ def main() -> int:
     if not serials:
         raise RuntimeError("No usable camera videos")
     first, last = min(poses), max(poses)
-    frames = args.frame_indices or [first, (first + last) // 2, last]
+    # Frame 0 can be a stale capture or a deliberately recovered reverse
+    # prefix.  Default QA should start at frame 1 when it exists, while still
+    # supporting one-frame smoke-test records.
+    default_first = 1 if first == 0 and last >= 1 else first
+    frames = args.frame_indices or [default_first, (default_first + last) // 2, last]
     frames = list(dict.fromkeys(max(first, min(last, int(frame))) for frame in frames))
     print(f"[sheet] cameras={serials}; frames={frames}; output={output}")
     if args.dry_run:

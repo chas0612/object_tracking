@@ -3,7 +3,7 @@
 
 Tasks are discovered as ``<robot-root>/<object>/<episode>`` and claimed through
 atomic directories on shared storage.  Every task explicitly
-uses the existing ``inspire_dftp/<object>/foundpose_assets`` cache; it never
+uses the canonical ``mesh_new/<object>/foundpose_assets`` cache; it never
 silently onboards a target campaign.
 
 Typical use:
@@ -88,6 +88,19 @@ def _mesh_for(mesh_root: Path, object_name: str) -> Path | None:
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _mesh_for_roots(mesh_roots: list[Path], object_name: str) -> Path | None:
+    """Resolve an object mesh from ordered evidence roots.
+
+    ``mesh_new`` contains corrected meshes for a growing subset of objects;
+    retain ``mesh_blender`` as a compatibility fallback for the rest.
+    """
+    for mesh_root in mesh_roots:
+        mesh = _mesh_for(mesh_root, object_name)
+        if mesh is not None:
+            return mesh
+    return None
+
+
 def _cache_repre(cache_root: Path, object_name: str) -> Path:
     return cache_root / object_name / "foundpose_assets" / "object_repre" / "v1" / object_name / "1" / "repre.pth"
 
@@ -140,7 +153,10 @@ def _prompt_candidates(object_name: str, args: argparse.Namespace) -> list[str]:
 def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[str]]:
     target_root = shared_root / args.target_root_rel
     cache_root = shared_root / args.cache_root_rel
-    mesh_root = shared_root / args.mesh_root_rel
+    mesh_roots = [shared_root / args.mesh_root_rel]
+    fallback_mesh_root = shared_root / args.fallback_mesh_root_rel
+    if fallback_mesh_root not in mesh_roots:
+        mesh_roots.append(fallback_mesh_root)
     if not target_root.is_dir():
         raise FileNotFoundError(f"Target root is missing: {target_root}")
     if not cache_root.is_dir():
@@ -185,9 +201,10 @@ def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[st
         if not (episode_dir / "cam_param" / "extrinsics.json").is_file() or not (episode_dir / "videos").is_dir():
             skipped.append(f"{rel}: missing videos/ or cam_param/extrinsics.json")
             continue
-        mesh = _mesh_for(mesh_root, object_name)
+        mesh = _mesh_for_roots(mesh_roots, object_name)
         if mesh is None:
-            skipped.append(f"{rel}: no unambiguous mesh under {mesh_root / object_name}")
+            searched = ", ".join(str(root / object_name) for root in mesh_roots)
+            skipped.append(f"{rel}: no unambiguous mesh under {searched}")
             continue
         repre = _cache_repre(cache_root, object_name)
         if not repre.is_file():
@@ -523,8 +540,12 @@ def main() -> int:
     p.add_argument("--shared-root-rel", default="shared_data")
     p.add_argument("--target-root-rel", default=None, help="With --mode init: robot root under ~/shared_data; its immediate children are objects.")
     p.add_argument("--robot-label", default=None, help="Label recorded in tasks; default: --target-root-rel.")
-    p.add_argument("--cache-root-rel", default="capture/eccv2026/inspire_dftp", help="Source campaign cache root under ~/shared_data.")
-    p.add_argument("--mesh-root-rel", default="mesh_blender")
+    p.add_argument("--cache-root-rel", default="mesh_new",
+                   help="Canonical FoundPose cache root under ~/shared_data. Default: mesh_new")
+    p.add_argument("--mesh-root-rel", default="mesh_new",
+                   help="Preferred mesh evidence root under ~/shared_data. Default: mesh_new")
+    p.add_argument("--fallback-mesh-root-rel", default="mesh_blender",
+                   help="Fallback evidence root for objects absent from --mesh-root-rel. Default: mesh_blender")
     p.add_argument("--objects", nargs="*", default=None); p.add_argument("--episodes", nargs="*", default=None)
     p.add_argument("--object-episodes-json", default=None,
                    help="JSON object mapping each object to its exact episode list; avoids --objects/--episodes cross products.")
