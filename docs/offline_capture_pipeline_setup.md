@@ -10,7 +10,8 @@ videos/ + cam_param/
   -> frame-0 SAM3 mask                  (sam3 env)
   -> FoundPose initial world pose        (gotrack env)
   -> mask-free GoTrack trajectory        (gotrack env)
-  -> optional reprojection grid video    (gotrack env)
+  -> optional sparse debug sheet / Viser inspection (gotrack env)
+  -> optional reprojection grid video    (gotrack env; exceptional cases only)
 ```
 
 출력은 capture의 기존 `videos/`, `cam_param/` 또는 과거 pipeline 결과를 바꾸지
@@ -353,6 +354,63 @@ python -u scripts/distribute_foundpose_gotrack.py \
 실패 task는 기본으로 재시도하지 않는다. 원인을 log에서 확인한 뒤 worker 또는 launch에
 `--retry-failed`를 추가한다. task당 기본 최대 시도 횟수는 2회다.
 
+### 빠른 결과 검증: sparse sheet와 Viser
+
+전체 camera와 모든 frame을 MP4 grid로 인코딩하는 것은 대규모 run의 기본 QA 방식으로
+비싸다. 우선 아래 순서를 사용한다.
+
+1. `world_pose_records.json`에 pose 누락, NaN 또는 큰 frame 간 jump가 없는지 수치적으로 확인한다.
+2. 대표 camera와 시작/중간/끝 frame만 담은 **한 장의 reprojection contact sheet**를 만든다.
+3. sheet에서 의심스러운 episode만 Viser로 자세히 보고, 필요한 짧은 구간에만 grid video를
+   만든다.
+
+`render_gotrack_debug_sheet.py`는 기본 여섯 camera와 세 frame을 GPU로 overlay하지만,
+최종 JPEG/PNG 한 장만 저장하며 intermediate frame이나 video를 만들지 않는다.
+
+```bash
+export RECORDS="$TRACK_OUT/gotrack_output/$OBJ/world_pose_records.json"
+
+conda run --no-capture-output -n gotrack python -u \
+  src/process/render_gotrack_debug_sheet.py \
+  --capture-dir "$CAPTURE" --object-mesh "$MESH" \
+  --gotrack-records "$RECORDS" \
+  --output "$TRACK_OUT/debug_sheet.jpg"
+```
+
+특정 움직임 구간만 볼 때는 `--frame-indices 120 150 180`처럼 frame을 지정한다.
+더 작은 sheet가 필요하면 `--max-cameras 4 --cell-width 360`을 추가한다.
+
+`view_gotrack_viser.py`는 output을 쓰지 않는 interactive 검사 도구다. object trajectory와
+calibration camera frustum을 띄우며, 기본은 모든 camera, camera image 비표시, 30 FPS 재생이다.
+camera image를 띄우지 않으면 video decode/전송이 없어 가장 빠르다. browser의 `Show camera
+frames`를 켜거나 `--show-camera-images`를 주면 선택 frame의 기존 undistorted video만 읽는다.
+
+```bash
+conda run --no-capture-output -n gotrack python -u \
+  src/process/view_gotrack_viser.py \
+  --capture-dir "$CAPTURE" --object-mesh "$MESH" \
+  --gotrack-records "$RECORDS" --port 8080
+```
+
+Viser는 gotrack environment에 별도로 필요하다.
+
+```bash
+conda run -n gotrack python -m pip install "viser[urdf]"
+```
+
+Inspire capture에서는 `C2R.npy`를 사용해 robot-base 좌표계가 기본 scene frame이 된다.
+episode의 arm/hand recording과 로봇 URDF가 있으면 robot motion도 함께 표시한다. arm/hand
+asset과 robot helper는 이 repository가 아니라 **Paradex repository**에서 제공되므로, viewer를
+실행하는 PC에 Paradex checkout 및 해당 Python import가 준비돼 있어야 한다. object/camera만
+검사하려면 `--no-robot`을 사용한다.
+
+### Texture 없는 mesh
+
+FoundPose의 `make_mesh_tensors()`는 UV와 material은 있지만 texture image가 없는 OBJ도 지원한다.
+이 경우 material color(없으면 중립 회색)로 만든 1×1 RGB texture를 사용해 UV renderer 경로를
+유지한다. 따라서 이런 object의 실패는 즉시 재시도하지 말고, worker가 이 top-level
+FoundationPose 수정이 포함된 commit을 받고 있는지 먼저 확인한다.
+
 ## 7. 결과와 보존 규칙
 
 ```text
@@ -372,7 +430,7 @@ python -u scripts/distribute_foundpose_gotrack.py \
 ## 커밋 전 정리 체크리스트
 
 - [ ] top-level의 `src/process/gotrack_capture.py`, `foundpose_init_capture.py`,
-  `undistort_capture_videos.py`, grid renderer와 `mask.py` 변경을 commit한다.
+  `undistort_capture_videos.py`, debug sheet/Viser/grid renderer와 `mask.py` 변경을 commit한다.
 - [ ] MV-GoTrack base가 `a9f033734c0bdf2d191265d22ea732a914c861f6`이고,
   `patches/MV-GoTrack-offline-capture.patch`가 적용됐는지 확인한다.
 - [ ] `utils/renderer_nvdiffrast.py.orig` 및 `.rej`가 있다면 patch 충돌 잔재다.
