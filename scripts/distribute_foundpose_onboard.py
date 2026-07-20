@@ -138,7 +138,7 @@ def _has_direct_mesh(mesh_root: Path, object_name: str) -> bool:
 def _scenario_object_paths(
     *, shared_root: Path, mesh_root: Path, scenario_root_rel: str
 ) -> tuple[list[str], dict[str, str], dict[str, str]]:
-    """Use episode-0 calibration and a campaign-local cache for each object."""
+    """Use episode-0 calibration and the canonical mesh-local cache."""
     scenario_root = shared_root / scenario_root_rel
     if not scenario_root.is_dir():
         raise FileNotFoundError(f"Scenario root is missing: {scenario_root}")
@@ -154,7 +154,9 @@ def _scenario_object_paths(
             continue
         objects.append(object_name)
         references[object_name] = str(reference.relative_to(shared_root))
-        outputs[object_name] = str((object_dir / "foundpose_assets").relative_to(shared_root))
+        outputs[object_name] = str(
+            (mesh_root / object_name / "foundpose_assets").relative_to(shared_root)
+        )
     if not objects:
         raise ValueError(f"No scenario objects with episode-0 calibration and a mesh: {scenario_root}")
     return objects, references, outputs
