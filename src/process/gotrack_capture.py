@@ -112,11 +112,13 @@ def _select_cameras(extrinsics_json: Path, available: list[str], number: int) ->
     return selected
 
 
-def _write_init_pose_jsons(init_dir: Path, camera_ids: list[str], pose: np.ndarray) -> None:
+def _write_init_pose_jsons(
+    init_dir: Path, camera_ids: list[str], pose: np.ndarray, frame_index: int,
+) -> None:
     frame_poses = init_dir / "frame_poses"
     frame_poses.mkdir(parents=True)
     record = [{
-        "frame_index": 0,
+        "frame_index": int(frame_index),
         "pose_world": pose.tolist(),
         "certainty_count_above_threshold": 1000.0,
         "status": "ok",
@@ -155,6 +157,8 @@ def parse_args() -> argparse.Namespace:
                         help="Input AVI directory. Default: <capture-dir>/undistorted_video (required).")
     parser.add_argument("--mesh", required=True, help="Object mesh in meters.")
     parser.add_argument("--init-pose", required=True, help="FoundPose init_pose_world.npy.")
+    parser.add_argument("--init-frame-index", type=int, default=0,
+                        help="Video frame represented by --init-pose. Frames before it are left untracked.")
     parser.add_argument("--object-name", required=True)
     parser.add_argument("--output-dir", default=None,
                         help="Default: <capture-dir>/gotrack_tracking/ (new directory only).")
@@ -193,7 +197,7 @@ def main() -> int:
         raise FileNotFoundError("--capture-dir/--video-dir must exist, and --mesh/--init-pose must be files.")
     if not GOTRACK_RUNNER.is_file():
         raise FileNotFoundError(f"GoTrack runner not found: {GOTRACK_RUNNER}")
-    if args.num_cameras < 1 or args.min_video_frames < 1 or args.camera_micro_batch_size < 0 or args.max_video_duration_skew_sec < 0:
+    if args.num_cameras < 1 or args.min_video_frames < 1 or args.camera_micro_batch_size < 0 or args.max_video_duration_skew_sec < 0 or args.init_frame_index < 0:
         raise ValueError("--num-cameras/--min-video-frames must be positive, and batch/skew options must be non-negative.")
 
     output_dir = (Path(args.output_dir).expanduser().resolve() if args.output_dir else
@@ -229,6 +233,7 @@ def main() -> int:
         "video_timings": video_timings, "median_video_duration_sec": median_duration,
         "min_video_frames": args.min_video_frames, "max_video_duration_skew_sec": args.max_video_duration_skew_sec,
         "max_frames": args.max_frames,
+        "init_frame_index": args.init_frame_index,
         "gpus": args.gpus, "camera_micro_batch_size": args.camera_micro_batch_size,
     }
     if args.dry_run:
@@ -243,7 +248,7 @@ def main() -> int:
     anchor_bank = output_dir / "anchor_bank.npz"
     tracker_output = output_dir / "gotrack_output"
     _stage_input(capture_dir, video_dir, stage_dir)
-    _write_init_pose_jsons(init_dir, selected, pose)
+    _write_init_pose_jsons(init_dir, selected, pose, args.init_frame_index)
 
     generate_anchor_cmd = [
         sys.executable, str(ANCHOR_GENERATOR), "--mesh-path", str(mesh_path),

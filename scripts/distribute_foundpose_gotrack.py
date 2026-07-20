@@ -238,7 +238,12 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
     assets = shared / task["assets_rel"]
     attempt = int(task["attempts"])
     attempt_dir = episode / "object_tracking_foundpose_gotrack" / schedule_dir.name / f"attempt_{attempt:02d}"
-    frame_dir, init_dir, track_dir = (attempt_dir / "foundpose_frame_000000", attempt_dir / "foundpose_init", attempt_dir / "gotrack_tracking")
+    init_frame_index = int(args.init_frame_index)
+    frame_dir, init_dir, track_dir = (
+        attempt_dir / f"foundpose_frame_{init_frame_index:06d}",
+        attempt_dir / "foundpose_init",
+        attempt_dir / "gotrack_tracking",
+    )
     log_path = schedule_dir / "logs" / f"{task['task_id']}.attempt{attempt}.{task['worker_id']}.log"
     attempt_dir.mkdir(parents=True, exist_ok=False)
     task.update({"attempt_dir": str(attempt_dir.relative_to(shared)), "log": str(log_path), "phase": "undistort"})
@@ -262,7 +267,7 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                 task["sam3_prompt_current"] = prompt
                 task["sam3_attempted_prompts"].append(prompt)
                 _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
-                _run_command(sam3 + ["src/process/mask.py", "--capture_dir", str(episode), "--frame-index", "0",
+                _run_command(sam3 + ["src/process/mask.py", "--capture_dir", str(episode), "--frame-index", str(init_frame_index),
                                      "--prompt", prompt, "--video-dir", str(episode / "undistorted_video"),
                                      "--frame-output-dir", str(frame_dir)], log, REPO_ROOT)
                 metadata_path = frame_dir / "metadata.json"
@@ -286,6 +291,7 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                                     "--mesh", str(mesh), "--init-pose", str(init_dir / "init_pose_world.npy"), "--object-name", task["object_name"],
                                     "--num-cameras", str(args.num_cameras), "--allow-fewer-cameras",
                                     "--camera-micro-batch-size", str(args.camera_micro_batch_size),
+                                    "--init-frame-index", str(init_frame_index),
                                     "--max-video-duration-skew-sec", str(args.max_video_duration_skew_sec),
                                     "--max-frames", str(args.max_frames), "--output-dir", str(track_dir)], log, REPO_ROOT)
         task["status"] = "completed" if _track_done(task, attempt_dir) else "failed"
@@ -314,6 +320,7 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
                                                 "num_cameras": args.num_cameras, "max_frames": args.max_frames,
                                                 "camera_micro_batch_size": args.camera_micro_batch_size,
                                                 "max_video_duration_skew_sec": args.max_video_duration_skew_sec,
+                                                "init_frame_index": args.init_frame_index,
                                                 "max_attempts": args.max_attempts, "n_tasks": len(tasks), "skipped": skipped})
     for task in tasks:
         task.update({"status": "pending", "attempts": 0, "phase": "pending", "created_utc": _now(), "updated_utc": _now()})
@@ -344,6 +351,7 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
     args.max_frames = int(manifest["max_frames"])
     args.camera_micro_batch_size = int(manifest["camera_micro_batch_size"])
     args.max_video_duration_skew_sec = float(manifest["max_video_duration_skew_sec"])
+    args.init_frame_index = int(manifest.get("init_frame_index", 0))
     args.max_attempts = int(manifest.get("max_attempts", args.max_attempts))
     for spec in args.workers:
         worker_id = _safe_id(spec)
@@ -353,6 +361,7 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
                    "--shared-root-rel", args.shared_root_rel, "--num-cameras", str(args.num_cameras),
                    "--camera-micro-batch-size", str(args.camera_micro_batch_size),
                    "--max-video-duration-skew-sec", str(args.max_video_duration_skew_sec),
+                   "--init-frame-index", str(args.init_frame_index),
                    "--max-frames", str(args.max_frames), "--max-attempts", str(args.max_attempts)]
         if args.retry_failed:
             command.append("--retry-failed")
@@ -419,12 +428,14 @@ def main() -> int:
     p.add_argument("--num-cameras", type=int, default=22); p.add_argument("--camera-micro-batch-size", type=int, default=11)
     p.add_argument("--max-video-duration-skew-sec", type=float, default=1.0)
     p.add_argument("--max-frames", type=int, default=-1)
+    p.add_argument("--init-frame-index", type=int, default=0,
+                   help="SAM3/FoundPose bootstrap frame. Nonzero values track forward from that frame only.")
     p.add_argument("--max-attempts", type=int, default=2)
     p.add_argument("--retry-failed", action="store_true"); p.add_argument("--dry-run", action="store_true")
     p.add_argument("--confirm-workers-stopped", action="store_true",
                    help="Required with --mode reset-running; confirms no worker can still own a task.")
     args = p.parse_args()
-    if args.connect_timeout < 1 or args.num_cameras < 1 or args.camera_micro_batch_size < 0 or args.max_video_duration_skew_sec < 0 or args.max_frames == 0 or args.max_attempts < 1: raise ValueError("invalid worker/tracking option")
+    if args.connect_timeout < 1 or args.num_cameras < 1 or args.camera_micro_batch_size < 0 or args.max_video_duration_skew_sec < 0 or args.max_frames == 0 or args.max_attempts < 1 or args.init_frame_index < 0: raise ValueError("invalid worker/tracking option")
     roots = (args.cache_root_rel, args.mesh_root_rel) + ((args.target_root_rel,) if args.target_root_rel else ())
     if any(Path(x).is_absolute() or ".." in Path(x).parts for x in roots): raise ValueError("root paths must be safe relative paths")
     shared = Path.home() / args.shared_root_rel; schedule = _schedule_dir(shared, args.schedule_id)
