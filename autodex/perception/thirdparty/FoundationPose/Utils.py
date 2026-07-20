@@ -107,7 +107,28 @@ set_logging_format()
 def make_mesh_tensors(mesh, device='cuda', max_tex_size=None):
   mesh_tensors = {}
   if isinstance(mesh.visual, trimesh.visual.texture.TextureVisuals):
-    img = np.array(mesh.visual.material.image.convert('RGB'))
+    # OBJ meshes can carry UV coordinates and a material, but no image map
+    # (``SimpleMaterial.image is None``).  Keep the texture/UV render path in
+    # that case by supplying a 1x1 texture from the material colour.  Falling
+    # back to vertex colours here would discard the valid UV topology and
+    # used to crash before silhouette refinement could start.
+    material = mesh.visual.material
+    material_image = getattr(material, 'image', None)
+    if material_image is None:
+      color = np.asarray(getattr(material, 'main_color', [128, 128, 128])).reshape(-1)
+      if color.size < 3:
+        color = np.array([128, 128, 128])
+      color = color[:3]
+      if np.issubdtype(color.dtype, np.floating) and color.size and color.max() <= 1.0:
+        color = color * 255.0
+      color = np.clip(color, 0, 255).astype(np.uint8)
+      logging.warning(
+        "Mesh material has no texture image; using a 1x1 RGB fallback texture %s",
+        color.tolist(),
+      )
+      img = color.reshape(1, 1, 3)
+    else:
+      img = np.array(material_image.convert('RGB'))
     img = img[...,:3]
     if max_tex_size is not None:
       max_size = max(img.shape[0], img.shape[1])
