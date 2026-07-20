@@ -106,6 +106,27 @@ def _load_prompt_map(path_value: str | None) -> dict[str, str]:
             if isinstance(value, str) and value.strip()}
 
 
+def _load_object_episode_map(path_value: str | None) -> dict[str, set[str]]:
+    """Load exact object-to-episode selections without cross-product surprises."""
+    if not path_value:
+        return {}
+    path = Path(path_value).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"Object episode map is missing: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Object episode map must be a JSON object: {path}")
+    result: dict[str, set[str]] = {}
+    for object_name, episodes in payload.items():
+        if not isinstance(object_name, str) or not isinstance(episodes, list):
+            raise ValueError("Object episode map values must be episode lists")
+        selected = {str(episode) for episode in episodes}
+        if not selected:
+            raise ValueError(f"Object episode map has no episodes for {object_name!r}")
+        result[object_name] = selected
+    return result
+
+
 def _prompt_candidates(object_name: str, args: argparse.Namespace) -> list[str]:
     """Prefer curated SAM3 text, then broad original text, then object name."""
     candidates = [
@@ -126,6 +147,7 @@ def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[st
         raise FileNotFoundError(f"Cache campaign root is missing: {cache_root}")
     objects = set(args.objects or [])
     episodes = set(args.episodes or [])
+    object_episode_map = args.object_episode_map
     tasks: list[dict[str, Any]] = []
     skipped: list[str] = []
     # A robot root has object directories directly beneath it.  Deliberately
@@ -141,6 +163,8 @@ def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[st
             continue
         if objects and object_dir.name not in objects:
             continue
+        if object_episode_map and object_dir.name not in object_episode_map:
+            continue
         for episode_dir in sorted(object_dir.iterdir()):
             if (episode_dir.is_dir() and not episode_dir.name.startswith(".")
                     and episode_dir.name not in generated_dirs):
@@ -155,6 +179,8 @@ def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[st
         object_name, episode = rel.parts[-2:]
         robot_path = args.robot_label or args.target_root_rel
         if episodes and episode not in episodes:
+            continue
+        if object_episode_map and episode not in object_episode_map[object_name]:
             continue
         if not (episode_dir / "cam_param" / "extrinsics.json").is_file() or not (episode_dir / "videos").is_dir():
             skipped.append(f"{rel}: missing videos/ or cam_param/extrinsics.json")
@@ -179,15 +205,35 @@ def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[st
     return tasks, skipped
 
 
-def _track_done(task: dict[str, Any], attempt_dir: Path) -> bool:
+def _tracking_summary(task: dict[str, Any], attempt_dir: Path, min_coverage: float, max_trailing_missing: int) -> dict[str, Any]:
     records = attempt_dir / "gotrack_tracking" / "gotrack_output" / task["object_name"] / "world_pose_records.json"
     if not records.is_file():
-        return False
+        return {"complete": False, "reason": "records_missing", "records": 0, "valid_poses": 0,
+                "coverage": 0.0, "trailing_missing": 0}
     try:
         data = json.loads(records.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        return False
-    return isinstance(data, list) and any(isinstance(x, dict) and x.get("pose_world") is not None for x in data)
+        return {"complete": False, "reason": "records_invalid_json", "records": 0, "valid_poses": 0,
+                "coverage": 0.0, "trailing_missing": 0}
+    if not isinstance(data, list) or not data:
+        return {"complete": False, "reason": "records_empty", "records": 0, "valid_poses": 0,
+                "coverage": 0.0, "trailing_missing": 0}
+    valid = sum(isinstance(row, dict) and row.get("pose_world") is not None for row in data)
+    trailing_missing = 0
+    for row in reversed(data):
+        if isinstance(row, dict) and row.get("pose_world") is not None:
+            break
+        trailing_missing += 1
+    coverage = valid / len(data)
+    complete = coverage >= min_coverage and trailing_missing <= max_trailing_missing
+    if coverage < min_coverage:
+        reason = f"coverage={coverage:.3f}<{min_coverage:.3f}"
+    elif trailing_missing > max_trailing_missing:
+        reason = f"trailing_missing={trailing_missing}>{max_trailing_missing}"
+    else:
+        reason = None
+    return {"complete": complete, "reason": reason, "records": len(data), "valid_poses": valid,
+            "coverage": coverage, "trailing_missing": trailing_missing}
 
 
 def _task_path(schedule_dir: Path, task_id: str) -> Path:
@@ -229,6 +275,24 @@ def _run_command(command: list[str], log: Any, cwd: Path) -> None:
     log.write("$ " + " ".join(shlex.quote(part) for part in command) + "\n")
     log.flush()
     subprocess.run(command, cwd=str(cwd), stdout=log, stderr=subprocess.STDOUT, text=True, check=True)
+
+
+def _publish_debug_sheet(episode_sheet: Path, central_sheet: Path) -> str:
+    """Make the central QA view point at the episode-owned sheet.
+
+    A relative symlink avoids duplicating JPEGs on the shared NAS.  Some NAS
+    mounts disallow symlinks, in which case a normal copy is still useful and
+    keeps sheet generation non-fatal to tracking.
+    """
+    central_sheet.parent.mkdir(parents=True, exist_ok=True)
+    if central_sheet.exists() or central_sheet.is_symlink():
+        return "existing"
+    try:
+        central_sheet.symlink_to(os.path.relpath(episode_sheet, central_sheet.parent))
+        return "symlink"
+    except OSError:
+        shutil.copy2(episode_sheet, central_sheet)
+        return "copy"
 
 
 def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -294,8 +358,36 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                                     "--init-frame-index", str(init_frame_index),
                                     "--max-video-duration-skew-sec", str(args.max_video_duration_skew_sec),
                                     "--max-frames", str(args.max_frames), "--output-dir", str(track_dir)], log, REPO_ROOT)
-        task["status"] = "completed" if _track_done(task, attempt_dir) else "failed"
-        task["reason"] = None if task["status"] == "completed" else "commands_succeeded_but_tracking_output_missing"
+            tracking_summary = _tracking_summary(task, attempt_dir, args.min_valid_pose_coverage, args.max_trailing_missing_frames)
+            task["tracking_summary"] = tracking_summary
+            tracking_ok = bool(tracking_summary["complete"])
+            if tracking_ok and args.debug_sheets:
+                task["phase"] = "debug_sheet"
+                _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
+                records = track_dir / "gotrack_output" / task["object_name"] / "world_pose_records.json"
+                episode_sheet = episode / f"gotrack_debug_sheet_{schedule_dir.name}_{attempt_dir.name}.jpg"
+                central_sheet = shared / args.debug_sheet_output_root_rel / schedule_dir.name / f"{task['task_id']}.jpg"
+                try:
+                    if not episode_sheet.is_file():
+                        _run_command(gotrack + ["src/process/render_gotrack_debug_sheet.py", "--capture-dir", str(episode),
+                                                "--object-mesh", str(mesh), "--gotrack-records", str(records),
+                                                "--output", str(episode_sheet), "--max-cameras", str(args.debug_sheet_max_cameras)], log, REPO_ROOT)
+                    task["debug_sheet_rel"] = str(episode_sheet.relative_to(shared))
+                    task["debug_sheet_central_rel"] = str(central_sheet.relative_to(shared))
+                    task["debug_sheet_publish"] = _publish_debug_sheet(episode_sheet, central_sheet)
+                    task["debug_sheet_status"] = "completed"
+                except Exception as exc:
+                    # A renderer problem must not discard an otherwise valid
+                    # tracking result.  The retryable batch renderer remains
+                    # available for this exact recovery path.
+                    task["debug_sheet_status"] = "failed"
+                    task["debug_sheet_error"] = f"{type(exc).__name__}: {exc}"
+                    log.write(f"[debug-sheet] nonfatal failure: {task['debug_sheet_error']}\n")
+                    log.flush()
+        tracking_summary = _tracking_summary(task, attempt_dir, args.min_valid_pose_coverage, args.max_trailing_missing_frames)
+        task["tracking_summary"] = tracking_summary
+        task["status"] = "completed" if tracking_summary["complete"] else "failed"
+        task["reason"] = None if task["status"] == "completed" else f"tracking_incomplete: {tracking_summary['reason']}"
     except subprocess.CalledProcessError as exc:
         task.update({"status": "failed", "reason": f"returncode={exc.returncode}"})
     except Exception as exc:
@@ -317,10 +409,16 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
     for dirname in ("tasks", "claims", "logs", "workers"): (schedule / dirname).mkdir(parents=True, exist_ok=True)
     _atomic_json(schedule / "manifest.json", {"schedule_id": schedule.name, "created_utc": _now(), "target_root_rel": args.target_root_rel,
                                                 "cache_root_rel": args.cache_root_rel, "mesh_root_rel": args.mesh_root_rel,
+                                                "object_episode_map": {name: sorted(episodes) for name, episodes in args.object_episode_map.items()},
                                                 "num_cameras": args.num_cameras, "max_frames": args.max_frames,
                                                 "camera_micro_batch_size": args.camera_micro_batch_size,
                                                 "max_video_duration_skew_sec": args.max_video_duration_skew_sec,
                                                 "init_frame_index": args.init_frame_index,
+                                                "debug_sheets": args.debug_sheets,
+                                                "debug_sheet_max_cameras": args.debug_sheet_max_cameras,
+                                                "debug_sheet_output_root_rel": args.debug_sheet_output_root_rel,
+                                                "min_valid_pose_coverage": args.min_valid_pose_coverage,
+                                                "max_trailing_missing_frames": args.max_trailing_missing_frames,
                                                 "max_attempts": args.max_attempts, "n_tasks": len(tasks), "skipped": skipped})
     for task in tasks:
         task.update({"status": "pending", "attempts": 0, "phase": "pending", "created_utc": _now(), "updated_utc": _now()})
@@ -352,6 +450,11 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
     args.camera_micro_batch_size = int(manifest["camera_micro_batch_size"])
     args.max_video_duration_skew_sec = float(manifest["max_video_duration_skew_sec"])
     args.init_frame_index = int(manifest.get("init_frame_index", 0))
+    args.debug_sheets = bool(manifest.get("debug_sheets", args.debug_sheets))
+    args.debug_sheet_max_cameras = int(manifest.get("debug_sheet_max_cameras", args.debug_sheet_max_cameras))
+    args.debug_sheet_output_root_rel = str(manifest.get("debug_sheet_output_root_rel", args.debug_sheet_output_root_rel))
+    args.min_valid_pose_coverage = float(manifest.get("min_valid_pose_coverage", args.min_valid_pose_coverage))
+    args.max_trailing_missing_frames = int(manifest.get("max_trailing_missing_frames", args.max_trailing_missing_frames))
     args.max_attempts = int(manifest.get("max_attempts", args.max_attempts))
     for spec in args.workers:
         worker_id = _safe_id(spec)
@@ -362,7 +465,12 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
                    "--camera-micro-batch-size", str(args.camera_micro_batch_size),
                    "--max-video-duration-skew-sec", str(args.max_video_duration_skew_sec),
                    "--init-frame-index", str(args.init_frame_index),
+                   "--debug-sheet-max-cameras", str(args.debug_sheet_max_cameras),
+                   "--debug-sheet-output-root-rel", args.debug_sheet_output_root_rel,
+                   "--min-valid-pose-coverage", str(args.min_valid_pose_coverage),
+                   "--max-trailing-missing-frames", str(args.max_trailing_missing_frames),
                    "--max-frames", str(args.max_frames), "--max-attempts", str(args.max_attempts)]
+        command.append("--debug-sheets" if args.debug_sheets else "--no-debug-sheets")
         if args.retry_failed:
             command.append("--retry-failed")
         rendered = " ".join(part if part.startswith("$HOME/") else shlex.quote(part) for part in command)
@@ -418,6 +526,8 @@ def main() -> int:
     p.add_argument("--cache-root-rel", default="capture/eccv2026/inspire_dftp", help="Source campaign cache root under ~/shared_data.")
     p.add_argument("--mesh-root-rel", default="mesh_blender")
     p.add_argument("--objects", nargs="*", default=None); p.add_argument("--episodes", nargs="*", default=None)
+    p.add_argument("--object-episodes-json", default=None,
+                   help="JSON object mapping each object to its exact episode list; avoids --objects/--episodes cross products.")
     p.add_argument("--workers", nargs="+", default=None); p.add_argument("--worker-id", default=None)
     p.add_argument("--remote-repo-rel", default="object_tracking"); p.add_argument("--connect-timeout", type=int, default=10)
     p.add_argument("--gotrack-env", default="gotrack"); p.add_argument("--sam3-env", default="sam3")
@@ -425,22 +535,37 @@ def main() -> int:
                    help="Curated object-to-SAM3-prompt JSON. Missing file is allowed.")
     p.add_argument("--object-prompts-original-json", default=str(Path.home() / "sam3/object_prompts_original.json"),
                    help="Broader fallback object-to-SAM3-prompt JSON. Missing file is allowed.")
-    p.add_argument("--num-cameras", type=int, default=22); p.add_argument("--camera-micro-batch-size", type=int, default=11)
+    p.add_argument("--num-cameras", type=int, default=22)
+    p.add_argument("--camera-micro-batch-size", type=int, default=0,
+                   help="0 (default) refines all selected cameras together; set lower only to reduce GPU memory.")
     p.add_argument("--max-video-duration-skew-sec", type=float, default=1.0)
     p.add_argument("--max-frames", type=int, default=-1)
-    p.add_argument("--init-frame-index", type=int, default=0,
-                   help="SAM3/FoundPose bootstrap frame. Nonzero values track forward from that frame only.")
+    p.add_argument("--init-frame-index", type=int, default=30,
+                   help="SAM3/FoundPose bootstrap frame. Default 30 avoids stale frame-0 captures; GoTrack merges reverse prefix poses automatically.")
     p.add_argument("--max-attempts", type=int, default=2)
+    debug_group = p.add_mutually_exclusive_group()
+    debug_group.add_argument("--debug-sheets", dest="debug_sheets", action="store_true",
+                             help="Render one compact reprojection sheet after each successful GoTrack task (default).")
+    debug_group.add_argument("--no-debug-sheets", dest="debug_sheets", action="store_false",
+                             help="Skip per-task sheet rendering; use the batch renderer later if needed.")
+    p.set_defaults(debug_sheets=True)
+    p.add_argument("--debug-sheet-max-cameras", type=int, default=6)
+    p.add_argument("--debug-sheet-output-root-rel", default="object_tracking/gotrack_debug_sheets")
+    p.add_argument("--min-valid-pose-coverage", type=float, default=0.5,
+                   help="Mark task failed below this valid-pose fraction. Deliberately conservative; semantic drift stays completed/suspect.")
+    p.add_argument("--max-trailing-missing-frames", type=int, default=30,
+                   help="Mark task failed when more than this many final frames lack poses.")
     p.add_argument("--retry-failed", action="store_true"); p.add_argument("--dry-run", action="store_true")
     p.add_argument("--confirm-workers-stopped", action="store_true",
                    help="Required with --mode reset-running; confirms no worker can still own a task.")
     args = p.parse_args()
-    if args.connect_timeout < 1 or args.num_cameras < 1 or args.camera_micro_batch_size < 0 or args.max_video_duration_skew_sec < 0 or args.max_frames == 0 or args.max_attempts < 1 or args.init_frame_index < 0: raise ValueError("invalid worker/tracking option")
-    roots = (args.cache_root_rel, args.mesh_root_rel) + ((args.target_root_rel,) if args.target_root_rel else ())
+    if args.connect_timeout < 1 or args.num_cameras < 1 or args.camera_micro_batch_size < 0 or args.max_video_duration_skew_sec < 0 or args.max_frames == 0 or args.max_attempts < 1 or args.init_frame_index < 0 or args.debug_sheet_max_cameras < 1 or not 0 < args.min_valid_pose_coverage <= 1 or args.max_trailing_missing_frames < 0: raise ValueError("invalid worker/tracking option")
+    roots = (args.cache_root_rel, args.mesh_root_rel, args.debug_sheet_output_root_rel) + ((args.target_root_rel,) if args.target_root_rel else ())
     if any(Path(x).is_absolute() or ".." in Path(x).parts for x in roots): raise ValueError("root paths must be safe relative paths")
     shared = Path.home() / args.shared_root_rel; schedule = _schedule_dir(shared, args.schedule_id)
     args.object_prompts = _load_prompt_map(args.object_prompts_json)
     args.object_prompts_original = _load_prompt_map(args.object_prompts_original_json)
+    args.object_episode_map = _load_object_episode_map(args.object_episodes_json)
     args.local_worker = args.mode == "worker" and (args.worker_id or socket.gethostname()).startswith("local")
     if args.mode == "init":
         if not args.target_root_rel: raise ValueError("--target-root-rel is required for --mode init")

@@ -274,7 +274,8 @@ conda run -n sam3 python src/process/mask.py --help
 export CAPTURE=/path/to/capture/object/episode
 export MESH=/path/to/mesh.obj
 export OBJ=object_name
-export FRAME_OUT="$CAPTURE/foundpose_frame_000000_$OBJ"
+export FRAME_INDEX=30  # frame 0 can contain a stale capture on this platform
+export FRAME_OUT="$CAPTURE/foundpose_frame_$(printf '%06d' "$FRAME_INDEX")_$OBJ"
 export INIT_OUT="$CAPTURE/foundpose_$OBJ"
 export TRACK_OUT="$CAPTURE/gotrack_${OBJ}_12cam"
 
@@ -283,7 +284,7 @@ conda run --no-capture-output -n gotrack python -u \
   src/process/undistort_capture_videos.py --capture-dir "$CAPTURE"
 
 conda run --no-capture-output -n sam3 python -u src/process/mask.py \
-  --capture_dir "$CAPTURE" --frame-index 0 --prompt "${OBJ//_/ }" \
+  --capture_dir "$CAPTURE" --frame-index "$FRAME_INDEX" --prompt "${OBJ//_/ }" \
   --video-dir "$CAPTURE/undistorted_video" --frame-output-dir "$FRAME_OUT"
 
 conda run --no-capture-output -n gotrack python -u \
@@ -295,9 +296,16 @@ conda run --no-capture-output -n gotrack python -u \
   src/process/gotrack_capture.py \
   --capture-dir "$CAPTURE" --video-dir "$CAPTURE/undistorted_video" \
   --mesh "$MESH" --init-pose "$INIT_OUT/init_pose_world.npy" \
-  --object-name "$OBJ" --num-cameras 12 --max-frames -1 \
+  --object-name "$OBJ" --init-frame-index "$FRAME_INDEX" --bidirectional \
+  --num-cameras 12 --max-frames -1 \
   --output-dir "$TRACK_OUT"
 ```
+
+기본 bootstrap frame은 30이다. `gotrack_capture.py`는 이 frame에서 FoundPose로
+초기화한 뒤 정방향 tracking과 `0..30` 역방향 tracking을 실행하고, 원래 시간순의
+`gotrack_output/<object>/world_pose_records.json` 하나로 합친다. 따라서 stale frame-0
+문제를 피하면서도 frame 0부터 pose를 제공한다. seed 이전 pose가 필요 없는 짧은
+smoke test에만 `--forward-only`를 사용한다.
 
 GoTrack은 모든 AVI의 frame count/FPS로 계산한 duration을 비교해 median에서 기본 1초 이상
 벗어난 camera만 자동 제외한다. 몇 frame 누락은 허용하며, 과거 특정 serial을 하드코딩해
@@ -305,9 +313,10 @@ GoTrack은 모든 AVI의 frame count/FPS로 계산한 duration을 비교해 medi
 확인할 수 있다. 필요하면 `--max-video-duration-skew-sec`으로 threshold를 조절하거나 `0`으로
 끄고, 정말 제외할 camera만 `--exclude-cameras`로 명시한다.
 
+기본값 `--camera-micro-batch-size 0`은 선택 camera 전체를 한 번에 refinement한다.
 GoTrack이 OOM이면 `--num-cameras 8`로 새로운 `--output-dir`에 재실행하거나,
-선택 camera 수보다 작은 `--camera-micro-batch-size`를 쓴다. 예를 들어 21개
-camera 전체 관측을 유지하면서 GPU refinement만 8개씩 처리하려면
+선택 camera 수보다 작은 micro-batch를 쓴다. 예를 들어 21개 camera 전체 관측을
+유지하면서 GPU refinement만 8개씩 처리하려면
 `--num-cameras 21 --camera-micro-batch-size 8`이다. 이 옵션이 동작하려면 해당
 변경을 포함한 **MV-GoTrack fork commit**이어야 한다.
 
@@ -318,7 +327,13 @@ camera 전체 관측을 유지하면서 GPU refinement만 8개씩 처리하려�
 cache를 만들지 않고, 명시적으로
 `capture/eccv2026/inspire_dftp/<object>/foundpose_assets`의 `repre.pth`를 사용한다.
 worker는 shared-storage atomic claim으로 episode 하나씩만 점유하며, 다음 단계를
-순서대로 실행한다: undistort → SAM3 frame-0 mask → FoundPose init → GoTrack.
+순서대로 실행한다: undistort → SAM3 frame-30 mask → FoundPose init → GoTrack
+정방향+역방향 병합. `--init-frame-index`로 seed를 바꿀 수 있다.
+
+`completed`는 더 이상 pose 하나만 있어도 되지 않는다. 기본적으로 valid pose coverage가
+50% 이상이고 마지막 missing 구간이 30 frame 이하여야 한다. 그보다 심한 중단은
+`failed`와 `tracking_summary`로 기록되어 재시도 대상이 된다. 반면 pose가 전 frame에
+있지만 의미상 drift한 경우는 자동 실패로 단정하지 않는다.
 GoTrack 재시도는 새 `attempt_NN` output directory를 사용하므로 partial output을
 덮어쓰지 않는다.
 
@@ -329,12 +344,12 @@ cd "$REPO"
 python -u scripts/distribute_foundpose_gotrack.py \
   --mode init --schedule-id hand_taeyun_right_01 \
   --target-root-rel capture/eccv2026/hand_taeyun/right \
-  --num-cameras 22 --camera-micro-batch-size 11 --max-frames -1 --dry-run
+  --num-cameras 22 --max-frames -1 --dry-run
 
 python -u scripts/distribute_foundpose_gotrack.py \
   --mode init --schedule-id hand_taeyun_right_01 \
   --target-root-rel capture/eccv2026/hand_taeyun/right \
-  --num-cameras 22 --camera-micro-batch-size 11 --max-frames -1
+  --num-cameras 22 --max-frames -1
 ```
 
 그 다음 controller는 remote worker를 `nohup`으로 detach한다. controller가 종료돼도

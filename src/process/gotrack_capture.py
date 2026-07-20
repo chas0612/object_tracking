@@ -23,6 +23,7 @@ import argparse
 import importlib.util
 import json
 import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -140,6 +141,88 @@ def _stage_input(capture_dir: Path, video_dir: Path, stage_dir: Path) -> None:
     (stage_dir / "undistorted_video").symlink_to(video_dir.resolve(), target_is_directory=True)
 
 
+def _write_reversed_prefix_videos(
+    source_dir: Path, destination_dir: Path, camera_ids: list[str], frame_index: int,
+) -> None:
+    """Write only frames ``frame_index..0`` for the backward GoTrack pass.
+
+    We deliberately do not reverse the whole capture: the backward pass only
+    needs to recover the short pre-seed prefix.  ``MJPG`` is used because it
+    is reliably readable by OpenCV and MV-GoTrack on all capture workers.
+    """
+    destination_dir.mkdir(parents=True)
+    for camera_id in camera_ids:
+        source = source_dir / f"{camera_id}.avi"
+        cap = cv2.VideoCapture(str(source))
+        try:
+            if not cap.isOpened():
+                raise RuntimeError(f"Could not open video for reverse pass: {source}")
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = float(cap.get(cv2.CAP_PROP_FPS))
+            width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if frame_index >= total:
+                raise ValueError(f"--init-frame-index {frame_index} is outside {source} (0..{total - 1})")
+            if fps <= 0 or width <= 0 or height <= 0:
+                raise RuntimeError(f"Invalid AVI metadata for reverse pass: {source}")
+            target = destination_dir / source.name
+            writer = cv2.VideoWriter(str(target), cv2.VideoWriter_fourcc(*"MJPG"), fps, (width, height))
+            if not writer.isOpened():
+                raise RuntimeError(f"Could not create reverse video: {target}")
+            try:
+                for original_index in range(frame_index, -1, -1):
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, original_index)
+                    ok, frame = cap.read()
+                    if not ok:
+                        raise RuntimeError(f"Could not decode {source} frame {original_index} for reverse pass")
+                    writer.write(frame)
+            finally:
+                writer.release()
+        finally:
+            cap.release()
+
+
+def _load_records(path: Path) -> list[dict[str, object]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list) or not all(isinstance(row, dict) for row in payload):
+        raise ValueError(f"Expected a list of records in {path}")
+    return payload
+
+
+def _merge_bidirectional_records(
+    forward_path: Path, backward_path: Path, destination: Path, seed_frame: int,
+) -> dict[str, int]:
+    """Map reverse-local frames back to capture indices and join at the seed.
+
+    The FoundPose seed belongs to the forward run.  Earlier frames come from
+    the reversed prefix, so the public output remains one normal chronological
+    ``world_pose_records.json`` usable by all existing visualization tools.
+    """
+    forward = _load_records(forward_path)
+    backward = _load_records(backward_path)
+    merged = {int(row["frame_index"]): dict(row) for row in forward if "frame_index" in row}
+    backward_used = 0
+    for reverse_row in backward:
+        if "frame_index" not in reverse_row:
+            continue
+        original_index = seed_frame - int(reverse_row["frame_index"])
+        if original_index < 0 or original_index >= seed_frame:
+            continue
+        row = dict(reverse_row)
+        row["frame_index"] = original_index
+        row["tracking_direction"] = "backward"
+        row["reverse_source_frame_index"] = int(reverse_row["frame_index"])
+        merged[original_index] = row
+        backward_used += 1
+    ordered: list[dict[str, object]] = []
+    for frame_index in sorted(merged):
+        row = merged[frame_index]
+        row.setdefault("tracking_direction", "forward")
+        ordered.append(row)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(ordered, indent=2) + "\n", encoding="utf-8")
+    return {"forward_records": len(forward), "backward_records_used": backward_used, "merged_records": len(ordered)}
+
+
 def _require_gotrack_dependencies() -> None:
     missing = [name for name in ("hydra", "omegaconf") if importlib.util.find_spec(name) is None]
     if missing:
@@ -157,8 +240,14 @@ def parse_args() -> argparse.Namespace:
                         help="Input AVI directory. Default: <capture-dir>/undistorted_video (required).")
     parser.add_argument("--mesh", required=True, help="Object mesh in meters.")
     parser.add_argument("--init-pose", required=True, help="FoundPose init_pose_world.npy.")
-    parser.add_argument("--init-frame-index", type=int, default=0,
-                        help="Video frame represented by --init-pose. Frames before it are left untracked.")
+    parser.add_argument("--init-frame-index", type=int, default=30,
+                        help="Video frame represented by --init-pose. Default 30 avoids known stale frame-0 captures.")
+    direction_group = parser.add_mutually_exclusive_group()
+    direction_group.add_argument("--bidirectional", dest="bidirectional", action="store_true",
+                                 help="Track forward and reverse the 0..seed prefix, then merge into one chronological output (default).")
+    direction_group.add_argument("--forward-only", dest="bidirectional", action="store_false",
+                                 help="Only track forward from the seed; frames before it remain untracked.")
+    parser.set_defaults(bidirectional=True)
     parser.add_argument("--object-name", required=True)
     parser.add_argument("--output-dir", default=None,
                         help="Default: <capture-dir>/gotrack_tracking/ (new directory only).")
@@ -225,6 +314,8 @@ def main() -> int:
             capture_dir / "cam_param" / "extrinsics.json", eligible, min(args.num_cameras, len(eligible)),
         )
 
+    if args.init_frame_index >= min(int(video_timings[camera_id]["frames"]) for camera_id in selected):
+        raise ValueError(f"--init-frame-index {args.init_frame_index} is outside at least one selected camera video")
     manifest = {
         "capture_dir": str(capture_dir), "video_dir": str(video_dir), "mesh": str(mesh_path), "init_pose": str(init_pose_path),
         "object_name": args.object_name, "requested_num_cameras": args.num_cameras,
@@ -234,6 +325,7 @@ def main() -> int:
         "min_video_frames": args.min_video_frames, "max_video_duration_skew_sec": args.max_video_duration_skew_sec,
         "max_frames": args.max_frames,
         "init_frame_index": args.init_frame_index,
+        "bidirectional": args.bidirectional,
         "gpus": args.gpus, "camera_micro_batch_size": args.camera_micro_batch_size,
     }
     if args.dry_run:
@@ -243,24 +335,28 @@ def main() -> int:
     _require_gotrack_dependencies()
     output_dir.mkdir(parents=True)
     (output_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    stage_dir = output_dir / "input_stage"
-    init_dir = output_dir / "init_poses"
+    forward_stage_dir = output_dir / "forward_input_stage"
+    forward_init_dir = output_dir / "forward_init_poses"
     anchor_bank = output_dir / "anchor_bank.npz"
-    tracker_output = output_dir / "gotrack_output"
-    _stage_input(capture_dir, video_dir, stage_dir)
-    _write_init_pose_jsons(init_dir, selected, pose, args.init_frame_index)
+    forward_output = output_dir / "forward_output"
+    reverse_video_dir = output_dir / "reverse_prefix_videos"
+    reverse_stage_dir = output_dir / "reverse_input_stage"
+    reverse_init_dir = output_dir / "reverse_init_poses"
+    reverse_output = output_dir / "reverse_output"
+    final_records = output_dir / "gotrack_output" / args.object_name / "world_pose_records.json"
+    _stage_input(capture_dir, video_dir, forward_stage_dir)
+    _write_init_pose_jsons(forward_init_dir, selected, pose, args.init_frame_index)
 
     generate_anchor_cmd = [
         sys.executable, str(ANCHOR_GENERATOR), "--mesh-path", str(mesh_path),
         "--output-path", str(anchor_bank), "--num-anchors", str(args.num_anchors), "--mesh-scale", "1.0",
     ]
     subprocess.run(generate_anchor_cmd, check=True, cwd=str(GOTRACK_ROOT))
-    track_cmd = [
+    track_common = [
         sys.executable, str(GOTRACK_RUNNER),
-        "--input-root", str(stage_dir), "--output-root", str(tracker_output),
         "--checkpoint-path", str(GOTRACK_ROOT / "gotrack_checkpoint.pt"), "--gpus", *args.gpus,
         "--camera-ids", *selected, "--object-names", args.object_name, "--object-ids", "1",
-        "--mesh-paths", str(mesh_path), "--init-pose-sources", str(init_dir),
+        "--mesh-paths", str(mesh_path),
         "--anchor-bank-paths", str(anchor_bank), "--num-iters", "1",
         "--first-frame-num-iters", str(args.first_frame_num_iters), "--num-anchors", str(args.num_anchors),
         "--mesh-scale", "1.0", "--unit-scale-mode", "auto", "--mask-free", "--skip-pnp",
@@ -268,15 +364,47 @@ def main() -> int:
         "--optim-v2-warp-grid-workers", "4", "--optim-template-update-interval", "2",
         "--template-renderer-backend", "nvdiffrast", "--input-resize-scale", str(args.input_resize_scale),
         "--camera-micro-batch-size", str(args.camera_micro_batch_size),
-        "--forward-precision", "fp32", "--torch-compile", "off", "--max-frames", str(args.max_frames),
+        "--forward-precision", "fp32", "--torch-compile", "off",
         "--worker-mode", "auto", "--tri-fit-worker-mode", "process", "--triangulation-worker-mode", "auto",
         "--status-log-every", "50", "--debug-level", "0",
     ]
     env = dict(os.environ, PYTHONUNBUFFERED="1", PYOPENGL_PLATFORM="egl", EGL_PLATFORM="surfaceless")
     print("[gotrack] selected cameras:", " ".join(selected), flush=True)
     print("[gotrack] output:", output_dir, flush=True)
-    subprocess.run(track_cmd, check=True, cwd=str(GOTRACK_ROOT), env=env)
-    print(f"[done] {tracker_output / args.object_name / 'world_pose_records.json'}", flush=True)
+    forward_cmd = track_common + [
+        "--input-root", str(forward_stage_dir), "--output-root", str(forward_output),
+        "--init-pose-sources", str(forward_init_dir), "--max-frames", str(args.max_frames),
+    ]
+    subprocess.run(forward_cmd, check=True, cwd=str(GOTRACK_ROOT), env=env)
+    forward_records = forward_output / args.object_name / "world_pose_records.json"
+    if not args.bidirectional or args.init_frame_index == 0:
+        final_records.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(forward_records, final_records)
+        print(f"[done] {final_records}", flush=True)
+        return 0
+
+    try:
+        print(f"[gotrack] building reversed prefix 0..{args.init_frame_index}", flush=True)
+        _write_reversed_prefix_videos(video_dir, reverse_video_dir, selected, args.init_frame_index)
+        _stage_input(capture_dir, reverse_video_dir, reverse_stage_dir)
+        _write_init_pose_jsons(reverse_init_dir, selected, pose, 0)
+        reverse_cmd = track_common + [
+            "--input-root", str(reverse_stage_dir), "--output-root", str(reverse_output),
+            "--init-pose-sources", str(reverse_init_dir), "--max-frames", str(args.init_frame_index + 1),
+        ]
+        subprocess.run(reverse_cmd, check=True, cwd=str(GOTRACK_ROOT), env=env)
+        merge_stats = _merge_bidirectional_records(
+            forward_records, reverse_output / args.object_name / "world_pose_records.json", final_records, args.init_frame_index,
+        )
+        (output_dir / "merge_manifest.json").write_text(json.dumps({
+            "seed_frame": args.init_frame_index, "strategy": "forward_from_seed_plus_reverse_prefix", **merge_stats,
+        }, indent=2) + "\n", encoding="utf-8")
+    finally:
+        # This is a reproducible, short-lived staging artifact.  Keep tracker
+        # outputs for audit, but avoid permanently storing 22 duplicate AVIs.
+        if reverse_video_dir.exists():
+            shutil.rmtree(reverse_video_dir)
+    print(f"[done] {final_records}", flush=True)
     return 0
 
 
