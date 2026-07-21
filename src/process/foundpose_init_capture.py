@@ -105,6 +105,15 @@ def main() -> int:
     parser.add_argument("--skip-silhouette", action="store_true",
                         help="Save cross-view IoU pose without silhouette refinement.")
     parser.add_argument("--silhouette-iters", type=int, default=100)
+    parser.add_argument("--pose-selection-mode", choices=("silhouette", "consensus", "hybrid"),
+                        default="silhouette",
+                        help="Candidate selector. silhouette preserves legacy behavior; consensus/hybrid use per-view FoundPose PnP agreement.")
+    parser.add_argument("--pose-candidate-rank", type=int, default=0,
+                        help="Use this zero-based rank from the selected candidate bank; useful for case studies.")
+    parser.add_argument("--candidate-bank-size", type=int, default=3,
+                        help="How many ranked candidates to save for inspection.")
+    parser.add_argument("--consensus-rotation-deg", type=float, default=25.0)
+    parser.add_argument("--consensus-translation-m", type=float, default=0.06)
     args = parser.parse_args()
 
     capture_dir = Path(args.capture_dir).expanduser().resolve()
@@ -134,7 +143,7 @@ def main() -> int:
     print(f"[inputs] {len(serials)} valid views, {width}x{height}; object={object_name}", flush=True)
 
     from autodex.perception.foundpose_init import FoundPoseInit
-    from autodex.perception.pose_select import select_best_pose_by_iou
+    from autodex.perception.pose_select import rank_pose_candidates, select_best_pose_by_iou
 
     init = FoundPoseInit(
         mesh_path=str(mesh_path),
@@ -156,7 +165,7 @@ def main() -> int:
 
     from autodex.perception.silhouette import SilhouetteOptimizer
     sil = SilhouetteOptimizer(str(mesh_path), device=args.device)
-    best_serial, pose_pre, mean_iou, _ = select_best_pose_by_iou(
+    best_serial, legacy_pose, legacy_mean_iou, per_candidate_iou = select_best_pose_by_iou(
         candidates=candidates,
         masks=masks,
         intrinsics=intrinsics,
@@ -166,8 +175,42 @@ def main() -> int:
         glctx=sil.glctx,
         mesh_tensors=sil.mesh_tensors,
     )
-    if pose_pre is None:
+    if legacy_pose is None:
         raise RuntimeError("Cross-view IoU pose selection failed.")
+
+    candidate_bank = rank_pose_candidates(
+        candidates=candidates,
+        pnp_quality={serial: float(per_view[serial]["quality"]) for serial in candidates},
+        iou_scores=per_candidate_iou,
+        consensus_rotation_deg=args.consensus_rotation_deg,
+        consensus_translation_m=args.consensus_translation_m,
+    )
+    if args.pose_selection_mode == "silhouette":
+        selected = sorted(candidate_bank, key=lambda item: item["mean_iou"], reverse=True)
+    elif args.pose_selection_mode == "consensus":
+        selected = sorted(candidate_bank, key=lambda item: item["consensus"], reverse=True)
+    else:
+        selected = sorted(candidate_bank, key=lambda item: item["hybrid_score"], reverse=True)
+    if args.pose_candidate_rank < 0 or args.pose_candidate_rank >= len(selected):
+        raise ValueError(f"--pose-candidate-rank must be in [0, {len(selected) - 1}]")
+    chosen = selected[args.pose_candidate_rank]
+    pose_pre = np.asarray(chosen["pose_world"], dtype=np.float64)
+    mean_iou = float(chosen["mean_iou"])
+    best_serial = str(chosen["source_serial"])
+    serializable_bank = [{
+        **{key: value for key, value in item.items() if key != "pose_world"},
+        "pose_world": np.asarray(item["pose_world"]).tolist(),
+    } for item in selected[:max(1, args.candidate_bank_size)]]
+    (output_dir / "candidate_bank.json").write_text(json.dumps({
+        "selection_mode": args.pose_selection_mode,
+        "selected_rank": args.pose_candidate_rank,
+        "consensus_rotation_deg": args.consensus_rotation_deg,
+        "consensus_translation_m": args.consensus_translation_m,
+        "candidates": serializable_bank,
+    }, indent=2) + "\n", encoding="utf-8")
+    print(f"[selection] mode={args.pose_selection_mode} serial={best_serial} "
+          f"iou={mean_iou:.4f} quality={chosen['pnp_quality']:.3f} "
+          f"consensus={chosen['consensus']:.3f} hybrid={chosen['hybrid_score']:.3f}", flush=True)
 
     pose_final = pose_pre
     sil_loss = None
@@ -193,6 +236,9 @@ def main() -> int:
         "mesh": str(mesh_path), "object_name": object_name,
         "num_input_views": len(serials), "num_foundpose_candidates": len(candidates),
         "iou_best_serial": best_serial, "iou_mean": float(mean_iou),
+        "pose_selection_mode": args.pose_selection_mode,
+        "pose_candidate_rank": args.pose_candidate_rank,
+        "candidate_bank": "candidate_bank.json",
         "foundpose_sec": foundpose_sec, "silhouette_sec": sil_sec,
         "silhouette_loss": None if sil_loss is None else float(sil_loss),
         "init_pose_world": pose_final.tolist(),

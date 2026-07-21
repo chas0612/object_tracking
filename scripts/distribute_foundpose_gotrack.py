@@ -365,6 +365,8 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
             _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
             _run_command(gotrack + ["src/process/foundpose_init_capture.py", "--capture-dir", str(episode), "--frame-dir", str(frame_dir),
                                     "--mesh", str(mesh), "--object-name", task["object_name"], "--assets-root", str(assets),
+                                    "--pose-selection-mode", args.foundpose_selection_mode,
+                                    "--pose-candidate-rank", str(args.foundpose_candidate_rank),
                                     "--output-dir", str(init_dir)], log, REPO_ROOT)
             task["phase"] = "gotrack"
             _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
@@ -431,6 +433,8 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
                                                 "camera_micro_batch_size": args.camera_micro_batch_size,
                                                 "max_video_duration_skew_sec": args.max_video_duration_skew_sec,
                                                 "init_frame_index": args.init_frame_index,
+                                                "foundpose_selection_mode": args.foundpose_selection_mode,
+                                                "foundpose_candidate_rank": args.foundpose_candidate_rank,
                                                 "debug_sheets": args.debug_sheets,
                                                 "debug_sheet_max_cameras": args.debug_sheet_max_cameras,
                                                 "debug_sheet_output_root_rel": args.debug_sheet_output_root_rel,
@@ -467,6 +471,8 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
     args.camera_micro_batch_size = int(manifest["camera_micro_batch_size"])
     args.max_video_duration_skew_sec = float(manifest["max_video_duration_skew_sec"])
     args.init_frame_index = int(manifest.get("init_frame_index", 0))
+    args.foundpose_selection_mode = str(manifest.get("foundpose_selection_mode", args.foundpose_selection_mode))
+    args.foundpose_candidate_rank = int(manifest.get("foundpose_candidate_rank", args.foundpose_candidate_rank))
     args.debug_sheets = bool(manifest.get("debug_sheets", args.debug_sheets))
     args.debug_sheet_max_cameras = int(manifest.get("debug_sheet_max_cameras", args.debug_sheet_max_cameras))
     args.debug_sheet_output_root_rel = str(manifest.get("debug_sheet_output_root_rel", args.debug_sheet_output_root_rel))
@@ -482,6 +488,8 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
                    "--camera-micro-batch-size", str(args.camera_micro_batch_size),
                    "--max-video-duration-skew-sec", str(args.max_video_duration_skew_sec),
                    "--init-frame-index", str(args.init_frame_index),
+                   "--foundpose-selection-mode", args.foundpose_selection_mode,
+                   "--foundpose-candidate-rank", str(args.foundpose_candidate_rank),
                    "--debug-sheet-max-cameras", str(args.debug_sheet_max_cameras),
                    "--debug-sheet-output-root-rel", args.debug_sheet_output_root_rel,
                    "--min-valid-pose-coverage", str(args.min_valid_pose_coverage),
@@ -563,6 +571,11 @@ def main() -> int:
     p.add_argument("--max-frames", type=int, default=-1)
     p.add_argument("--init-frame-index", type=int, default=30,
                    help="SAM3/FoundPose bootstrap frame. Default 30 avoids stale frame-0 captures; GoTrack merges reverse prefix poses automatically.")
+    p.add_argument("--foundpose-selection-mode", choices=("silhouette", "consensus", "hybrid"),
+                   default="silhouette",
+                   help="FoundPose wrapper selector. Default silhouette preserves legacy behavior; hybrid retains candidate-bank diagnostics.")
+    p.add_argument("--foundpose-candidate-rank", type=int, default=0,
+                   help="Zero-based candidate-bank rank to initialize GoTrack from. Default: 0.")
     p.add_argument("--max-attempts", type=int, default=2)
     debug_group = p.add_mutually_exclusive_group()
     debug_group.add_argument("--debug-sheets", dest="debug_sheets", action="store_true",
@@ -580,7 +593,7 @@ def main() -> int:
     p.add_argument("--confirm-workers-stopped", action="store_true",
                    help="Required with --mode reset-running; confirms no worker can still own a task.")
     args = p.parse_args()
-    if args.connect_timeout < 1 or args.num_cameras < 1 or args.camera_micro_batch_size < 0 or args.max_video_duration_skew_sec < 0 or args.max_frames == 0 or args.max_attempts < 1 or args.init_frame_index < 0 or args.debug_sheet_max_cameras < 1 or not 0 < args.min_valid_pose_coverage <= 1 or args.max_trailing_missing_frames < 0: raise ValueError("invalid worker/tracking option")
+    if args.connect_timeout < 1 or args.num_cameras < 1 or args.camera_micro_batch_size < 0 or args.max_video_duration_skew_sec < 0 or args.max_frames == 0 or args.max_attempts < 1 or args.init_frame_index < 0 or args.foundpose_candidate_rank < 0 or args.debug_sheet_max_cameras < 1 or not 0 < args.min_valid_pose_coverage <= 1 or args.max_trailing_missing_frames < 0: raise ValueError("invalid worker/tracking option")
     roots = (args.cache_root_rel, args.mesh_root_rel, args.debug_sheet_output_root_rel) + ((args.target_root_rel,) if args.target_root_rel else ())
     if any(Path(x).is_absolute() or ".." in Path(x).parts for x in roots): raise ValueError("root paths must be safe relative paths")
     shared = Path.home() / args.shared_root_rel; schedule = _schedule_dir(shared, args.schedule_id)

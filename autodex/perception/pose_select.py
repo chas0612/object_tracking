@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -186,6 +186,70 @@ def select_best_pose_by_iou(
             best_pose = pose_world
 
     return best_serial, best_pose, best_iou, per_cand
+
+
+def _rotation_distance_deg(first: np.ndarray, second: np.ndarray) -> float:
+    """Geodesic SO(3) distance, with clipping for numerical stability."""
+    relative = np.asarray(first, dtype=np.float64)[:3, :3].T @ np.asarray(second, dtype=np.float64)[:3, :3]
+    cosine = float(np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine)))
+
+
+def rank_pose_candidates(
+    *,
+    candidates: Mapping[str, np.ndarray],
+    pnp_quality: Mapping[str, float],
+    iou_scores: Mapping[str, float],
+    consensus_rotation_deg: float = 25.0,
+    consensus_translation_m: float = 0.06,
+) -> list[dict[str, Any]]:
+    """Rank existing FoundPose per-view candidates without rerunning FoundPose.
+
+    The legacy selector sees only rendered silhouette IoU, which cannot
+    distinguish rotations that share a silhouette.  This helper retains that
+    score and augments it with FoundPose's own PnP quality plus agreement among
+    independent camera estimates.  It intentionally does not claim to resolve
+    a true visual symmetry: low score margins are surfaced as ambiguity.
+    """
+    if consensus_rotation_deg <= 0 or consensus_translation_m <= 0:
+        raise ValueError("Consensus tolerances must be positive")
+    names = list(candidates)
+    if not names:
+        return []
+    qualities = np.asarray([max(0.0, float(pnp_quality.get(name, 0.0))) for name in names])
+    quality_scale = float(qualities.max()) if float(qualities.max()) > 0 else 1.0
+    ious = np.asarray([float(iou_scores.get(name, 0.0)) for name in names])
+    iou_min, iou_max = float(ious.min()), float(ious.max())
+    iou_scale = max(iou_max - iou_min, 1e-8)
+
+    ranked: list[dict[str, Any]] = []
+    for index, name in enumerate(names):
+        pose = np.asarray(candidates[name], dtype=np.float64)
+        agreement = 0.0
+        total_weight = 0.0
+        for other_name in names:
+            other = np.asarray(candidates[other_name], dtype=np.float64)
+            rotation = _rotation_distance_deg(pose, other)
+            translation = float(np.linalg.norm(pose[:3, 3] - other[:3, 3]))
+            kernel = float(np.exp(-0.5 * ((rotation / consensus_rotation_deg) ** 2 +
+                                          (translation / consensus_translation_m) ** 2)))
+            weight = max(0.01, float(pnp_quality.get(other_name, 0.0)))
+            agreement += weight * kernel
+            total_weight += weight
+        consensus = agreement / total_weight if total_weight else 0.0
+        iou = float(iou_scores.get(name, 0.0))
+        iou_normalized = (iou - iou_min) / iou_scale if iou_max > iou_min else 1.0
+        quality_normalized = float(qualities[index] / quality_scale)
+        hybrid = 0.45 * iou_normalized + 0.25 * quality_normalized + 0.30 * consensus
+        ranked.append({
+            "source_serial": name,
+            "pose_world": pose,
+            "mean_iou": iou,
+            "pnp_quality": float(pnp_quality.get(name, 0.0)),
+            "consensus": consensus,
+            "hybrid_score": hybrid,
+        })
+    return ranked
 
 
 def load_masks_bool(

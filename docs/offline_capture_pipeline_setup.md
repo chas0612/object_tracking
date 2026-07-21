@@ -314,6 +314,14 @@ conda run --no-capture-output -n gotrack python -u \
 문제를 피하면서도 frame 0부터 pose를 제공한다. seed 이전 pose가 필요 없는 짧은
 smoke test에만 `--forward-only`를 사용한다.
 
+대칭성 때문에 시작 회전이 애매한 case study에는 `foundpose_init_capture.py`의
+`--pose-selection-mode hybrid`를 시험할 수 있다. 이는 FoundPose를 다시 여러 번
+실행하지 않고, 이미 계산한 camera별 PnP quality·cross-view pose consensus·silhouette
+IoU를 함께 점수화한다. 기본값 `silhouette`은 기존 결과와 호환된다. 각 실행은
+`<INIT_OUT>/candidate_bank.json`에 상위 후보와 score를 남긴다. 완전한 시각적 대칭은
+어떤 selector도 의미상 올바른 회전을 보장하지 않으므로, `hybrid`는 검증 후에만
+schedule 기본값으로 승격한다.
+
 GoTrack은 모든 AVI의 frame count/FPS로 계산한 duration을 비교해 median에서 기본 1초 이상
 벗어난 camera만 자동 제외한다. 몇 frame 누락은 허용하며, 과거 특정 serial을 하드코딩해
 제외하지 않는다. `run_manifest.json`의 `video_timings`, `rejected_cameras`에서 판단 근거를
@@ -343,6 +351,12 @@ worker는 shared-storage atomic claim으로 episode 하나씩만 점유하며, �
 있지만 의미상 drift한 경우는 자동 실패로 단정하지 않는다.
 GoTrack 재시도는 새 `attempt_NN` output directory를 사용하므로 partial output을
 덮어쓰지 않는다.
+
+옛 schedule의 process-exit 기반 `completed` 결과는 다음 audit으로 점검한다.
+
+```bash
+python -u scripts/audit_gotrack_completeness.py --all-schedules --only-incomplete
+```
 
 먼저 dry-run으로 mesh/cache/episode 조건을 확인하고 queue를 만든다.
 
