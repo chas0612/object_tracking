@@ -50,7 +50,7 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _atomic_json(path: Path, data: dict[str, Any]) -> None:
+def _atomic_json(path: Path, data: Any) -> None:
     # Several PCs can update different task files concurrently, and a retry
     # can briefly make two workers touch the same task.  A fixed ``.tmp`` name
     # lets one writer rename another writer's temporary file on shared NAS.
@@ -253,6 +253,13 @@ def _tracking_summary(task: dict[str, Any], attempt_dir: Path, min_coverage: flo
             "coverage": coverage, "trailing_missing": trailing_missing}
 
 
+def _record_list(path: Path) -> list[dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list) or not all(isinstance(row, dict) for row in payload):
+        raise ValueError(f"Expected a JSON record list: {path}")
+    return payload
+
+
 def _task_path(schedule_dir: Path, task_id: str) -> Path:
     return schedule_dir / "tasks" / f"{task_id}.json"
 
@@ -312,6 +319,217 @@ def _publish_debug_sheet(episode_sheet: Path, central_sheet: Path) -> str:
         return "copy"
 
 
+def _foundpose_command(
+    gotrack: list[str], *, capture: Path, frame_dir: Path, mesh: Path,
+    object_name: str, assets: Path, output_dir: Path, args: argparse.Namespace,
+) -> list[str]:
+    return gotrack + [
+        "src/process/foundpose_init_capture.py",
+        "--capture-dir", str(capture), "--frame-dir", str(frame_dir),
+        "--mesh", str(mesh), "--object-name", object_name, "--assets-root", str(assets),
+        "--pose-selection-mode", args.foundpose_selection_mode,
+        "--pose-candidate-rank", str(args.foundpose_candidate_rank),
+        "--per-view-candidates", str(args.foundpose_per_view_candidates),
+        "--global-rotation-count", str(args.foundpose_global_rotation_count),
+        "--global-coarse-max-side", str(args.foundpose_global_coarse_max_side),
+        "--global-refine-top-k", str(args.foundpose_global_refine_top_k),
+        "--global-min-rotation-separation-deg", str(args.foundpose_global_min_rotation_separation_deg),
+        "--global-asymmetry-refine-top-k", str(args.foundpose_global_asymmetry_refine_top_k),
+        "--global-asymmetry-max-side", str(args.foundpose_global_asymmetry_max_side),
+        "--global-asymmetry-score-margin", str(args.foundpose_global_asymmetry_score_margin),
+        "--global-asymmetry-weight", str(args.foundpose_global_asymmetry_weight),
+        "--output-dir", str(output_dir),
+    ]
+
+
+def _attempt_tail_recovery(
+    *, schedule_dir: Path, task: dict[str, Any], attempt_dir: Path, episode: Path,
+    mesh: Path, assets: Path, track_dir: Path, gotrack: list[str], sam3: list[str],
+    prompts: list[str], args: argparse.Namespace, log: Any,
+) -> bool:
+    """Try late SAM3/FoundPose seeds, then run one validated reverse bridge."""
+    from autodex.tracking.tail_recovery import (
+        assess_tail_recovery,
+        descending_seed_frames,
+        merge_tail_recovery,
+        tail_gap,
+    )
+
+    records_path = track_dir / "gotrack_output" / task["object_name"] / "world_pose_records.json"
+    if not records_path.is_file():
+        return False
+    original = _record_list(records_path)
+    gap = tail_gap(original)
+    if gap["trailing_missing"] <= args.max_trailing_missing_frames:
+        return False
+
+    primary_manifest_path = track_dir / "run_manifest.json"
+    primary_manifest = _read_json(primary_manifest_path) if primary_manifest_path.is_file() else {}
+    selected = [str(value) for value in primary_manifest.get("selected_cameras", [])]
+    timings = primary_manifest.get("video_timings", {})
+    common_last = min(
+        (int(timings[camera]["frames"]) - 1 for camera in selected
+         if camera in timings and int(timings[camera].get("frames", 0)) > 0),
+        default=gap["last_frame"],
+    )
+    seeds = descending_seed_frames(
+        original, step=args.tail_recovery_frame_step,
+        max_attempts=args.tail_recovery_max_seed_attempts,
+        maximum_frame=common_last,
+    )
+    recovery_root = attempt_dir / "tail_recovery"
+    recovery_root.mkdir(parents=True, exist_ok=True)
+    recovery_manifest: dict[str, Any] = {
+        "status": "searching", "created_utc": _now(), "original_gap": gap,
+        "candidate_seed_frames": seeds, "selected_cameras": selected,
+        "seed_attempts": [],
+    }
+    manifest_path = recovery_root / "recovery_manifest.json"
+    _atomic_json(manifest_path, recovery_manifest)
+    if not seeds:
+        recovery_manifest.update({"status": "failed", "reason": "no_common_late_seed_frame"})
+        _atomic_json(manifest_path, recovery_manifest)
+        return False
+
+    chosen: tuple[int, Path, str] | None = None
+    for seed_frame in seeds:
+        seed_info: dict[str, Any] = {"frame_index": seed_frame, "prompt_attempts": []}
+        recovery_manifest["seed_attempts"].append(seed_info)
+        seed_root = recovery_root / f"seed_{seed_frame:06d}"
+        seed_root.mkdir(parents=True, exist_ok=True)
+        for prompt_index, prompt in enumerate(prompts, start=1):
+            prompt_root = seed_root / f"prompt_{prompt_index:02d}"
+            frame_dir = prompt_root / f"foundpose_frame_{seed_frame:06d}"
+            init_dir = prompt_root / "foundpose_init"
+            prompt_info: dict[str, Any] = {"prompt": prompt, "frame_dir": str(frame_dir)}
+            seed_info["prompt_attempts"].append(prompt_info)
+            task.update({"tail_recovery_seed_current": seed_frame,
+                         "tail_recovery_prompt_current": prompt})
+            _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
+            mask_command = sam3 + [
+                "src/process/mask.py", "--capture_dir", str(episode),
+                "--frame-index", str(seed_frame), "--prompt", prompt,
+                "--video-dir", str(episode / "undistorted_video"),
+                "--frame-output-dir", str(frame_dir),
+            ]
+            if selected:
+                mask_command += ["--serials", *selected]
+            try:
+                _run_command(mask_command, log, REPO_ROOT)
+            except subprocess.CalledProcessError as exc:
+                prompt_info.update({"status": "mask_failed", "returncode": exc.returncode})
+                _atomic_json(manifest_path, recovery_manifest)
+                continue
+            metadata_path = frame_dir / "metadata.json"
+            metadata = _read_json(metadata_path) if metadata_path.is_file() else {}
+            mask_views = int(metadata.get("masks_written", 0)) + int(metadata.get("masks_skipped", 0))
+            prompt_info["mask_views"] = mask_views
+            if mask_views < args.tail_recovery_min_mask_views:
+                prompt_info["status"] = "insufficient_masks"
+                _atomic_json(manifest_path, recovery_manifest)
+                continue
+            try:
+                _run_command(_foundpose_command(
+                    gotrack, capture=episode, frame_dir=frame_dir, mesh=mesh,
+                    object_name=task["object_name"], assets=assets,
+                    output_dir=init_dir, args=args,
+                ), log, REPO_ROOT)
+            except subprocess.CalledProcessError as exc:
+                prompt_info.update({"status": "foundpose_failed", "returncode": exc.returncode})
+                _atomic_json(manifest_path, recovery_manifest)
+                continue
+            result_path = init_dir / "result.json"
+            result = _read_json(result_path) if result_path.is_file() else {}
+            foundpose_views = int(result.get("num_foundpose_candidates", 0))
+            min_foundpose_views = max(3, args.tail_recovery_min_mask_views // 2)
+            prompt_info["foundpose_views"] = foundpose_views
+            if foundpose_views < min_foundpose_views:
+                prompt_info.update({
+                    "status": "insufficient_foundpose_views",
+                    "min_foundpose_views": min_foundpose_views,
+                })
+                _atomic_json(manifest_path, recovery_manifest)
+                continue
+            prompt_info["status"] = "foundpose_succeeded"
+            chosen = (seed_frame, init_dir, prompt)
+            _atomic_json(manifest_path, recovery_manifest)
+            break
+        if chosen is not None:
+            break
+
+    if chosen is None:
+        recovery_manifest.update({"status": "failed", "reason": "no_late_foundpose_seed"})
+        _atomic_json(manifest_path, recovery_manifest)
+        return False
+
+    seed_frame, init_dir, prompt = chosen
+    recovery_track_dir = recovery_root / f"seed_{seed_frame:06d}" / "gotrack_tracking"
+    reverse_stop = max(0, gap["last_valid_frame"] - args.tail_recovery_overlap_frames + 1)
+    track_command = gotrack + [
+        "src/process/gotrack_capture.py", "--capture-dir", str(episode),
+        "--video-dir", str(episode / "undistorted_video"), "--mesh", str(mesh),
+        "--init-pose", str(init_dir / "init_pose_world.npy"),
+        "--object-name", task["object_name"], "--num-cameras", str(args.num_cameras),
+        "--allow-fewer-cameras", "--camera-micro-batch-size", str(args.camera_micro_batch_size),
+        "--init-frame-index", str(seed_frame), "--reverse-stop-frame-index", str(reverse_stop),
+        "--max-video-duration-skew-sec", str(args.max_video_duration_skew_sec),
+        "--max-frames", str(args.max_frames), "--output-dir", str(recovery_track_dir),
+    ]
+    if selected:
+        track_command += ["--camera-ids", *selected]
+    recovery_manifest.update({
+        "status": "tracking", "selected_seed_frame": seed_frame,
+        "selected_prompt": prompt, "reverse_stop_frame": reverse_stop,
+    })
+    _atomic_json(manifest_path, recovery_manifest)
+    try:
+        _run_command(track_command, log, REPO_ROOT)
+    except subprocess.CalledProcessError as exc:
+        recovery_manifest.update({"status": "failed", "reason": f"gotrack_returncode={exc.returncode}"})
+        _atomic_json(manifest_path, recovery_manifest)
+        return False
+
+    recovery_records_path = (
+        recovery_track_dir / "gotrack_output" / task["object_name"] / "world_pose_records.json"
+    )
+    recovery_records = _record_list(recovery_records_path)
+    assessment = assess_tail_recovery(
+        original, recovery_records,
+        overlap_frames=args.tail_recovery_overlap_frames,
+        min_connection_frames=args.tail_recovery_min_connection_frames,
+        min_suffix_coverage=args.tail_recovery_min_suffix_coverage,
+        max_trailing_missing=args.max_trailing_missing_frames,
+        max_translation_error_m=args.tail_recovery_max_translation_error_m,
+        max_rotation_error_deg=args.tail_recovery_max_rotation_error_deg,
+        max_rotation_alignment_dispersion_deg=args.tail_recovery_max_rotation_alignment_dispersion_deg,
+    )
+    recovery_manifest["assessment"] = assessment
+    if not assessment["accepted"]:
+        recovery_manifest.update({"status": "rejected", "reason": assessment["reason"]})
+        _atomic_json(manifest_path, recovery_manifest)
+        return False
+
+    backup = track_dir / "pre_tail_recovery_world_pose_records.json"
+    if backup.exists():
+        raise FileExistsError(f"Refusing to overwrite recovery backup: {backup}")
+    shutil.copy2(records_path, backup)
+    merged = merge_tail_recovery(
+        original, recovery_records, recovery_seed_frame=seed_frame,
+        rotation_alignment=assessment.get("rotation_alignment"),
+    )
+    _atomic_json(records_path, merged)
+    recovery_manifest.update({
+        "status": "accepted", "finished_utc": _now(),
+        "original_records_backup": str(backup), "published_records": str(records_path),
+    })
+    _atomic_json(manifest_path, recovery_manifest)
+    task["tail_recovery"] = {
+        "status": "accepted", "seed_frame": seed_frame, "prompt": prompt,
+        "assessment": assessment, "manifest": str(manifest_path),
+    }
+    return True
+
+
 def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     shared = Path.home() / args.shared_root_rel
     episode = shared / task["episode_rel"]
@@ -363,19 +581,11 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                 raise RuntimeError(f"SAM3 produced no masks with prompts: {prompts}")
             task["phase"] = "foundpose"
             _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
-            _run_command(gotrack + ["src/process/foundpose_init_capture.py", "--capture-dir", str(episode), "--frame-dir", str(frame_dir),
-                                    "--mesh", str(mesh), "--object-name", task["object_name"], "--assets-root", str(assets),
-                                    "--pose-selection-mode", args.foundpose_selection_mode,
-                                    "--pose-candidate-rank", str(args.foundpose_candidate_rank),
-                                    "--global-rotation-count", str(args.foundpose_global_rotation_count),
-                                    "--global-coarse-max-side", str(args.foundpose_global_coarse_max_side),
-                                    "--global-refine-top-k", str(args.foundpose_global_refine_top_k),
-                                    "--global-min-rotation-separation-deg", str(args.foundpose_global_min_rotation_separation_deg),
-                                    "--global-asymmetry-refine-top-k", str(args.foundpose_global_asymmetry_refine_top_k),
-                                    "--global-asymmetry-max-side", str(args.foundpose_global_asymmetry_max_side),
-                                    "--global-asymmetry-score-margin", str(args.foundpose_global_asymmetry_score_margin),
-                                    "--global-asymmetry-weight", str(args.foundpose_global_asymmetry_weight),
-                                    "--output-dir", str(init_dir)], log, REPO_ROOT)
+            _run_command(_foundpose_command(
+                gotrack, capture=episode, frame_dir=frame_dir, mesh=mesh,
+                object_name=task["object_name"], assets=assets,
+                output_dir=init_dir, args=args,
+            ), log, REPO_ROOT)
             task["phase"] = "gotrack"
             _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
             _run_command(gotrack + ["src/process/gotrack_capture.py", "--capture-dir", str(episode), "--video-dir", str(episode / "undistorted_video"),
@@ -388,6 +598,21 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
             tracking_summary = _tracking_summary(task, attempt_dir, args.min_valid_pose_coverage, args.max_trailing_missing_frames)
             task["tracking_summary"] = tracking_summary
             tracking_ok = bool(tracking_summary["complete"])
+            if (not tracking_ok and args.tail_recovery
+                    and int(tracking_summary.get("trailing_missing", 0)) > args.max_trailing_missing_frames):
+                task["phase"] = "tail_recovery"
+                _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
+                recovered = _attempt_tail_recovery(
+                    schedule_dir=schedule_dir, task=task, attempt_dir=attempt_dir,
+                    episode=episode, mesh=mesh, assets=assets, track_dir=track_dir,
+                    gotrack=gotrack, sam3=sam3, prompts=prompts, args=args, log=log,
+                )
+                tracking_summary = _tracking_summary(
+                    task, attempt_dir, args.min_valid_pose_coverage, args.max_trailing_missing_frames,
+                )
+                task["tracking_summary"] = tracking_summary
+                task.setdefault("tail_recovery", {})["published"] = recovered
+                tracking_ok = bool(tracking_summary["complete"])
             if tracking_ok and args.debug_sheets:
                 task["phase"] = "debug_sheet"
                 _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
@@ -443,6 +668,7 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
                                                 "init_frame_index": args.init_frame_index,
                                                 "foundpose_selection_mode": args.foundpose_selection_mode,
                                                 "foundpose_candidate_rank": args.foundpose_candidate_rank,
+                                                "foundpose_per_view_candidates": args.foundpose_per_view_candidates,
                                                 "foundpose_global_rotation_count": args.foundpose_global_rotation_count,
                                                 "foundpose_global_coarse_max_side": args.foundpose_global_coarse_max_side,
                                                 "foundpose_global_refine_top_k": args.foundpose_global_refine_top_k,
@@ -456,6 +682,16 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
                                                 "debug_sheet_output_root_rel": args.debug_sheet_output_root_rel,
                                                 "min_valid_pose_coverage": args.min_valid_pose_coverage,
                                                 "max_trailing_missing_frames": args.max_trailing_missing_frames,
+                                                "tail_recovery": args.tail_recovery,
+                                                "tail_recovery_frame_step": args.tail_recovery_frame_step,
+                                                "tail_recovery_max_seed_attempts": args.tail_recovery_max_seed_attempts,
+                                                "tail_recovery_min_mask_views": args.tail_recovery_min_mask_views,
+                                                "tail_recovery_overlap_frames": args.tail_recovery_overlap_frames,
+                                                "tail_recovery_min_connection_frames": args.tail_recovery_min_connection_frames,
+                                                "tail_recovery_min_suffix_coverage": args.tail_recovery_min_suffix_coverage,
+                                                "tail_recovery_max_translation_error_m": args.tail_recovery_max_translation_error_m,
+                                                "tail_recovery_max_rotation_error_deg": args.tail_recovery_max_rotation_error_deg,
+                                                "tail_recovery_max_rotation_alignment_dispersion_deg": args.tail_recovery_max_rotation_alignment_dispersion_deg,
                                                 "max_attempts": args.max_attempts, "n_tasks": len(tasks), "skipped": skipped})
     for task in tasks:
         task.update({"status": "pending", "attempts": 0, "phase": "pending", "created_utc": _now(), "updated_utc": _now()})
@@ -489,6 +725,7 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
     args.init_frame_index = int(manifest.get("init_frame_index", 0))
     args.foundpose_selection_mode = str(manifest.get("foundpose_selection_mode", args.foundpose_selection_mode))
     args.foundpose_candidate_rank = int(manifest.get("foundpose_candidate_rank", args.foundpose_candidate_rank))
+    args.foundpose_per_view_candidates = int(manifest.get("foundpose_per_view_candidates", args.foundpose_per_view_candidates))
     args.foundpose_global_rotation_count = int(manifest.get("foundpose_global_rotation_count", args.foundpose_global_rotation_count))
     args.foundpose_global_coarse_max_side = int(manifest.get("foundpose_global_coarse_max_side", args.foundpose_global_coarse_max_side))
     args.foundpose_global_refine_top_k = int(manifest.get("foundpose_global_refine_top_k", args.foundpose_global_refine_top_k))
@@ -502,6 +739,16 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
     args.debug_sheet_output_root_rel = str(manifest.get("debug_sheet_output_root_rel", args.debug_sheet_output_root_rel))
     args.min_valid_pose_coverage = float(manifest.get("min_valid_pose_coverage", args.min_valid_pose_coverage))
     args.max_trailing_missing_frames = int(manifest.get("max_trailing_missing_frames", args.max_trailing_missing_frames))
+    args.tail_recovery = bool(manifest.get("tail_recovery", args.tail_recovery))
+    args.tail_recovery_frame_step = int(manifest.get("tail_recovery_frame_step", args.tail_recovery_frame_step))
+    args.tail_recovery_max_seed_attempts = int(manifest.get("tail_recovery_max_seed_attempts", args.tail_recovery_max_seed_attempts))
+    args.tail_recovery_min_mask_views = int(manifest.get("tail_recovery_min_mask_views", args.tail_recovery_min_mask_views))
+    args.tail_recovery_overlap_frames = int(manifest.get("tail_recovery_overlap_frames", args.tail_recovery_overlap_frames))
+    args.tail_recovery_min_connection_frames = int(manifest.get("tail_recovery_min_connection_frames", args.tail_recovery_min_connection_frames))
+    args.tail_recovery_min_suffix_coverage = float(manifest.get("tail_recovery_min_suffix_coverage", args.tail_recovery_min_suffix_coverage))
+    args.tail_recovery_max_translation_error_m = float(manifest.get("tail_recovery_max_translation_error_m", args.tail_recovery_max_translation_error_m))
+    args.tail_recovery_max_rotation_error_deg = float(manifest.get("tail_recovery_max_rotation_error_deg", args.tail_recovery_max_rotation_error_deg))
+    args.tail_recovery_max_rotation_alignment_dispersion_deg = float(manifest.get("tail_recovery_max_rotation_alignment_dispersion_deg", args.tail_recovery_max_rotation_alignment_dispersion_deg))
     args.max_attempts = int(manifest.get("max_attempts", args.max_attempts))
     for spec in args.workers:
         worker_id = _safe_id(spec)
@@ -514,6 +761,7 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
                    "--init-frame-index", str(args.init_frame_index),
                    "--foundpose-selection-mode", args.foundpose_selection_mode,
                    "--foundpose-candidate-rank", str(args.foundpose_candidate_rank),
+                   "--foundpose-per-view-candidates", str(args.foundpose_per_view_candidates),
                    "--foundpose-global-rotation-count", str(args.foundpose_global_rotation_count),
                    "--foundpose-global-coarse-max-side", str(args.foundpose_global_coarse_max_side),
                    "--foundpose-global-refine-top-k", str(args.foundpose_global_refine_top_k),
@@ -526,8 +774,18 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
                    "--debug-sheet-output-root-rel", args.debug_sheet_output_root_rel,
                    "--min-valid-pose-coverage", str(args.min_valid_pose_coverage),
                    "--max-trailing-missing-frames", str(args.max_trailing_missing_frames),
+                   "--tail-recovery-frame-step", str(args.tail_recovery_frame_step),
+                   "--tail-recovery-max-seed-attempts", str(args.tail_recovery_max_seed_attempts),
+                   "--tail-recovery-min-mask-views", str(args.tail_recovery_min_mask_views),
+                   "--tail-recovery-overlap-frames", str(args.tail_recovery_overlap_frames),
+                   "--tail-recovery-min-connection-frames", str(args.tail_recovery_min_connection_frames),
+                   "--tail-recovery-min-suffix-coverage", str(args.tail_recovery_min_suffix_coverage),
+                   "--tail-recovery-max-translation-error-m", str(args.tail_recovery_max_translation_error_m),
+                   "--tail-recovery-max-rotation-error-deg", str(args.tail_recovery_max_rotation_error_deg),
+                   "--tail-recovery-max-rotation-alignment-dispersion-deg", str(args.tail_recovery_max_rotation_alignment_dispersion_deg),
                    "--max-frames", str(args.max_frames), "--max-attempts", str(args.max_attempts)]
         command.append("--debug-sheets" if args.debug_sheets else "--no-debug-sheets")
+        command.append("--tail-recovery" if args.tail_recovery else "--no-tail-recovery")
         if args.retry_failed:
             command.append("--retry-failed")
         rendered = " ".join(part if part.startswith("$HOME/") else shlex.quote(part) for part in command)
@@ -608,6 +866,8 @@ def main() -> int:
                    help="FoundPose wrapper selector. global adds coarse SO(3) search and multi-start silhouette refinement.")
     p.add_argument("--foundpose-candidate-rank", type=int, default=0,
                    help="Zero-based candidate-bank rank to initialize GoTrack from. Default: 0.")
+    p.add_argument("--foundpose-per-view-candidates", type=int, default=5,
+                   help="PnP alternatives retained per camera in global mode. Default: 5.")
     p.add_argument("--foundpose-global-rotation-count", type=int, default=256)
     p.add_argument("--foundpose-global-coarse-max-side", type=int, default=160)
     p.add_argument("--foundpose-global-refine-top-k", type=int, default=5)
@@ -629,11 +889,44 @@ def main() -> int:
                    help="Mark task failed below this valid-pose fraction. Deliberately conservative; semantic drift stays completed/suspect.")
     p.add_argument("--max-trailing-missing-frames", type=int, default=30,
                    help="Mark task failed when more than this many final frames lack poses.")
+    recovery_group = p.add_mutually_exclusive_group()
+    recovery_group.add_argument("--tail-recovery", dest="tail_recovery", action="store_true",
+                                help="Re-anchor from the end and reverse-track a lost terminal suffix (default).")
+    recovery_group.add_argument("--no-tail-recovery", dest="tail_recovery", action="store_false")
+    p.set_defaults(tail_recovery=True)
+    p.add_argument("--tail-recovery-frame-step", type=int, default=30,
+                   help="Move this many frames toward the front after an unusable late seed.")
+    p.add_argument("--tail-recovery-max-seed-attempts", type=int, default=6)
+    p.add_argument("--tail-recovery-min-mask-views", type=int, default=6)
+    p.add_argument("--tail-recovery-overlap-frames", type=int, default=30)
+    p.add_argument("--tail-recovery-min-connection-frames", type=int, default=3)
+    p.add_argument("--tail-recovery-min-suffix-coverage", type=float, default=0.9)
+    p.add_argument("--tail-recovery-max-translation-error-m", type=float, default=0.03)
+    p.add_argument("--tail-recovery-max-rotation-error-deg", type=float, default=15.0)
+    p.add_argument("--tail-recovery-max-rotation-alignment-dispersion-deg", type=float, default=5.0,
+                   help="Allow a constant late-seed rotation offset only below this overlap dispersion.")
     p.add_argument("--retry-failed", action="store_true"); p.add_argument("--dry-run", action="store_true")
     p.add_argument("--confirm-workers-stopped", action="store_true",
                    help="Required with --mode reset-running; confirms no worker can still own a task.")
     args = p.parse_args()
-    if args.connect_timeout < 1 or args.num_cameras < 1 or args.camera_micro_batch_size < 0 or args.max_video_duration_skew_sec < 0 or args.max_frames == 0 or args.max_attempts < 1 or args.init_frame_index < 0 or args.foundpose_candidate_rank < 0 or args.foundpose_global_rotation_count < 1 or args.foundpose_global_coarse_max_side < 32 or args.foundpose_global_refine_top_k < 1 or args.foundpose_global_min_rotation_separation_deg < 0 or args.foundpose_global_asymmetry_refine_top_k < args.foundpose_global_refine_top_k or args.foundpose_global_asymmetry_max_side < 32 or args.foundpose_global_asymmetry_score_margin < 0 or not 0 <= args.foundpose_global_asymmetry_weight <= 1 or args.debug_sheet_max_cameras < 1 or not 0 < args.min_valid_pose_coverage <= 1 or args.max_trailing_missing_frames < 0: raise ValueError("invalid worker/tracking option")
+    if (args.connect_timeout < 1 or args.num_cameras < 1 or args.camera_micro_batch_size < 0
+            or args.max_video_duration_skew_sec < 0 or args.max_frames == 0 or args.max_attempts < 1
+            or args.init_frame_index < 0 or args.foundpose_candidate_rank < 0
+            or args.foundpose_per_view_candidates < 1
+            or args.foundpose_global_rotation_count < 1 or args.foundpose_global_coarse_max_side < 32
+            or args.foundpose_global_refine_top_k < 1 or args.foundpose_global_min_rotation_separation_deg < 0
+            or args.foundpose_global_asymmetry_refine_top_k < args.foundpose_global_refine_top_k
+            or args.foundpose_global_asymmetry_max_side < 32 or args.foundpose_global_asymmetry_score_margin < 0
+            or not 0 <= args.foundpose_global_asymmetry_weight <= 1 or args.debug_sheet_max_cameras < 1
+            or not 0 < args.min_valid_pose_coverage <= 1 or args.max_trailing_missing_frames < 0
+            or args.tail_recovery_frame_step < 1 or args.tail_recovery_max_seed_attempts < 1
+            or args.tail_recovery_min_mask_views < 1 or args.tail_recovery_overlap_frames < 1
+            or args.tail_recovery_min_connection_frames < 1
+            or not 0 < args.tail_recovery_min_suffix_coverage <= 1
+            or args.tail_recovery_max_translation_error_m < 0
+            or args.tail_recovery_max_rotation_error_deg < 0
+            or args.tail_recovery_max_rotation_alignment_dispersion_deg < 0):
+        raise ValueError("invalid worker/tracking option")
     roots = (args.cache_root_rel, args.mesh_root_rel, args.debug_sheet_output_root_rel) + ((args.target_root_rel,) if args.target_root_rel else ())
     if any(Path(x).is_absolute() or ".." in Path(x).parts for x in roots): raise ValueError("root paths must be safe relative paths")
     shared = Path.home() / args.shared_root_rel; schedule = _schedule_dir(shared, args.schedule_id)

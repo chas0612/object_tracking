@@ -143,8 +143,9 @@ def _stage_input(capture_dir: Path, video_dir: Path, stage_dir: Path) -> None:
 
 def _write_reversed_prefix_videos(
     source_dir: Path, destination_dir: Path, camera_ids: list[str], frame_index: int,
+    stop_frame_index: int = 0,
 ) -> None:
-    """Write only frames ``frame_index..0`` for the backward GoTrack pass.
+    """Write frames ``frame_index..stop_frame_index`` for the backward pass.
 
     We deliberately do not reverse the whole capture: the backward pass only
     needs to recover the short pre-seed prefix.  ``MJPG`` is used because it
@@ -169,7 +170,7 @@ def _write_reversed_prefix_videos(
             if not writer.isOpened():
                 raise RuntimeError(f"Could not create reverse video: {target}")
             try:
-                for original_index in range(frame_index, -1, -1):
+                for original_index in range(frame_index, stop_frame_index - 1, -1):
                     cap.set(cv2.CAP_PROP_POS_FRAMES, original_index)
                     ok, frame = cap.read()
                     if not ok:
@@ -242,6 +243,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--init-pose", required=True, help="FoundPose init_pose_world.npy.")
     parser.add_argument("--init-frame-index", type=int, default=30,
                         help="Video frame represented by --init-pose. Default 30 avoids known stale frame-0 captures.")
+    parser.add_argument("--reverse-stop-frame-index", type=int, default=0,
+                        help=("Earliest original frame written for the reverse pass. "
+                              "A positive value limits late re-anchor recovery to a short overlap."))
     direction_group = parser.add_mutually_exclusive_group()
     direction_group.add_argument("--bidirectional", dest="bidirectional", action="store_true",
                                  help="Track forward and reverse the 0..seed prefix, then merge into one chronological output (default).")
@@ -286,7 +290,9 @@ def main() -> int:
         raise FileNotFoundError("--capture-dir/--video-dir must exist, and --mesh/--init-pose must be files.")
     if not GOTRACK_RUNNER.is_file():
         raise FileNotFoundError(f"GoTrack runner not found: {GOTRACK_RUNNER}")
-    if args.num_cameras < 1 or args.min_video_frames < 1 or args.camera_micro_batch_size < 0 or args.max_video_duration_skew_sec < 0 or args.init_frame_index < 0:
+    if (args.num_cameras < 1 or args.min_video_frames < 1 or args.camera_micro_batch_size < 0
+            or args.max_video_duration_skew_sec < 0 or args.init_frame_index < 0
+            or not 0 <= args.reverse_stop_frame_index <= args.init_frame_index):
         raise ValueError("--num-cameras/--min-video-frames must be positive, and batch/skew options must be non-negative.")
 
     output_dir = (Path(args.output_dir).expanduser().resolve() if args.output_dir else
@@ -325,6 +331,7 @@ def main() -> int:
         "min_video_frames": args.min_video_frames, "max_video_duration_skew_sec": args.max_video_duration_skew_sec,
         "max_frames": args.max_frames,
         "init_frame_index": args.init_frame_index,
+        "reverse_stop_frame_index": args.reverse_stop_frame_index,
         "bidirectional": args.bidirectional,
         "gpus": args.gpus, "camera_micro_batch_size": args.camera_micro_batch_size,
     }
@@ -384,8 +391,12 @@ def main() -> int:
         return 0
 
     try:
-        print(f"[gotrack] building reversed prefix 0..{args.init_frame_index}", flush=True)
-        _write_reversed_prefix_videos(video_dir, reverse_video_dir, selected, args.init_frame_index)
+        print(f"[gotrack] building reversed interval "
+              f"{args.reverse_stop_frame_index}..{args.init_frame_index}", flush=True)
+        _write_reversed_prefix_videos(
+            video_dir, reverse_video_dir, selected, args.init_frame_index,
+            stop_frame_index=args.reverse_stop_frame_index,
+        )
         _stage_input(capture_dir, reverse_video_dir, reverse_stage_dir)
         _write_init_pose_jsons(reverse_init_dir, selected, pose, 0)
         reverse_cmd = track_common + [
@@ -397,7 +408,9 @@ def main() -> int:
             forward_records, reverse_output / args.object_name / "world_pose_records.json", final_records, args.init_frame_index,
         )
         (output_dir / "merge_manifest.json").write_text(json.dumps({
-            "seed_frame": args.init_frame_index, "strategy": "forward_from_seed_plus_reverse_prefix", **merge_stats,
+            "seed_frame": args.init_frame_index,
+            "reverse_stop_frame": args.reverse_stop_frame_index,
+            "strategy": "forward_from_seed_plus_reverse_interval", **merge_stats,
         }, indent=2) + "\n", encoding="utf-8")
     finally:
         # This is a reproducible, short-lived staging artifact.  Keep tracker

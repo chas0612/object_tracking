@@ -363,6 +363,16 @@ search와 다섯 번의 silhouette refinement다. 필요하면
 `candidate_bank.json`에는 refinement 후에도 중복 제거된 pose들이 저장된다. 후자의 pose는 이미
 각각 refinement된 결과이므로 candidate Viser에서 바로 비교할 수 있다.
 
+FoundPose는 camera별로 검색한 상위 template 각각에 대해 PnP를 계산하지만 원래 interface는
+내부 PnP 1등 하나만 반환한다. global mode에서는 동일한 DINO feature/correspondence를 재사용해
+camera별 PnP 대안을 기본 5개까지 회수한 뒤 coarse multiview pool에 추가한다. 모든 대안을 비싼
+refinement에 넣지는 않고, 저해상도 silhouette score와 pose diversity를 통과한 소수만 기존
+refinement를 받는다. primary candidate들만 translation medoid 계산에 사용하므로 낮은 순위의
+오류 translation이 global search 중심을 이동시키지 않는다. 후보 수는
+`--foundpose-per-view-candidates`로 조절하며, 결과는
+`per_view_pose_candidates_world.npz`와 `candidate_bank.json`에서 확인한다. 기존
+`silhouette`/`consensus`/`hybrid` mode는 camera별 1등만 사용한다.
+
 작은 handle이나 고리만 symmetry를 깨는 object는 전체 silhouette IoU가 몸체 면적에 지배될 수
 있다. global mode는 refinement된 후보 중 25도 이상 떨어진 회전이 robust IoU 0.005 이내에
 있을 때만 near-symmetry fallback을 켠다. 이때 diverse seed를 최대 12개까지 추가 refinement하고,
@@ -398,8 +408,31 @@ worker는 shared-storage atomic claim으로 episode 하나씩만 점유하며, �
 
 `completed`는 더 이상 pose 하나만 있어도 되지 않는다. 기본적으로 valid pose coverage가
 50% 이상이고 마지막 missing 구간이 30 frame 이하여야 한다. 그보다 심한 중단은
-`failed`와 `tracking_summary`로 기록되어 재시도 대상이 된다. 반면 pose가 전 frame에
+곧바로 task 전체 재시도로 넘기기 전에 기본 tail recovery를 시도한다. 반면 pose가 전 frame에
 있지만 의미상 drift한 경우는 자동 실패로 단정하지 않는다.
+
+tail recovery는 선택 camera들이 공통으로 가진 마지막 frame에서 시작해 30 frame 간격으로
+앞쪽 seed를 탐색한다. 각 seed에 전체 선택 camera의 SAM3를 실행하고 최소 6-view mask 및
+최소 3-view FoundPose pose를 얻은 첫 지점에서 GoTrack을 한 번만 실행한다. 이 pass는 seed에서 끝까지의 짧은
+정방향 구간과, 기존 마지막 정상 pose보다 30 frame 앞까지의 역방향 구간만 만든다. 다음 조건을
+모두 만족할 때만 기존 `world_pose_records.json`의 잃어버린 suffix를 교체한다.
+
+- 기존/복구 track이 overlap에서 최소 3 pose를 공유한다.
+- overlap 중앙값 차이가 translation 3 cm, rotation 15도 이하다. late FoundPose가 대칭으로
+  인해 상수 회전 offset을 선택한 경우에는 실패 경계에서 먼 overlap frame들에서 그 offset의
+  dispersion이 5도 이하일 때만 object-frame 회전을 정렬한다.
+- 복구 suffix pose coverage가 90% 이상이고 마지막 missing이 30 frame 이하다.
+
+publish 전 원본 records는 `gotrack_tracking/pre_tail_recovery_world_pose_records.json`에
+보존된다. 탐색 및 거부 근거는 `attempt_NN/tail_recovery/recovery_manifest.json`에 남는다.
+복구를 끄려면 `--no-tail-recovery`를 사용한다. 주요 조절 옵션은
+`--tail-recovery-frame-step`, `--tail-recovery-max-seed-attempts`,
+`--tail-recovery-min-mask-views`, `--tail-recovery-overlap-frames`다. FoundPose가 성공한 뒤
+reverse bridge가 거부되더라도 다른 seed에서 비싼 GoTrack을 반복하지 않고 task를 failed로
+남긴다.
+
+tail recovery는 실제 영상에서 물체가 보이지 않는 구간의 pose를 만들어내지 않는다. 끝까지
+물체가 복귀하지 않았거나 역방향 track이 기존 정상 구간에 연결되지 않으면 자동 병합하지 않는다.
 GoTrack 재시도는 새 `attempt_NN` output directory를 사용하므로 partial output을
 덮어쓰지 않는다.
 

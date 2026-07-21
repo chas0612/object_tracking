@@ -112,6 +112,9 @@ def main() -> int:
                         help="Use this zero-based rank from the selected candidate bank; useful for case studies.")
     parser.add_argument("--candidate-bank-size", type=int, default=3,
                         help="How many ranked candidates to save for inspection.")
+    parser.add_argument("--per-view-candidates", type=int, default=5,
+                        help=("FoundPose PnP alternatives retained per camera in global mode. "
+                              "They reuse the same DINO features; default 5."))
     parser.add_argument("--consensus-rotation-deg", type=float, default=25.0)
     parser.add_argument("--consensus-translation-m", type=float, default=0.06)
     parser.add_argument("--global-rotation-count", type=int, default=256,
@@ -130,6 +133,8 @@ def main() -> int:
                         help="Robust-IoU margin that triggers symmetry-breaking reranking.")
     parser.add_argument("--global-asymmetry-weight", type=float, default=0.7)
     args = parser.parse_args()
+    if args.per_view_candidates < 1:
+        raise ValueError("--per-view-candidates must be positive")
     if args.pose_selection_mode == "global" and args.skip_silhouette:
         raise ValueError("--skip-silhouette is incompatible with --pose-selection-mode global")
 
@@ -182,12 +187,37 @@ def main() -> int:
         force_onboard=args.force_onboard,
     )
     t0 = time.perf_counter()
-    per_view = init.estimate_per_view(images, masks, intrinsics, extrinsics)
+    per_view = init.estimate_per_view(
+        images, masks, intrinsics, extrinsics,
+        max_pose_candidates_per_view=(
+            args.per_view_candidates if args.pose_selection_mode == "global" else 1
+        ),
+    )
     foundpose_sec = time.perf_counter() - t0
     candidates = {s: item["pose_world"] for s, item in per_view.items() if item is not None}
     if not candidates:
         raise RuntimeError("FoundPose failed in every camera view.")
     print(f"[foundpose] {len(candidates)}/{len(serials)} candidate poses ({foundpose_sec:.1f}s)", flush=True)
+    expanded_candidates: dict[str, np.ndarray] = {}
+    expanded_metadata: dict[str, dict[str, object]] = {}
+    for serial, item in per_view.items():
+        if item is None:
+            continue
+        for candidate in item.get("pose_candidates", []):
+            rank = int(candidate.get("candidate_rank", 0))
+            key = f"{serial}#{rank}"
+            expanded_candidates[key] = np.asarray(candidate["pose_world"], dtype=np.float64)
+            expanded_metadata[key] = {
+                "foundpose_camera": serial,
+                "foundpose_candidate_rank": rank,
+                "foundpose_quality": float(candidate.get("quality", 0.0)),
+                "foundpose_inliers": int(candidate.get("inliers", 0)),
+                "foundpose_template_id": int(candidate.get("template_id", -1)),
+                "foundpose_corresp_id": int(candidate.get("corresp_id", -1)),
+            }
+    if args.pose_selection_mode == "global":
+        print(f"[foundpose] retained {len(expanded_candidates)} PnP candidates "
+              f"from {len(candidates)} views", flush=True)
 
     from autodex.perception.silhouette import SilhouetteOptimizer
     sil = SilhouetteOptimizer(str(mesh_path), device=args.device)
@@ -227,7 +257,10 @@ def main() -> int:
                 or not 0 <= args.global_asymmetry_weight <= 1):
             raise ValueError("global search parameters must be positive")
         hypotheses = build_global_pose_hypotheses(
-            candidates, rotation_count=args.global_rotation_count,
+            expanded_candidates,
+            rotation_count=args.global_rotation_count,
+            translation_candidates=candidates,
+            candidate_metadata=expanded_metadata,
         )
         t_global = time.perf_counter()
         coarse_ranked = score_pose_hypotheses_by_iou(
@@ -252,10 +285,14 @@ def main() -> int:
             "pose_world": np.asarray(item["pose_world"]).tolist(),
             "mean_iou": float(item["coarse_mean_iou"]),
             "robust_iou": float(item["coarse_robust_iou"]),
-            "pnp_quality": 0.0,
+            "pnp_quality": float(item.get("foundpose_quality", 0.0)),
             "consensus": 0.0,
             "hybrid_score": float(item["coarse_robust_iou"]),
             "coarse_rank": int(item["coarse_rank"]),
+            **{key: item[key] for key in (
+                "foundpose_camera", "foundpose_candidate_rank", "foundpose_quality",
+                "foundpose_inliers", "foundpose_template_id", "foundpose_corresp_id",
+            ) if key in item},
         } for item in refine_seed_pool]
         (output_dir / "global_coarse_bank.json").write_text(json.dumps({
             "selection_mode": "global_coarse",
@@ -281,13 +318,17 @@ def main() -> int:
                 "pose_world_coarse": seed_pose,
                 "mean_iou": float(refined_iou),
                 "robust_iou": refined_robust_iou,
-                "pnp_quality": 0.0,
+                "pnp_quality": float(item.get("foundpose_quality", 0.0)),
                 "consensus": 0.0,
                 "hybrid_score": refined_robust_iou,
                 "coarse_rank": int(item["coarse_rank"]),
                 "coarse_mean_iou": float(item["coarse_mean_iou"]),
                 "coarse_robust_iou": float(item["coarse_robust_iou"]),
                 "silhouette_loss": float(refined_loss),
+                **{key: item[key] for key in (
+                    "foundpose_camera", "foundpose_candidate_rank", "foundpose_quality",
+                    "foundpose_inliers", "foundpose_template_id", "foundpose_corresp_id",
+                ) if key in item},
             }
 
         initial_count = min(args.global_refine_top_k, len(refine_seed_pool))
@@ -361,10 +402,14 @@ def main() -> int:
     np.save(output_dir / "init_pose_world.npy", pose_final)
     np.save(output_dir / "init_pose_world_pre_silhouette.npy", pose_pre)
     np.savez(output_dir / "per_view_poses_world.npz", **candidates)
+    if args.pose_selection_mode == "global":
+        np.savez(output_dir / "per_view_pose_candidates_world.npz", **expanded_candidates)
     result = {
         "capture_dir": str(capture_dir), "frame_dir": str(frame_dir),
         "mesh": str(mesh_path), "object_name": object_name,
         "num_input_views": len(serials), "num_foundpose_candidates": len(candidates),
+        "num_foundpose_pnp_candidates": len(expanded_candidates),
+        "per_view_candidates": args.per_view_candidates if args.pose_selection_mode == "global" else 1,
         "iou_best_serial": best_serial, "iou_mean": float(mean_iou),
         "pose_selection_mode": args.pose_selection_mode,
         "pose_candidate_rank": args.pose_candidate_rank,

@@ -200,6 +200,7 @@ class FoundPoseInit:
         mask_bool: np.ndarray,
         K: np.ndarray,
         ext_cw: np.ndarray,
+        max_pose_candidates: int = 1,
     ) -> Optional[Dict[str, Any]]:
         """Run FoundPose on one view. Returns None if mask too small or PnP failed.
 
@@ -217,7 +218,10 @@ class FoundPoseInit:
             }
         """
         import torch
-        from utils import data_util, structs, transform3d
+        from utils import data_util, pnp_util, structs, transform3d
+
+        if max_pose_candidates < 1:
+            raise ValueError("max_pose_candidates must be positive")
 
         h, w = image_rgb.shape[:2]
         n_pixels = int(mask_bool.sum())
@@ -281,34 +285,91 @@ class FoundPoseInit:
         timings["template_retrieval_sec"] = float(inner.get("establish_correspondences_sec", 0.0))
         timings["pnp_sec"] = float(inner.get("pnp_sec", 0.0))
 
-        final = estimate["final_poses"][0]
-        pose_cam_native = transform3d.Rt_to_4x4_numpy(
-            R=np.asarray(final["R_m2c"], dtype=np.float64),
-            t=np.asarray(final["t_m2c"], dtype=np.float64).reshape(1, 3),
-        )
-        scale = float(self.opts["translation_scale"])
-        pose_camera_m = pose_cam_native.copy()
-        pose_camera_m[:3, 3] *= scale
         T_world_from_crop_cam = np.asarray(
             crop_detections.cameras[0].T_world_from_eye, dtype=np.float64
         )
-        pose_world_m = T_world_from_crop_cam @ pose_camera_m
+        scale = float(self.opts["translation_scale"])
 
-        inliers = final.get("inliers", 0)
-        if hasattr(inliers, "shape"):
-            inliers_count = int(np.asarray(inliers).reshape(-1).shape[0])
-        else:
-            try:
-                inliers_count = int(inliers)
-            except Exception:
-                inliers_count = 0
+        def convert_pose(final: Mapping[str, Any], *, candidate_rank: int) -> Dict[str, Any]:
+            pose_cam_native = transform3d.Rt_to_4x4_numpy(
+                R=np.asarray(final["R_m2c"], dtype=np.float64),
+                t=np.asarray(final["t_m2c"], dtype=np.float64).reshape(1, 3),
+            )
+            pose_camera_m = pose_cam_native.copy()
+            pose_camera_m[:3, 3] *= scale
+            pose_world_m = T_world_from_crop_cam @ pose_camera_m
+            inliers = final.get("inliers", 0)
+            if hasattr(inliers, "shape"):
+                inliers_count = int(np.asarray(inliers).reshape(-1).shape[0])
+            else:
+                try:
+                    inliers_count = int(inliers)
+                except Exception:
+                    inliers_count = 0
+            return {
+                "pose_world": pose_world_m,
+                "pose_camera": pose_camera_m,
+                "quality": float(final.get("quality", 0.0)),
+                "inliers": inliers_count,
+                "template_id": int(final.get("template_id", -1)),
+                "corresp_id": int(final.get("corresp_id", -1)),
+                "candidate_rank": int(candidate_rank),
+            }
+
+        # FoundPose computes one PnP per retrieved template but exposes only its
+        # best result.  Reusing the already-computed DINO correspondences lets
+        # us recover the discarded alternatives without another backbone pass.
+        final = estimate["final_poses"][0]
+        pose_candidates = [convert_pose(final, candidate_rank=0)]
+        if max_pose_candidates > 1:
+            alternatives: list[Dict[str, Any]] = []
+            primary_corresp_id = int(final.get("corresp_id", -1))
+            for corresp_id, correspondence in enumerate(estimate.get("corresp", [])):
+                if corresp_id == primary_corresp_id or len(correspondence.get("coord_2d", [])) < 6:
+                    continue
+                success, rotation, translation, inliers, quality = pnp_util.estimate_pose(
+                    corresp=correspondence,
+                    camera_c2w=crop_detections.cameras[0],
+                    pnp_type=self.model.opts.pnp_type,
+                    pnp_ransac_iter=self.model.opts.pnp_ransac_iter,
+                    pnp_inlier_thresh=self.model.opts.pnp_inlier_thresh,
+                    pnp_required_ransac_conf=self.model.opts.pnp_required_ransac_conf,
+                    pnp_refine_lm=self.model.opts.pnp_refine_lm,
+                )
+                if not success:
+                    continue
+                alternatives.append(convert_pose({
+                    "R_m2c": rotation, "t_m2c": translation,
+                    "inliers": inliers, "quality": quality,
+                    "template_id": correspondence["template_id"],
+                    "corresp_id": corresp_id,
+                }, candidate_rank=0))
+            alternatives.sort(key=lambda item: (item["quality"], item["inliers"]), reverse=True)
+            for alternative in alternatives:
+                pose = np.asarray(alternative["pose_world"])
+                duplicate = any(
+                    np.linalg.norm(pose[:3, 3] - np.asarray(item["pose_world"])[:3, 3]) < 1e-3
+                    and np.trace(
+                        np.asarray(item["pose_world"])[:3, :3].T @ pose[:3, :3]
+                    ) > 2.9995
+                    for item in pose_candidates
+                )
+                if duplicate:
+                    continue
+                alternative["candidate_rank"] = len(pose_candidates)
+                pose_candidates.append(alternative)
+                if len(pose_candidates) >= max_pose_candidates:
+                    break
+
+        primary = pose_candidates[0]
 
         return {
-            "pose_world": pose_world_m,
-            "pose_camera": pose_camera_m,
-            "quality": float(final.get("quality", 0.0)),
-            "inliers": inliers_count,
-            "template_id": int(final.get("template_id", -1)),
+            "pose_world": primary["pose_world"],
+            "pose_camera": primary["pose_camera"],
+            "quality": primary["quality"],
+            "inliers": primary["inliers"],
+            "template_id": primary["template_id"],
+            "pose_candidates": pose_candidates,
             "mask_pixels": n_pixels,
             "timings": timings,
         }
@@ -319,6 +380,7 @@ class FoundPoseInit:
         masks_bool: Dict[str, np.ndarray],
         intrinsics: Dict[str, np.ndarray],
         extrinsics: Dict[str, np.ndarray],
+        max_pose_candidates_per_view: int = 1,
     ) -> Dict[str, Dict[str, Any]]:
         """Run FoundPose on every camera. Returns {serial: result_or_None}."""
         out: Dict[str, Dict[str, Any]] = {}
@@ -329,6 +391,7 @@ class FoundPoseInit:
             try:
                 out[s] = self.estimate_one_view(
                     img, masks_bool[s], intrinsics[s], extrinsics[s],
+                    max_pose_candidates=max_pose_candidates_per_view,
                 )
             except Exception as exc:
                 logger.warning(f"[FoundPoseInit] {s} failed: {exc}")

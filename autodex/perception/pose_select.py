@@ -240,6 +240,8 @@ def _translation_medoid(candidates: Mapping[str, np.ndarray]) -> np.ndarray:
 def build_global_pose_hypotheses(
     candidates: Mapping[str, np.ndarray],
     rotation_count: int = 256,
+    translation_candidates: Mapping[str, np.ndarray] | None = None,
+    candidate_metadata: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Build coarse global pose hypotheses around a robust translation.
 
@@ -251,14 +253,15 @@ def build_global_pose_hypotheses(
     """
     if not candidates:
         return []
-    translation = _translation_medoid(candidates)
+    translation = _translation_medoid(translation_candidates or candidates)
     hypotheses: list[dict[str, Any]] = []
     for serial, value in candidates.items():
         pose = np.asarray(value, dtype=np.float64)
-        hypotheses.append({"source": f"foundpose:{serial}", "pose_world": pose.copy()})
+        metadata = dict((candidate_metadata or {}).get(serial, {}))
+        hypotheses.append({"source": f"foundpose:{serial}", "pose_world": pose.copy(), **metadata})
         recombined = pose.copy()
         recombined[:3, 3] = translation
-        hypotheses.append({"source": f"foundpose_rotation:{serial}", "pose_world": recombined})
+        hypotheses.append({"source": f"foundpose_rotation:{serial}", "pose_world": recombined, **metadata})
     for index, rotation in enumerate(sample_so3_rotations(rotation_count)):
         pose = np.eye(4, dtype=np.float64)
         pose[:3, :3] = rotation
