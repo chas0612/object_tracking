@@ -322,6 +322,57 @@ IoU를 함께 점수화한다. 기본값 `silhouette`은 기존 결과와 호환
 어떤 selector도 의미상 올바른 회전을 보장하지 않으므로, `hybrid`는 검증 후에만
 schedule 기본값으로 승격한다.
 
+후보 순위 자체를 검토할 때는 GoTrack을 후보마다 실행하지 않는다.
+`view_foundpose_candidates_viser.py`는 기존 `candidate_bank.json`의 pose를 읽어
+bootstrap frame의 robot·camera scene에 후보를 색상별로 등록한다. 모든 rank가 기본으로
+표시되며, GUI checkbox로 하나씩 숨기거나 다시 겹쳐 볼 수 있다. NAS output은 추가로 만들지 않는다.
+
+```bash
+conda run --no-capture-output -n gotrack python -u \
+  src/process/view_foundpose_candidates_viser.py \
+  --capture-dir "$CAPTURE" --object-mesh "$MESH" \
+  --candidate-bank "$INIT_OUT/candidate_bank.json" --port 8080
+```
+
+기본 frame은 같은 directory의 `result.json`에서 추론하고, 없으면 30을 사용한다.
+camera RGB가 필요할 때만 `--show-camera-images`를 추가한다. 후보를 고른 뒤 선택한
+zero-based rank 하나에만 `--foundpose-candidate-rank`를 주어 GoTrack을 실행한다.
+
+상위 FoundPose 후보 자체에 올바른 회전이 없을 때는 opt-in `global` selector를 사용할 수
+있다. 이 mode는 모든 per-camera FoundPose pose에서 translation medoid를 구하고, 원래 후보
+pose·후보 rotation과 medoid translation의 조합·저편향 SO(3) rotation 256개를 저해상도
+multi-view silhouette으로 평가한다. camera별 IoU 양끝 15%를 제외한 robust mean으로 coarse
+순위를 정한다. 점수만으로 인접 pose가 상위 slot을 독점하지 않도록 기본 35도 이상의 회전
+간격을 강제하고, 서로 다른 pose basin 상위 5개만 기존 full-resolution silhouette optimizer로
+정밀화한다. 최종
+pose 하나만 GoTrack으로 넘어가므로 GoTrack 실행 횟수는 늘지 않는다.
+
+```bash
+python -u scripts/distribute_foundpose_gotrack.py \
+  --mode init --schedule-id <new-schedule-id> \
+  --target-root-rel capture/<campaign>/<robot> \
+  --objects <object> --episodes <episode> \
+  --foundpose-selection-mode global --max-attempts 1
+```
+
+기본 `silhouette` 동작에는 영향이 없으며, global mode의 주요 비용은 저해상도 rotation
+search와 다섯 번의 silhouette refinement다. 필요하면
+`--foundpose-global-rotation-count`, `--foundpose-global-coarse-max-side`,
+`--foundpose-global-refine-top-k`, `--foundpose-global-min-rotation-separation-deg`로 조절한다.
+`global_coarse_bank.json`에는 refinement 전의 서로 다른 seed들이, global
+`candidate_bank.json`에는 refinement 후에도 중복 제거된 pose들이 저장된다. 후자의 pose는 이미
+각각 refinement된 결과이므로 candidate Viser에서 바로 비교할 수 있다.
+
+작은 handle이나 고리만 symmetry를 깨는 object는 전체 silhouette IoU가 몸체 면적에 지배될 수
+있다. global mode는 refinement된 후보 중 25도 이상 떨어진 회전이 robust IoU 0.005 이내에
+있을 때만 near-symmetry fallback을 켠다. 이때 diverse seed를 최대 12개까지 추가 refinement하고,
+후보 render들의 union과 intersection이 다른 pixel을 자동 symmetry-breaking region으로 삼는다.
+이 영역을 512px resolution에서 확장해 mask mismatch를 계산하고, 기본 0.7 weight로 전체 IoU와
+합쳐 최종 순위를 다시 정한다. 일반적인 비대칭 object에는 이 추가 비용이 발생하지 않는다.
+관련 조절 옵션은 `--foundpose-global-asymmetry-refine-top-k`,
+`--foundpose-global-asymmetry-max-side`, `--foundpose-global-asymmetry-score-margin`,
+`--foundpose-global-asymmetry-weight`다.
+
 GoTrack은 모든 AVI의 frame count/FPS로 계산한 duration을 비교해 median에서 기본 1초 이상
 벗어난 camera만 자동 제외한다. 몇 frame 누락은 허용하며, 과거 특정 serial을 하드코딩해
 제외하지 않는다. `run_manifest.json`의 `video_timings`, `rejected_cameras`에서 판단 근거를

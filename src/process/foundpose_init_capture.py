@@ -105,16 +105,33 @@ def main() -> int:
     parser.add_argument("--skip-silhouette", action="store_true",
                         help="Save cross-view IoU pose without silhouette refinement.")
     parser.add_argument("--silhouette-iters", type=int, default=100)
-    parser.add_argument("--pose-selection-mode", choices=("silhouette", "consensus", "hybrid"),
+    parser.add_argument("--pose-selection-mode", choices=("silhouette", "consensus", "hybrid", "global"),
                         default="silhouette",
-                        help="Candidate selector. silhouette preserves legacy behavior; consensus/hybrid use per-view FoundPose PnP agreement.")
+                        help="Candidate selector. global adds coarse SO(3) search and multi-start silhouette refinement.")
     parser.add_argument("--pose-candidate-rank", type=int, default=0,
                         help="Use this zero-based rank from the selected candidate bank; useful for case studies.")
     parser.add_argument("--candidate-bank-size", type=int, default=3,
                         help="How many ranked candidates to save for inspection.")
     parser.add_argument("--consensus-rotation-deg", type=float, default=25.0)
     parser.add_argument("--consensus-translation-m", type=float, default=0.06)
+    parser.add_argument("--global-rotation-count", type=int, default=256,
+                        help="Deterministic SO(3) hypotheses used by global mode.")
+    parser.add_argument("--global-coarse-max-side", type=int, default=160,
+                        help="Maximum mask side for global coarse silhouette scoring.")
+    parser.add_argument("--global-refine-top-k", type=int, default=5,
+                        help="Coarse global hypotheses receiving full silhouette refinement.")
+    parser.add_argument("--global-min-rotation-separation-deg", type=float, default=35.0,
+                        help="Minimum rotation distance between coarse hypotheses sent to refinement.")
+    parser.add_argument("--global-asymmetry-refine-top-k", type=int, default=12,
+                        help="Diverse hypotheses refined only after near-symmetry is detected.")
+    parser.add_argument("--global-asymmetry-max-side", type=int, default=512,
+                        help="Resolution for symmetry-breaking silhouette reranking.")
+    parser.add_argument("--global-asymmetry-score-margin", type=float, default=0.005,
+                        help="Robust-IoU margin that triggers symmetry-breaking reranking.")
+    parser.add_argument("--global-asymmetry-weight", type=float, default=0.7)
     args = parser.parse_args()
+    if args.pose_selection_mode == "global" and args.skip_silhouette:
+        raise ValueError("--skip-silhouette is incompatible with --pose-selection-mode global")
 
     capture_dir = Path(args.capture_dir).expanduser().resolve()
     frame_dir = (Path(args.frame_dir).expanduser().resolve() if args.frame_dir else
@@ -143,7 +160,16 @@ def main() -> int:
     print(f"[inputs] {len(serials)} valid views, {width}x{height}; object={object_name}", flush=True)
 
     from autodex.perception.foundpose_init import FoundPoseInit
-    from autodex.perception.pose_select import rank_pose_candidates, select_best_pose_by_iou
+    from autodex.perception.pose_select import (
+        build_global_pose_hypotheses,
+        compute_cross_view_iou,
+        has_rotation_ambiguous_top_poses,
+        rank_pose_candidates,
+        score_pose_hypotheses_by_asymmetry,
+        score_pose_hypotheses_by_iou,
+        select_diverse_pose_hypotheses,
+        select_best_pose_by_iou,
+    )
 
     init = FoundPoseInit(
         mesh_path=str(mesh_path),
@@ -185,7 +211,116 @@ def main() -> int:
         consensus_rotation_deg=args.consensus_rotation_deg,
         consensus_translation_m=args.consensus_translation_m,
     )
-    if args.pose_selection_mode == "silhouette":
+    sil_views = [
+        {"mask": masks[s].astype(np.uint8) * 255,
+         "K": intrinsics[s].astype(np.float32),
+         "extrinsic": extrinsics[s]}
+        for s in serials
+    ]
+    global_silhouette_sec = 0.0
+    asymmetry_applied = False
+    if args.pose_selection_mode == "global":
+        if (args.global_rotation_count < 1 or args.global_coarse_max_side < 32
+                or args.global_refine_top_k < 1 or args.global_min_rotation_separation_deg < 0
+                or args.global_asymmetry_refine_top_k < args.global_refine_top_k
+                or args.global_asymmetry_max_side < 32 or args.global_asymmetry_score_margin < 0
+                or not 0 <= args.global_asymmetry_weight <= 1):
+            raise ValueError("global search parameters must be positive")
+        hypotheses = build_global_pose_hypotheses(
+            candidates, rotation_count=args.global_rotation_count,
+        )
+        t_global = time.perf_counter()
+        coarse_ranked = score_pose_hypotheses_by_iou(
+            hypotheses=hypotheses,
+            masks=masks,
+            intrinsics=intrinsics,
+            extrinsics=extrinsics,
+            glctx=sil.glctx,
+            mesh_tensors=sil.mesh_tensors,
+            max_side=args.global_coarse_max_side,
+        )
+        for coarse_rank, item in enumerate(coarse_ranked):
+            item["coarse_rank"] = coarse_rank
+        refine_seed_pool = select_diverse_pose_hypotheses(
+            coarse_ranked,
+            count=min(args.global_asymmetry_refine_top_k, len(coarse_ranked)),
+            min_rotation_deg=args.global_min_rotation_separation_deg,
+            min_translation_m=0.02,
+        )
+        coarse_bank = [{
+            "source_serial": str(item["source"]),
+            "pose_world": np.asarray(item["pose_world"]).tolist(),
+            "mean_iou": float(item["coarse_mean_iou"]),
+            "robust_iou": float(item["coarse_robust_iou"]),
+            "pnp_quality": 0.0,
+            "consensus": 0.0,
+            "hybrid_score": float(item["coarse_robust_iou"]),
+            "coarse_rank": int(item["coarse_rank"]),
+        } for item in refine_seed_pool]
+        (output_dir / "global_coarse_bank.json").write_text(json.dumps({
+            "selection_mode": "global_coarse",
+            "selected_rank": 0,
+            "candidates": coarse_bank,
+        }, indent=2) + "\n", encoding="utf-8")
+        def refine_seed(item: dict[str, object]) -> dict[str, object]:
+            seed_pose = np.asarray(item["pose_world"], dtype=np.float64)
+            refined_pose, refined_loss = sil.optimize(
+                seed_pose, sil_views, iters=args.silhouette_iters, lr=0.002, antialias=True,
+            )
+            refined_iou, refined_per_view = compute_cross_view_iou(
+                refined_pose, masks, intrinsics, extrinsics, height, width,
+                sil.glctx, sil.mesh_tensors,
+            )
+            refined_values = np.sort(np.asarray(list(refined_per_view.values()), dtype=np.float64))
+            trim = int(np.floor(len(refined_values) * 0.15))
+            refined_kept = refined_values[trim:len(refined_values) - trim] if trim > 0 else refined_values
+            refined_robust_iou = float(refined_kept.mean()) if len(refined_kept) else float(refined_iou)
+            return {
+                "source_serial": str(item["source"]),
+                "pose_world": refined_pose,
+                "pose_world_coarse": seed_pose,
+                "mean_iou": float(refined_iou),
+                "robust_iou": refined_robust_iou,
+                "pnp_quality": 0.0,
+                "consensus": 0.0,
+                "hybrid_score": refined_robust_iou,
+                "coarse_rank": int(item["coarse_rank"]),
+                "coarse_mean_iou": float(item["coarse_mean_iou"]),
+                "coarse_robust_iou": float(item["coarse_robust_iou"]),
+                "silhouette_loss": float(refined_loss),
+            }
+
+        initial_count = min(args.global_refine_top_k, len(refine_seed_pool))
+        print(f"[global] hypotheses={len(hypotheses)} refine_top_k={initial_count}", flush=True)
+        refined = [refine_seed(item) for item in refine_seed_pool[:initial_count]]
+        refined_ranked = sorted(refined, key=lambda item: float(item["robust_iou"]), reverse=True)
+        asymmetry_applied = has_rotation_ambiguous_top_poses(
+            refined_ranked,
+            score_margin=args.global_asymmetry_score_margin,
+            min_rotation_deg=25.0,
+        )
+        if asymmetry_applied:
+            extra_seeds = refine_seed_pool[initial_count:]
+            print(f"[global] rotation ambiguity detected; refining {len(extra_seeds)} extra hypotheses", flush=True)
+            refined.extend(refine_seed(item) for item in extra_seeds)
+            refined_ranked = score_pose_hypotheses_by_asymmetry(
+                refined,
+                masks=masks,
+                intrinsics=intrinsics,
+                extrinsics=extrinsics,
+                glctx=sil.glctx,
+                mesh_tensors=sil.mesh_tensors,
+                max_side=args.global_asymmetry_max_side,
+                asymmetry_weight=args.global_asymmetry_weight,
+            )
+        global_silhouette_sec = time.perf_counter() - t_global
+        selected = select_diverse_pose_hypotheses(
+            refined_ranked,
+            count=min(max(args.candidate_bank_size, args.pose_candidate_rank + 1), len(refined_ranked)),
+            min_rotation_deg=10.0,
+            min_translation_m=0.01,
+        )
+    elif args.pose_selection_mode == "silhouette":
         selected = sorted(candidate_bank, key=lambda item: item["mean_iou"], reverse=True)
     elif args.pose_selection_mode == "consensus":
         selected = sorted(candidate_bank, key=lambda item: item["consensus"], reverse=True)
@@ -194,13 +329,13 @@ def main() -> int:
     if args.pose_candidate_rank < 0 or args.pose_candidate_rank >= len(selected):
         raise ValueError(f"--pose-candidate-rank must be in [0, {len(selected) - 1}]")
     chosen = selected[args.pose_candidate_rank]
-    pose_pre = np.asarray(chosen["pose_world"], dtype=np.float64)
+    pose_pre = np.asarray(chosen.get("pose_world_coarse", chosen["pose_world"]), dtype=np.float64)
     mean_iou = float(chosen["mean_iou"])
     best_serial = str(chosen["source_serial"])
     serializable_bank = [{
-        **{key: value for key, value in item.items() if key != "pose_world"},
-        "pose_world": np.asarray(item["pose_world"]).tolist(),
-    } for item in selected[:max(1, args.candidate_bank_size)]]
+        key: (value.tolist() if isinstance(value, np.ndarray) else value)
+        for key, value in item.items()
+    } for item in selected[:max(1, args.candidate_bank_size, args.pose_candidate_rank + 1)]]
     (output_dir / "candidate_bank.json").write_text(json.dumps({
         "selection_mode": args.pose_selection_mode,
         "selected_rank": args.pose_candidate_rank,
@@ -210,18 +345,13 @@ def main() -> int:
     }, indent=2) + "\n", encoding="utf-8")
     print(f"[selection] mode={args.pose_selection_mode} serial={best_serial} "
           f"iou={mean_iou:.4f} quality={chosen['pnp_quality']:.3f} "
-          f"consensus={chosen['consensus']:.3f} hybrid={chosen['hybrid_score']:.3f}", flush=True)
+          f"consensus={chosen['consensus']:.3f} hybrid={chosen['hybrid_score']:.3f} "
+          f"asymmetry={chosen.get('asymmetry_combined_score', float('nan')):.3f}", flush=True)
 
-    pose_final = pose_pre
-    sil_loss = None
-    sil_sec = 0.0
-    if not args.skip_silhouette:
-        sil_views = [
-            {"mask": masks[s].astype(np.uint8) * 255,
-             "K": intrinsics[s].astype(np.float32),
-             "extrinsic": extrinsics[s]}
-            for s in serials
-        ]
+    pose_final = np.asarray(chosen["pose_world"], dtype=np.float64) if args.pose_selection_mode == "global" else pose_pre
+    sil_loss = float(chosen["silhouette_loss"]) if args.pose_selection_mode == "global" else None
+    sil_sec = global_silhouette_sec
+    if not args.skip_silhouette and args.pose_selection_mode != "global":
         t0 = time.perf_counter()
         pose_final, sil_loss = sil.optimize(
             pose_pre, sil_views, iters=args.silhouette_iters, lr=0.002, antialias=True,
@@ -238,6 +368,10 @@ def main() -> int:
         "iou_best_serial": best_serial, "iou_mean": float(mean_iou),
         "pose_selection_mode": args.pose_selection_mode,
         "pose_candidate_rank": args.pose_candidate_rank,
+        "global_rotation_count": args.global_rotation_count if args.pose_selection_mode == "global" else None,
+        "global_refine_top_k": args.global_refine_top_k if args.pose_selection_mode == "global" else None,
+        "global_asymmetry_applied": asymmetry_applied if args.pose_selection_mode == "global" else None,
+        "global_coarse_bank": "global_coarse_bank.json" if args.pose_selection_mode == "global" else None,
         "candidate_bank": "candidate_bank.json",
         "foundpose_sec": foundpose_sec, "silhouette_sec": sil_sec,
         "silhouette_loss": None if sil_loss is None else float(sil_loss),
