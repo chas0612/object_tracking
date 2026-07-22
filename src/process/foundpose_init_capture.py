@@ -132,6 +132,13 @@ def main() -> int:
     parser.add_argument("--global-asymmetry-score-margin", type=float, default=0.005,
                         help="Robust-IoU margin that triggers symmetry-breaking reranking.")
     parser.add_argument("--global-asymmetry-weight", type=float, default=0.7)
+    parser.add_argument("--global-dino-rerank", action=argparse.BooleanOptionalAction, default=False,
+                        help=("Experimental: use FoundPose's cached cross-view DINO correspondences "
+                              "as a tie-break among near-equal silhouette candidates."))
+    parser.add_argument("--global-dino-score-margin", type=float, default=0.02,
+                        help="Only candidates this close to the best mask score are DINO-reranked.")
+    parser.add_argument("--global-dino-inlier-threshold-px", type=float, default=10.0,
+                        help="Soft reprojection threshold in FoundPose crop pixels.")
     args = parser.parse_args()
     if args.per_view_candidates < 1:
         raise ValueError("--per-view-candidates must be positive")
@@ -170,6 +177,7 @@ def main() -> int:
         compute_cross_view_iou,
         has_rotation_ambiguous_top_poses,
         rank_pose_candidates,
+        score_pose_hypotheses_by_dino_reprojection,
         score_pose_hypotheses_by_asymmetry,
         score_pose_hypotheses_by_iou,
         select_diverse_pose_hypotheses,
@@ -249,12 +257,15 @@ def main() -> int:
     ]
     global_silhouette_sec = 0.0
     asymmetry_applied = False
+    dino_rerank_applied = False
     if args.pose_selection_mode == "global":
         if (args.global_rotation_count < 1 or args.global_coarse_max_side < 32
                 or args.global_refine_top_k < 1 or args.global_min_rotation_separation_deg < 0
                 or args.global_asymmetry_refine_top_k < args.global_refine_top_k
                 or args.global_asymmetry_max_side < 32 or args.global_asymmetry_score_margin < 0
-                or not 0 <= args.global_asymmetry_weight <= 1):
+                or not 0 <= args.global_asymmetry_weight <= 1
+                or args.global_dino_score_margin < 0
+                or args.global_dino_inlier_threshold_px <= 0):
             raise ValueError("global search parameters must be positive")
         hypotheses = build_global_pose_hypotheses(
             expanded_candidates,
@@ -354,6 +365,51 @@ def main() -> int:
                 max_side=args.global_asymmetry_max_side,
                 asymmetry_weight=args.global_asymmetry_weight,
             )
+        if args.global_dino_rerank:
+            appearance_evidence = {
+                serial: item["appearance_evidence"]
+                for serial, item in per_view.items()
+                if item is not None and item.get("appearance_evidence")
+            }
+            dino_scored = score_pose_hypotheses_by_dino_reprojection(
+                refined_ranked,
+                appearance_evidence=appearance_evidence,
+                inlier_threshold_px=args.global_dino_inlier_threshold_px,
+            )
+
+            def mask_score(item: dict[str, object]) -> float:
+                return float(item.get(
+                    "asymmetry_combined_score", item.get("robust_iou", 0.0),
+                ))
+
+            best_mask_score = max((mask_score(item) for item in dino_scored), default=0.0)
+            eligible = [
+                item for item in dino_scored
+                if best_mask_score - mask_score(item) <= args.global_dino_score_margin
+                and int(item.get("dino_valid_views", 0)) >= 3
+            ]
+            eligible_ids = {id(item) for item in eligible}
+            remainder = sorted(
+                (item for item in dino_scored if id(item) not in eligible_ids),
+                key=mask_score,
+                reverse=True,
+            )
+            if len(eligible) >= 2:
+                eligible.sort(
+                    key=lambda item: float(item["dino_reprojection_score"]), reverse=True,
+                )
+                refined_ranked = eligible + remainder
+                dino_rerank_applied = True
+                print(
+                    f"[global] DINO reprojection reranked {len(eligible)} mask-tied hypotheses; "
+                    f"winner={eligible[0]['source_serial']} "
+                    f"score={eligible[0]['dino_reprojection_score']:.3f}",
+                    flush=True,
+                )
+            else:
+                # Keep the original mask ordering when DINO evidence cannot
+                # compare at least two well-supported hypotheses.
+                refined_ranked = sorted(dino_scored, key=mask_score, reverse=True)
         global_silhouette_sec = time.perf_counter() - t_global
         selected = select_diverse_pose_hypotheses(
             refined_ranked,
@@ -387,7 +443,8 @@ def main() -> int:
     print(f"[selection] mode={args.pose_selection_mode} serial={best_serial} "
           f"iou={mean_iou:.4f} quality={chosen['pnp_quality']:.3f} "
           f"consensus={chosen['consensus']:.3f} hybrid={chosen['hybrid_score']:.3f} "
-          f"asymmetry={chosen.get('asymmetry_combined_score', float('nan')):.3f}", flush=True)
+          f"asymmetry={chosen.get('asymmetry_combined_score', float('nan')):.3f} "
+          f"dino={chosen.get('dino_reprojection_score', float('nan')):.3f}", flush=True)
 
     pose_final = np.asarray(chosen["pose_world"], dtype=np.float64) if args.pose_selection_mode == "global" else pose_pre
     sil_loss = float(chosen["silhouette_loss"]) if args.pose_selection_mode == "global" else None
@@ -416,6 +473,9 @@ def main() -> int:
         "global_rotation_count": args.global_rotation_count if args.pose_selection_mode == "global" else None,
         "global_refine_top_k": args.global_refine_top_k if args.pose_selection_mode == "global" else None,
         "global_asymmetry_applied": asymmetry_applied if args.pose_selection_mode == "global" else None,
+        "global_dino_rerank_requested": args.global_dino_rerank if args.pose_selection_mode == "global" else None,
+        "global_dino_rerank_applied": dino_rerank_applied if args.pose_selection_mode == "global" else None,
+        "global_dino_score_margin": args.global_dino_score_margin if args.pose_selection_mode == "global" else None,
         "global_coarse_bank": "global_coarse_bank.json" if args.pose_selection_mode == "global" else None,
         "candidate_bank": "candidate_bank.json",
         "foundpose_sec": foundpose_sec, "silhouette_sec": sil_sec,

@@ -218,7 +218,7 @@ class FoundPoseInit:
             }
         """
         import torch
-        from utils import data_util, pnp_util, structs, transform3d
+        from utils import data_util, misc, pnp_util, structs, torch_helpers, transform3d
 
         if max_pose_candidates < 1:
             raise ValueError("max_pose_candidates must be positive")
@@ -289,6 +289,44 @@ class FoundPoseInit:
             crop_detections.cameras[0].T_world_from_eye, dtype=np.float64
         )
         scale = float(self.opts["translation_scale"])
+
+        # Keep the DINO 2D<->3D matches that FoundPose already computed.  The
+        # multiview wrapper can use them to score a world-pose hypothesis in
+        # every camera without another backbone pass.  Object vertices are
+        # converted from FoundPose's native mesh units (mm in our onboarding)
+        # to the metre convention used by pose_world.
+        appearance_correspondences: list[Dict[str, Any]] = []
+        for correspondence in estimate.get("corresp", []):
+            coord_2d = torch_helpers.tensor_to_array(correspondence["coord_2d"]).astype(
+                np.float64, copy=False,
+            )
+            coord_3d_m = torch_helpers.tensor_to_array(correspondence["coord_3d"]).astype(
+                np.float64, copy=False,
+            ) * scale
+            coord_conf = torch_helpers.tensor_to_array(correspondence["coord_conf"]).astype(
+                np.float64, copy=False,
+            ).reshape(-1)
+            if coord_2d.ndim != 2 or coord_2d.shape[1] != 2:
+                continue
+            if coord_3d_m.ndim != 2 or coord_3d_m.shape[1] != 3:
+                continue
+            count = min(len(coord_2d), len(coord_3d_m), len(coord_conf))
+            if count < 6:
+                continue
+            appearance_correspondences.append({
+                "template_id": int(correspondence["template_id"]),
+                "template_score": float(correspondence.get("template_score", 0.0)),
+                "coord_2d": coord_2d[:count].copy(),
+                "coord_3d_m": coord_3d_m[:count].copy(),
+                "coord_conf": coord_conf[:count].copy(),
+            })
+        appearance_evidence = {
+            "K": np.asarray(
+                misc.get_intrinsic_matrix(crop_detections.cameras[0]), dtype=np.float64,
+            ),
+            "world_to_camera": np.linalg.inv(T_world_from_crop_cam),
+            "correspondences": appearance_correspondences,
+        }
 
         def convert_pose(final: Mapping[str, Any], *, candidate_rank: int) -> Dict[str, Any]:
             pose_cam_native = transform3d.Rt_to_4x4_numpy(
@@ -370,6 +408,7 @@ class FoundPoseInit:
             "inliers": primary["inliers"],
             "template_id": primary["template_id"],
             "pose_candidates": pose_candidates,
+            "appearance_evidence": appearance_evidence,
             "mask_pixels": n_pixels,
             "timings": timings,
         }

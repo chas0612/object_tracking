@@ -143,7 +143,8 @@ def main() -> int:
             f"score={float(row.get('hybrid_score', float('nan'))):.4f} "
             f"iou={float(row.get('mean_iou', float('nan'))):.4f} "
             f"pnp={float(row.get('pnp_quality', float('nan'))):.1f} "
-            f"consensus={float(row.get('consensus', float('nan'))):.4f}"
+            f"consensus={float(row.get('consensus', float('nan'))):.4f} "
+            f"dino={float(row.get('dino_reprojection_score', float('nan'))):.4f}"
         )
     if args.dry_run:
         return 0
@@ -247,7 +248,8 @@ def main() -> int:
             display_score = float(row.get("asymmetry_combined_score", row.get("hybrid_score", float("nan"))))
             label = (
                 f"rank {rank}  score={display_score:.3f}  "
-                f"IoU={float(row.get('mean_iou', float('nan'))):.3f}"
+                f"IoU={float(row.get('mean_iou', float('nan'))):.3f}  "
+                f"DINO={float(row.get('dino_reprojection_score', float('nan'))):.3f}"
             )
             visibility_controls.append(server.gui.add_checkbox(label, initial_value=True))
         show_robot = server.gui.add_checkbox("Show robot", initial_value=robot_vis is not None)

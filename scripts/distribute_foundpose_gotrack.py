@@ -340,8 +340,11 @@ def _foundpose_command(
         "--global-asymmetry-max-side", str(args.foundpose_global_asymmetry_max_side),
         "--global-asymmetry-score-margin", str(args.foundpose_global_asymmetry_score_margin),
         "--global-asymmetry-weight", str(args.foundpose_global_asymmetry_weight),
+        "--global-dino-score-margin", str(args.foundpose_global_dino_score_margin),
+        "--global-dino-inlier-threshold-px", str(args.foundpose_global_dino_inlier_threshold_px),
         "--output-dir", str(output_dir),
-    ]
+    ] + (["--global-dino-rerank"] if args.foundpose_global_dino_rerank else
+         ["--no-global-dino-rerank"])
 
 
 def _attempt_tail_recovery(
@@ -679,6 +682,9 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
                                                 "foundpose_global_asymmetry_max_side": args.foundpose_global_asymmetry_max_side,
                                                 "foundpose_global_asymmetry_score_margin": args.foundpose_global_asymmetry_score_margin,
                                                 "foundpose_global_asymmetry_weight": args.foundpose_global_asymmetry_weight,
+                                                "foundpose_global_dino_rerank": args.foundpose_global_dino_rerank,
+                                                "foundpose_global_dino_score_margin": args.foundpose_global_dino_score_margin,
+                                                "foundpose_global_dino_inlier_threshold_px": args.foundpose_global_dino_inlier_threshold_px,
                                                 "debug_sheets": args.debug_sheets,
                                                 "debug_sheet_max_cameras": args.debug_sheet_max_cameras,
                                                 "debug_sheet_output_root_rel": args.debug_sheet_output_root_rel,
@@ -736,6 +742,9 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
     args.foundpose_global_asymmetry_max_side = int(manifest.get("foundpose_global_asymmetry_max_side", args.foundpose_global_asymmetry_max_side))
     args.foundpose_global_asymmetry_score_margin = float(manifest.get("foundpose_global_asymmetry_score_margin", args.foundpose_global_asymmetry_score_margin))
     args.foundpose_global_asymmetry_weight = float(manifest.get("foundpose_global_asymmetry_weight", args.foundpose_global_asymmetry_weight))
+    args.foundpose_global_dino_rerank = bool(manifest.get("foundpose_global_dino_rerank", args.foundpose_global_dino_rerank))
+    args.foundpose_global_dino_score_margin = float(manifest.get("foundpose_global_dino_score_margin", args.foundpose_global_dino_score_margin))
+    args.foundpose_global_dino_inlier_threshold_px = float(manifest.get("foundpose_global_dino_inlier_threshold_px", args.foundpose_global_dino_inlier_threshold_px))
     args.debug_sheets = bool(manifest.get("debug_sheets", args.debug_sheets))
     args.debug_sheet_max_cameras = int(manifest.get("debug_sheet_max_cameras", args.debug_sheet_max_cameras))
     args.debug_sheet_output_root_rel = str(manifest.get("debug_sheet_output_root_rel", args.debug_sheet_output_root_rel))
@@ -772,6 +781,8 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
                    "--foundpose-global-asymmetry-max-side", str(args.foundpose_global_asymmetry_max_side),
                    "--foundpose-global-asymmetry-score-margin", str(args.foundpose_global_asymmetry_score_margin),
                    "--foundpose-global-asymmetry-weight", str(args.foundpose_global_asymmetry_weight),
+                   "--foundpose-global-dino-score-margin", str(args.foundpose_global_dino_score_margin),
+                   "--foundpose-global-dino-inlier-threshold-px", str(args.foundpose_global_dino_inlier_threshold_px),
                    "--debug-sheet-max-cameras", str(args.debug_sheet_max_cameras),
                    "--debug-sheet-output-root-rel", args.debug_sheet_output_root_rel,
                    "--min-valid-pose-coverage", str(args.min_valid_pose_coverage),
@@ -788,6 +799,8 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
                    "--max-frames", str(args.max_frames), "--max-attempts", str(args.max_attempts)]
         command.append("--debug-sheets" if args.debug_sheets else "--no-debug-sheets")
         command.append("--tail-recovery" if args.tail_recovery else "--no-tail-recovery")
+        command.append("--foundpose-global-dino-rerank" if args.foundpose_global_dino_rerank else
+                       "--no-foundpose-global-dino-rerank")
         if args.retry_failed:
             command.append("--retry-failed")
         rendered = " ".join(part if part.startswith("$HOME/") else shlex.quote(part) for part in command)
@@ -878,6 +891,15 @@ def main() -> int:
     p.add_argument("--foundpose-global-asymmetry-max-side", type=int, default=512)
     p.add_argument("--foundpose-global-asymmetry-score-margin", type=float, default=0.005)
     p.add_argument("--foundpose-global-asymmetry-weight", type=float, default=0.7)
+    dino_group = p.add_mutually_exclusive_group()
+    dino_group.add_argument("--foundpose-global-dino-rerank", dest="foundpose_global_dino_rerank",
+                            action="store_true",
+                            help="Tie-break mask-ambiguous global poses with cached DINO correspondences.")
+    dino_group.add_argument("--no-foundpose-global-dino-rerank", dest="foundpose_global_dino_rerank",
+                            action="store_false")
+    p.set_defaults(foundpose_global_dino_rerank=False)
+    p.add_argument("--foundpose-global-dino-score-margin", type=float, default=0.02)
+    p.add_argument("--foundpose-global-dino-inlier-threshold-px", type=float, default=10.0)
     p.add_argument("--max-attempts", type=int, default=2)
     debug_group = p.add_mutually_exclusive_group()
     debug_group.add_argument("--debug-sheets", dest="debug_sheets", action="store_true",
@@ -919,7 +941,10 @@ def main() -> int:
             or args.foundpose_global_refine_top_k < 1 or args.foundpose_global_min_rotation_separation_deg < 0
             or args.foundpose_global_asymmetry_refine_top_k < args.foundpose_global_refine_top_k
             or args.foundpose_global_asymmetry_max_side < 32 or args.foundpose_global_asymmetry_score_margin < 0
-            or not 0 <= args.foundpose_global_asymmetry_weight <= 1 or args.debug_sheet_max_cameras < 1
+            or not 0 <= args.foundpose_global_asymmetry_weight <= 1
+            or args.foundpose_global_dino_score_margin < 0
+            or args.foundpose_global_dino_inlier_threshold_px <= 0
+            or args.debug_sheet_max_cameras < 1
             or not 0 < args.min_valid_pose_coverage <= 1 or args.max_trailing_missing_frames < 0
             or args.tail_recovery_frame_step < 1 or args.tail_recovery_max_seed_attempts < 1
             or args.tail_recovery_min_mask_views < 1 or args.tail_recovery_overlap_frames < 1

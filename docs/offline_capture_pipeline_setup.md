@@ -383,6 +383,19 @@ refinement를 받는다. primary candidate들만 translation medoid 계산에 �
 `--foundpose-global-asymmetry-max-side`, `--foundpose-global-asymmetry-score-margin`,
 `--foundpose-global-asymmetry-weight`다.
 
+silhouette와 작은 disagreement region으로도 회전 후보를 구분하지 못하는 case study에는
+실험 옵션 `--foundpose-global-dino-rerank`를 사용할 수 있다. FoundPose가 각 camera에서
+PnP를 만들 때 이미 계산한 DINO 2D-to-object-3D correspondence를 버리지 않고, refinement된
+world-pose 후보를 모든 crop camera에 다시 투영해 soft reprojection score를 계산한다. 새
+backbone pass나 FoundPose core matching 변경은 없으며 GoTrack 실행 횟수도 늘지 않는다.
+기존 mask/asymmetry 최상점에서 기본 0.02 이내인 후보만 mask-tied 후보로 간주하고 그 안에서만
+DINO score를 tie-break로 사용한다. 비교 가능한 candidate와 camera evidence가 부족하면 기존
+mask 순서를 유지한다. 이 기능은 아직 기본값이 아니며, 검증 schedule에서만 켜는 것이 안전하다.
+`candidate_bank.json`의 `dino_reprojection_score`, `dino_median_error_px`,
+`dino_valid_views`, `dino_per_view`에 판단 근거가 저장된다. margin과 crop-pixel threshold는
+각각 `--foundpose-global-dino-score-margin`,
+`--foundpose-global-dino-inlier-threshold-px`로 조절한다.
+
 GoTrack은 모든 AVI의 frame count/FPS로 계산한 duration을 비교해 median에서 기본 1초 이상
 벗어난 camera만 자동 제외한다. 몇 frame 누락은 허용하며, 과거 특정 serial을 하드코딩해
 제외하지 않는다. `run_manifest.json`의 `video_timings`, `rejected_cameras`에서 판단 근거를

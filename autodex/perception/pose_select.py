@@ -479,6 +479,113 @@ def score_pose_hypotheses_by_asymmetry(
     return sorted(reranked, key=lambda item: item["asymmetry_combined_score"], reverse=True)
 
 
+def score_pose_hypotheses_by_dino_reprojection(
+    hypotheses: Sequence[Mapping[str, Any]],
+    appearance_evidence: Mapping[str, Mapping[str, Any]],
+    inlier_threshold_px: float = 10.0,
+    trim_fraction: float = 0.15,
+    min_correspondences: int = 6,
+) -> list[dict[str, Any]]:
+    """Score poses with FoundPose's already-computed DINO correspondences.
+
+    Each FoundPose view contains up to five sets of DINO 2D-to-object-3D
+    matches, one for each retrieved template.  For a proposed world pose, this
+    function projects every set into its crop camera, keeps the best matching
+    template per view, then robustly aggregates the view scores.  It performs
+    no feature extraction and does not alter FoundPose's PnP machinery.
+
+    The returned score is continuous in [0, 1].  A correspondence contributes
+    ``exp(-0.5 * (error / threshold)^2)`` weighted by FoundPose's match
+    confidence.  Very small correspondence sets are reliability-weighted so a
+    six-point accidental fit cannot dominate a well-supported view.
+    """
+    if inlier_threshold_px <= 0:
+        raise ValueError("inlier_threshold_px must be positive")
+    if not 0.0 <= trim_fraction < 0.5:
+        raise ValueError("trim_fraction must be in [0, 0.5)")
+    if min_correspondences < 6:
+        raise ValueError("min_correspondences must be at least 6")
+
+    scored: list[dict[str, Any]] = []
+    for hypothesis in hypotheses:
+        pose_world = np.asarray(hypothesis["pose_world"], dtype=np.float64)
+        view_scores: list[float] = []
+        view_errors: list[float] = []
+        used_correspondences = 0
+        per_view: dict[str, dict[str, float | int]] = {}
+        for serial, evidence in appearance_evidence.items():
+            K = np.asarray(evidence.get("K"), dtype=np.float64)
+            world_to_camera = np.asarray(evidence.get("world_to_camera"), dtype=np.float64)
+            if K.shape != (3, 3) or world_to_camera.shape != (4, 4):
+                continue
+            pose_camera = world_to_camera @ pose_world
+            best: tuple[float, float, int, int] | None = None
+            for correspondence in evidence.get("correspondences", []):
+                coord_2d = np.asarray(correspondence.get("coord_2d"), dtype=np.float64)
+                coord_3d = np.asarray(correspondence.get("coord_3d_m"), dtype=np.float64)
+                confidence = np.asarray(
+                    correspondence.get("coord_conf", np.ones(len(coord_2d))), dtype=np.float64,
+                ).reshape(-1)
+                if (coord_2d.ndim != 2 or coord_2d.shape[1] != 2
+                        or coord_3d.ndim != 2 or coord_3d.shape[1] != 3):
+                    continue
+                count = min(len(coord_2d), len(coord_3d), len(confidence))
+                if count < min_correspondences:
+                    continue
+                points_h = np.concatenate(
+                    [coord_3d[:count], np.ones((count, 1), dtype=np.float64)], axis=1,
+                )
+                points_camera = (pose_camera @ points_h.T).T[:, :3]
+                valid = (
+                    np.isfinite(points_camera).all(axis=1)
+                    & np.isfinite(coord_2d[:count]).all(axis=1)
+                    & np.isfinite(confidence[:count])
+                    & (points_camera[:, 2] > 1e-6)
+                )
+                if int(valid.sum()) < min_correspondences:
+                    continue
+                camera = points_camera[valid]
+                projected_h = (K @ camera.T).T
+                projected = projected_h[:, :2] / projected_h[:, 2:3]
+                error = np.linalg.norm(projected - coord_2d[:count][valid], axis=1)
+                weights = np.clip(confidence[:count][valid], 0.0, None)
+                if float(weights.sum()) <= 0:
+                    weights = np.ones_like(error)
+                soft = np.exp(-0.5 * np.square(error / inlier_threshold_px))
+                reliability = min(1.0, float(len(error)) / 24.0)
+                score = float(np.average(soft, weights=weights)) * reliability
+                median_error = float(np.median(error))
+                template_id = int(correspondence.get("template_id", -1))
+                candidate = (score, median_error, int(len(error)), template_id)
+                if best is None or candidate[0] > best[0]:
+                    best = candidate
+            if best is None:
+                continue
+            view_scores.append(best[0])
+            view_errors.append(best[1])
+            used_correspondences += best[2]
+            per_view[str(serial)] = {
+                "score": best[0],
+                "median_error_px": best[1],
+                "correspondences": best[2],
+                "template_id": best[3],
+            }
+
+        values = np.sort(np.asarray(view_scores, dtype=np.float64))
+        trim = int(np.floor(len(values) * trim_fraction))
+        kept = values[trim:len(values) - trim] if trim > 0 else values
+        score = float(kept.mean()) if len(kept) else 0.0
+        scored.append({
+            **hypothesis,
+            "dino_reprojection_score": score,
+            "dino_median_error_px": float(np.median(view_errors)) if view_errors else float("inf"),
+            "dino_valid_views": len(view_scores),
+            "dino_correspondence_count": used_correspondences,
+            "dino_per_view": per_view,
+        })
+    return sorted(scored, key=lambda item: float(item["dino_reprojection_score"]), reverse=True)
+
+
 def _rotation_distance_deg(first: np.ndarray, second: np.ndarray) -> float:
     """Geodesic SO(3) distance, with clipping for numerical stability."""
     relative = np.asarray(first, dtype=np.float64)[:3, :3].T @ np.asarray(second, dtype=np.float64)[:3, :3]
