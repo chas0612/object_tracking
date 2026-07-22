@@ -31,6 +31,8 @@ if str(PARADEX_ROOT) not in sys.path:
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from src.process.gotrack_capture import _eligible_cameras
+
 URDF_PATH = (REPO_ROOT / "autodex" / "planner" / "src" / "curobo" / "content" /
              "assets" / "robot" / "inspire_description" / "xarm_inspire.urdf")
 
@@ -73,14 +75,6 @@ def _load_calibration(capture_dir: Path) -> tuple[dict[str, np.ndarray], dict[st
     return intrinsics, extrinsics
 
 
-def _video_count(path: Path) -> int:
-    cap = cv2.VideoCapture(str(path))
-    try:
-        return int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else 0
-    finally:
-        cap.release()
-
-
 def _interpolate(times_src: np.ndarray, data: np.ndarray, times_dst: np.ndarray) -> np.ndarray:
     values = np.asarray(data, dtype=np.float64)
     return np.column_stack([np.interp(times_dst, times_src, values[:, i]) for i in range(values.shape[1])])
@@ -109,8 +103,9 @@ def _load_robot_qpos(capture_dir: Path, frame_count: int, arm_time_offset: float
     return _interpolate(arm_time, full_qpos, frame_times[:frame_count])
 
 
-def _load_object_poses(path: Path) -> dict[int, np.ndarray]:
+def _load_object_poses(path: Path) -> tuple[dict[int, np.ndarray], int]:
     """Load GoTrack JSON records or legacy all_poses_world.npz trajectories."""
+    last_recorded_frame = -1
     if path.suffix.lower() == ".npz":
         archive = np.load(path, allow_pickle=False)
         poses = {}
@@ -124,13 +119,15 @@ def _load_object_poses(path: Path) -> dict[int, np.ndarray]:
             pose = np.asarray(archive[key], dtype=np.float64)
             if pose.shape == (4, 4) and np.isfinite(pose).all():
                 poses[frame_index] = pose
+                last_recorded_frame = max(last_recorded_frame, frame_index)
     else:
         records = json.loads(path.read_text(encoding="utf-8"))
+        last_recorded_frame = max((int(item["frame_index"]) for item in records), default=-1)
         poses = {int(item["frame_index"]): np.asarray(item["pose_world"], dtype=np.float64)
                  for item in records if item.get("pose_world") is not None}
     if not poses:
         raise ValueError(f"No valid pose_world records in {path}")
-    return poses
+    return poses, last_recorded_frame
 
 
 def _load_mesh(path: Path) -> trimesh.Trimesh:
@@ -161,7 +158,13 @@ def parse_args() -> argparse.Namespace:
                         help="Render object overlays only; do not load/render the robot.")
     parser.add_argument("--output", required=True, help="New output .mp4; never overwritten.")
     parser.add_argument("--camera-ids", nargs="*", default=None, help="Default: every full-length capture camera.")
-    parser.add_argument("--exclude-cameras", nargs="*", default=["23029839"])
+    parser.add_argument("--exclude-cameras", nargs="*", default=[],
+                        help="Optional camera IDs to exclude explicitly. Default: none.")
+    parser.add_argument("--min-video-frames", type=int, default=100,
+                        help="Reject videos shorter than this before rendering.")
+    parser.add_argument("--max-video-duration-skew-sec", type=float, default=1.0,
+                        help=("Reject videos whose frame_count/FPS duration differs from the valid-camera "
+                              "median by more than this. 0 disables it."))
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--end-frame", type=int, default=-1, help="Inclusive; -1 means all available frames.")
     parser.add_argument("--grid-scale", type=float, default=0.20, help="Per-view scale in the output grid.")
@@ -189,21 +192,25 @@ def main() -> int:
         raise FileNotFoundError(f"Inspire arm/hand URDF not found: {URDF_PATH}")
     if not 0 < args.grid_scale <= 1:
         raise ValueError("--grid-scale must be in (0, 1]")
+    if args.min_video_frames < 1 or args.max_video_duration_skew_sec < 0:
+        raise ValueError("--min-video-frames must be positive and --max-video-duration-skew-sec non-negative")
 
     intrinsics, extrinsics = _load_calibration(capture_dir)
     excluded = set(args.exclude_cameras)
-    available = {p.stem: _video_count(p) for p in video_dir.glob("*.avi")}
-    max_common = min(count for serial, count in available.items() if serial not in excluded)
-    candidates = sorted(serial for serial, count in available.items()
-                        if serial in intrinsics and serial not in excluded and count >= max_common)
+    eligible, video_timings, rejected_cameras, median_duration = _eligible_cameras(
+        video_dir, args.min_video_frames, excluded, args.max_video_duration_skew_sec,
+    )
+    candidates = sorted(serial for serial in eligible if serial in intrinsics)
     serials = list(args.camera_ids) if args.camera_ids else candidates
     invalid = [serial for serial in serials if serial not in candidates]
     if invalid:
         raise ValueError(f"Requested camera IDs unavailable, excluded, or short: {invalid}")
     if not serials:
         raise RuntimeError("No usable cameras")
-    object_poses = [_load_object_poses(path) for path in records_paths]
-    total_frames = min(max_common, *(max(poses) + 1 for poses in object_poses))
+    loaded_trajectories = [_load_object_poses(path) for path in records_paths]
+    object_poses = [poses for poses, _ in loaded_trajectories]
+    common_video_frames = min(int(video_timings[serial]["frames"]) for serial in serials)
+    total_frames = min(common_video_frames, *(last_frame + 1 for _, last_frame in loaded_trajectories))
     start = max(0, args.start_frame)
     end = total_frames - 1 if args.end_frame < 0 else min(args.end_frame, total_frames - 1)
     if end < start:
@@ -212,7 +219,12 @@ def main() -> int:
     manifest = {"serials": serials, "frames": [start, end], "grid": [columns, rows],
                 "video_dir": str(video_dir), "object_only": args.object_only,
                 "objects": [str(path) for path in records_paths],
-                "arm_time_offset": args.arm_time_offset, "grid_scale": args.grid_scale}
+                "arm_time_offset": args.arm_time_offset, "grid_scale": args.grid_scale,
+                "manual_excluded_cameras": sorted(excluded),
+                "rejected_cameras": rejected_cameras,
+                "median_video_duration_sec": median_duration,
+                "min_video_frames": args.min_video_frames,
+                "max_video_duration_skew_sec": args.max_video_duration_skew_sec}
     if args.dry_run:
         print(json.dumps(manifest, indent=2))
         return 0
