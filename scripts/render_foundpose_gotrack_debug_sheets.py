@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--schedule-id", required=True)
     parser.add_argument("--shared-root-rel", default="shared_data")
+    parser.add_argument("--runs-root-rel", default="object_tracking/foundpose_gotrack_runs")
     parser.add_argument("--output-root-rel", default="object_tracking/gotrack_debug_sheets",
                         help="Directory under ~/shared_data; sheets are stored in a schedule subdirectory.")
     parser.add_argument("--max-cameras", type=int, default=6)
@@ -48,11 +49,11 @@ def main() -> int:
     if args.max_cameras < 1 or args.limit < 0:
         raise ValueError("--max-cameras must be positive and --limit non-negative")
     if any(Path(value).is_absolute() or ".." in Path(value).parts
-           for value in (args.shared_root_rel, args.output_root_rel)):
+           for value in (args.shared_root_rel, args.runs_root_rel, args.output_root_rel)):
         raise ValueError("root paths must be safe relative paths")
 
     shared = Path.home() / args.shared_root_rel
-    schedule = shared / "object_tracking/foundpose_gotrack_runs" / args.schedule_id
+    schedule = shared / args.runs_root_rel / args.schedule_id
     tasks_dir = schedule / "tasks"
     if not tasks_dir.is_dir():
         raise FileNotFoundError(f"Task directory not found: {tasks_dir}")

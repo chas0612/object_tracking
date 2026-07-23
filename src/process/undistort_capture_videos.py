@@ -5,7 +5,8 @@ The output is ``<capture-dir>/undistorted_video/``.  Source ``videos/`` and
 all pre-existing pipeline output are read-only.  Crucially, the remap uses the
 provided ``intrinsics_undistort`` matrix directly, rather than recomputing a
 new camera matrix with OpenCV.  The resulting pixels therefore match the K
-matrix used by FoundPose and GoTrack.
+matrix used by FoundPose and GoTrack. Source videos may be AVI or MP4; output
+is always AVI because the downstream GoTrack wrapper consumes ``*.avi``.
 """
 from __future__ import annotations
 
@@ -49,13 +50,30 @@ def main() -> int:
     manifest_path = output_dir / "undistort_manifest.json"
     calibration = json.loads(intrinsics_path.read_text(encoding="utf-8"))
 
-    videos = sorted(source_dir.glob("*.avi"))
+    videos_by_camera: dict[str, Path] = {}
+    for suffix in ("*.avi", "*.mp4"):
+        for source in sorted(source_dir.glob(suffix)):
+            if source.stem in videos_by_camera:
+                raise ValueError(
+                    f"Multiple source videos share camera ID {source.stem}: "
+                    f"{videos_by_camera[source.stem]} and {source}"
+                )
+            videos_by_camera[source.stem] = source
+    # Only fixed cameras with explicit calibration are valid FoundPose/GoTrack
+    # inputs. Human captures can also contain ego videos whose calibration is
+    # stored separately or absent.
+    videos = [
+        source for camera_id, source in sorted(videos_by_camera.items())
+        if camera_id in calibration
+    ]
     if not videos:
-        raise FileNotFoundError(f"No .avi videos found under {source_dir}")
+        raise FileNotFoundError(
+            f"No calibrated .avi/.mp4 videos found under {source_dir}"
+        )
     print(f"[undistort] {len(videos)} source videos -> {output_dir}", flush=True)
     for source in videos:
         camera_id = source.stem
-        output = output_dir / source.name
+        output = output_dir / f"{camera_id}.avi"
         if _complete_video(output) and not args.overwrite:
             print(f"[skip] {output.name}", flush=True)
             continue
@@ -103,7 +121,14 @@ def main() -> int:
         "source_dir": str(source_dir),
         "calibration": str(intrinsics_path),
         "new_intrinsics_field": "intrinsics_undistort",
-        "files": [path.name for path in videos],
+        "files": [
+            {"source": path.name, "output": f"{path.stem}.avi"}
+            for path in videos
+        ],
+        "excluded_uncalibrated_sources": sorted(
+            path.name for camera_id, path in videos_by_camera.items()
+            if camera_id not in calibration
+        ),
     }, indent=2) + "\n", encoding="utf-8")
     print(f"[done] {manifest_path}", flush=True)
     return 0

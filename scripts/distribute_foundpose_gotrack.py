@@ -73,10 +73,27 @@ def _safe_id(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_")
 
 
-def _schedule_dir(shared_root: Path, schedule_id: str) -> Path:
+def _schedule_dir(shared_root: Path, runs_root_rel: str, schedule_id: str) -> Path:
     if not SAFE_NAME.fullmatch(schedule_id):
         raise ValueError("--schedule-id may contain only letters, digits, '_', '-', and '.'")
-    return shared_root / "object_tracking" / "foundpose_gotrack_runs" / schedule_id
+    return shared_root / runs_root_rel / schedule_id
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _assert_episode_write_isolated(
+    shared_root: Path, episode_dir: Path, protected_root_rels: list[str]
+) -> None:
+    resolved_episode = episode_dir.resolve()
+    for relative in protected_root_rels:
+        protected = (shared_root / relative).resolve()
+        if _is_within(resolved_episode, protected):
+            raise ValueError(
+                f"Refusing pipeline output under protected source dataset: "
+                f"{resolved_episode} (protected root: {protected})"
+            )
 
 
 def _mesh_for(mesh_root: Path, object_name: str) -> Path | None:
@@ -188,6 +205,9 @@ def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[st
                     and episode_dir.name not in generated_dirs):
                 episode_dirs.append(episode_dir)
     for episode_dir in episode_dirs:
+        _assert_episode_write_isolated(
+            shared_root, episode_dir, args.protected_root_rel
+        )
         try:
             rel = episode_dir.relative_to(target_root)
         except ValueError:
@@ -210,7 +230,7 @@ def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[st
             continue
         repre = _cache_repre(cache_root, object_name)
         if not repre.is_file():
-            skipped.append(f"{rel}: inspire cache missing ({repre})")
+            skipped.append(f"{rel}: FoundPose cache missing ({repre})")
             continue
         task_id = _safe_id(rel.as_posix())
         tasks.append({
@@ -538,6 +558,7 @@ def _attempt_tail_recovery(
 def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     shared = Path.home() / args.shared_root_rel
     episode = shared / task["episode_rel"]
+    _assert_episode_write_isolated(shared, episode, args.protected_root_rel)
     mesh = shared / task["mesh_rel"]
     assets = shared / task["assets_rel"]
     attempt = int(task["attempts"])
@@ -665,6 +686,8 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
     if schedule.exists(): raise FileExistsError(f"Schedule exists: {schedule}")
     for dirname in ("tasks", "claims", "logs", "workers"): (schedule / dirname).mkdir(parents=True, exist_ok=True)
     _atomic_json(schedule / "manifest.json", {"schedule_id": schedule.name, "created_utc": _now(), "target_root_rel": args.target_root_rel,
+                                                "runs_root_rel": args.runs_root_rel,
+                                                "protected_root_rels": args.protected_root_rel,
                                                 "cache_root_rel": args.cache_root_rel, "mesh_root_rel": args.mesh_root_rel,
                                                 "object_episode_map": {name: sorted(episodes) for name, episodes in args.object_episode_map.items()},
                                                 "num_cameras": args.num_cameras, "max_frames": args.max_frames,
@@ -724,6 +747,14 @@ def _worker(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
 
 def _launch(args: argparse.Namespace, schedule: Path) -> int:
     manifest = _read_json(schedule / "manifest.json")
+    recorded_runs_root = str(
+        manifest.get("runs_root_rel", "object_tracking/foundpose_gotrack_runs")
+    )
+    if recorded_runs_root != args.runs_root_rel:
+        raise ValueError(
+            f"--runs-root-rel={args.runs_root_rel!r} does not match schedule "
+            f"manifest value {recorded_runs_root!r}"
+        )
     # The queue's processing knobs belong to the immutable init manifest, not
     # to whichever controller later launches/relaunches the workers.
     args.num_cameras = int(manifest["num_cameras"])
@@ -761,12 +792,19 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
     args.tail_recovery_max_rotation_error_deg = float(manifest.get("tail_recovery_max_rotation_error_deg", args.tail_recovery_max_rotation_error_deg))
     args.tail_recovery_max_rotation_alignment_dispersion_deg = float(manifest.get("tail_recovery_max_rotation_alignment_dispersion_deg", args.tail_recovery_max_rotation_alignment_dispersion_deg))
     args.max_attempts = int(manifest.get("max_attempts", args.max_attempts))
+    args.protected_root_rel = [
+        str(value) for value in manifest.get(
+            "protected_root_rels", args.protected_root_rel
+        )
+    ]
     for spec in args.workers:
         worker_id = _safe_id(spec)
         command = ["$HOME/anaconda3/bin/conda", "run", "--no-capture-output", "-n", args.gotrack_env, "python", "-u",
                    "scripts/distribute_foundpose_gotrack.py", "--mode", "worker", "--schedule-id", schedule.name,
                    "--worker-id", worker_id, "--gotrack-env", args.gotrack_env, "--sam3-env", args.sam3_env,
-                   "--shared-root-rel", args.shared_root_rel, "--num-cameras", str(args.num_cameras),
+                   "--shared-root-rel", args.shared_root_rel,
+                   "--runs-root-rel", args.runs_root_rel,
+                   "--num-cameras", str(args.num_cameras),
                    "--camera-micro-batch-size", str(args.camera_micro_batch_size),
                    "--max-video-duration-skew-sec", str(args.max_video_duration_skew_sec),
                    "--init-frame-index", str(args.init_frame_index),
@@ -797,6 +835,8 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
                    "--tail-recovery-max-rotation-error-deg", str(args.tail_recovery_max_rotation_error_deg),
                    "--tail-recovery-max-rotation-alignment-dispersion-deg", str(args.tail_recovery_max_rotation_alignment_dispersion_deg),
                    "--max-frames", str(args.max_frames), "--max-attempts", str(args.max_attempts)]
+        for protected_root_rel in args.protected_root_rel:
+            command.extend(["--protected-root-rel", protected_root_rel])
         command.append("--debug-sheets" if args.debug_sheets else "--no-debug-sheets")
         command.append("--tail-recovery" if args.tail_recovery else "--no-tail-recovery")
         command.append("--foundpose-global-dino-rerank" if args.foundpose_global_dino_rerank else
@@ -809,7 +849,11 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
             print("+ " + " ".join(shlex.quote(x) for x in local))
             if not args.dry_run: subprocess.Popen(local, cwd=REPO_ROOT, start_new_session=True)
             continue
-        remote_log = f'$HOME/{args.shared_root_rel.strip("/")}/object_tracking/foundpose_gotrack_runs/{schedule.name}/logs/worker.{worker_id}.log'
+        remote_log = (
+            f'$HOME/{args.shared_root_rel.strip("/")}/'
+            f'{args.runs_root_rel.strip("/")}/{schedule.name}/logs/'
+            f'worker.{worker_id}.log'
+        )
         remote = f"set -euo pipefail; cd $HOME/{args.remote_repo_rel.strip('/')}; nohup {rendered} > {remote_log} 2>&1 &"
         ssh = ["ssh", "-p", "77", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={args.connect_timeout}", spec, remote]
         print("+ " + " ".join(shlex.quote(x) for x in ssh))
@@ -851,7 +895,19 @@ def main() -> int:
     p.add_argument("--mode", choices=("init", "worker", "launch", "status", "reset-running"), required=True)
     p.add_argument("--schedule-id", required=True)
     p.add_argument("--shared-root-rel", default="shared_data")
+    p.add_argument(
+        "--runs-root-rel",
+        default="object_tracking/foundpose_gotrack_runs",
+        help="Scheduler state root under ~/shared_data.",
+    )
     p.add_argument("--target-root-rel", default=None, help="With --mode init: robot root under ~/shared_data; its immediate children are objects.")
+    p.add_argument(
+        "--protected-root-rel",
+        action="append",
+        default=None,
+        help="Refuse episode-local outputs under this root. Repeatable. "
+             "Default: capture/eccv2026/v0",
+    )
     p.add_argument("--robot-label", default=None, help="Label recorded in tasks; default: --target-root-rel.")
     p.add_argument("--cache-root-rel", default="mesh_new",
                    help="Canonical FoundPose cache root under ~/shared_data. Default: mesh_new")
@@ -933,6 +989,9 @@ def main() -> int:
     p.add_argument("--confirm-workers-stopped", action="store_true",
                    help="Required with --mode reset-running; confirms no worker can still own a task.")
     args = p.parse_args()
+    args.protected_root_rel = (
+        args.protected_root_rel or ["capture/eccv2026/v0"]
+    )
     if (args.connect_timeout < 1 or args.num_cameras < 1 or args.camera_micro_batch_size < 0
             or args.max_video_duration_skew_sec < 0 or args.max_frames == 0 or args.max_attempts < 1
             or args.init_frame_index < 0 or args.foundpose_candidate_rank < 0
@@ -954,9 +1013,16 @@ def main() -> int:
             or args.tail_recovery_max_rotation_error_deg < 0
             or args.tail_recovery_max_rotation_alignment_dispersion_deg < 0):
         raise ValueError("invalid worker/tracking option")
-    roots = (args.cache_root_rel, args.mesh_root_rel, args.debug_sheet_output_root_rel) + ((args.target_root_rel,) if args.target_root_rel else ())
+    roots = (
+        args.cache_root_rel,
+        args.mesh_root_rel,
+        args.debug_sheet_output_root_rel,
+        args.runs_root_rel,
+        *args.protected_root_rel,
+    ) + ((args.target_root_rel,) if args.target_root_rel else ())
     if any(Path(x).is_absolute() or ".." in Path(x).parts for x in roots): raise ValueError("root paths must be safe relative paths")
-    shared = Path.home() / args.shared_root_rel; schedule = _schedule_dir(shared, args.schedule_id)
+    shared = Path.home() / args.shared_root_rel
+    schedule = _schedule_dir(shared, args.runs_root_rel, args.schedule_id)
     args.object_prompts = _load_prompt_map(args.object_prompts_json)
     args.object_prompts_original = _load_prompt_map(args.object_prompts_original_json)
     args.object_episode_map = _load_object_episode_map(args.object_episodes_json)

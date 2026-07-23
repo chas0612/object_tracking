@@ -14,12 +14,25 @@ from pathlib import Path
 import numpy as np
 
 
+def _expected_frames(episode: Path) -> tuple[int | None, str]:
+    timestamps = episode / "raw" / "timestamps" / "timestamp.npy"
+    if timestamps.is_file():
+        return len(np.load(timestamps, mmap_mode="r")), "timestamps"
+    object_pose_dir = episode / "object_6d"
+    if object_pose_dir.is_dir():
+        files = sorted(object_pose_dir.glob("pose_*.txt"))
+        if files:
+            return len(files), "object_6d"
+    return None, "unavailable"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--schedule-id", required=False)
     parser.add_argument("--all-schedules", action="store_true",
                         help="Inspect every scheduler run under shared_data/object_tracking.")
     parser.add_argument("--shared-root-rel", default="shared_data")
+    parser.add_argument("--runs-root-rel", default="object_tracking/foundpose_gotrack_runs")
     parser.add_argument("--min-valid-pose-coverage", type=float, default=0.5)
     parser.add_argument("--max-trailing-missing-frames", type=int, default=30)
     parser.add_argument("--all-statuses", action="store_true",
@@ -34,7 +47,9 @@ def main() -> int:
     if not args.all_schedules and not args.schedule_id:
         raise ValueError("Pass --schedule-id or --all-schedules")
     shared = Path.home() / args.shared_root_rel
-    runs_root = shared / "object_tracking/foundpose_gotrack_runs"
+    if Path(args.runs_root_rel).is_absolute() or ".." in Path(args.runs_root_rel).parts:
+        raise ValueError("--runs-root-rel must be a safe relative path")
+    runs_root = shared / args.runs_root_rel
     tasks_dirs = (sorted(path / "tasks" for path in runs_root.iterdir() if (path / "tasks").is_dir())
                   if args.all_schedules else [runs_root / str(args.schedule_id) / "tasks"])
     if not tasks_dirs:
@@ -57,13 +72,12 @@ def main() -> int:
                 continue
             records_path = (shared / attempt_rel / "gotrack_tracking" / "gotrack_output" /
                             str(task["object_name"]) / "world_pose_records.json")
-            timestamps_path = episode / "raw" / "timestamps" / "timestamp.npy"
-            if not (records_path.is_file() and timestamps_path.is_file()):
+            expected_frames, frame_source = _expected_frames(episode)
+            if not records_path.is_file() or expected_frames is None:
                 missing += 1
                 continue
 
             records = json.loads(records_path.read_text(encoding="utf-8"))
-            timestamp_frames = len(np.load(timestamps_path, mmap_mode="r"))
             valid = sum(isinstance(row, dict) and row.get("pose_world") is not None for row in records)
             trailing_missing = 0
             for row in reversed(records):
@@ -71,7 +85,7 @@ def main() -> int:
                     break
                 trailing_missing += 1
             coverage = valid / len(records) if records else 0.0
-            is_mismatch = len(records) != timestamp_frames
+            is_mismatch = len(records) != expected_frames
             is_incomplete = (coverage < args.min_valid_pose_coverage or
                              trailing_missing > args.max_trailing_missing_frames)
             checked += 1
@@ -85,7 +99,7 @@ def main() -> int:
                     flags.append("frame_mismatch")
                 print(
                     f"[{','.join(flags)}] {schedule_id}/{task['task_id']} "
-                    f"timestamps={timestamp_frames} records={len(records)} "
+                    f"expected={expected_frames} source={frame_source} records={len(records)} "
                     f"valid={valid}/{len(records)} ({coverage:.1%}) trailing_missing={trailing_missing}",
                     flush=True,
                 )

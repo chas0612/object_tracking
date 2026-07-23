@@ -138,7 +138,7 @@ def _has_direct_mesh(mesh_root: Path, object_name: str) -> bool:
 def _scenario_object_paths(
     *, shared_root: Path, mesh_root: Path, scenario_root_rel: str
 ) -> tuple[list[str], dict[str, str], dict[str, str]]:
-    """Use episode-0 calibration and the canonical mesh-local cache."""
+    """Use the earliest calibrated episode and the canonical mesh-local cache."""
     scenario_root = shared_root / scenario_root_rel
     if not scenario_root.is_dir():
         raise FileNotFoundError(f"Scenario root is missing: {scenario_root}")
@@ -149,9 +149,20 @@ def _scenario_object_paths(
         if not object_dir.is_dir() or object_dir.name.startswith("."):
             continue
         object_name = object_dir.name
-        reference = object_dir / "0" / "cam_param" / "intrinsics.json"
-        if not reference.is_file() or not _has_direct_mesh(mesh_root, object_name):
+        episode_dirs = sorted(
+            (
+                path for path in object_dir.iterdir()
+                if path.is_dir() and path.name.isdigit()
+            ),
+            key=lambda path: int(path.name),
+        )
+        reference_candidates = [
+            path / "cam_param" / "intrinsics.json" for path in episode_dirs
+            if (path / "cam_param" / "intrinsics.json").is_file()
+        ]
+        if not reference_candidates or not _has_direct_mesh(mesh_root, object_name):
             continue
+        reference = reference_candidates[0]
         objects.append(object_name)
         references[object_name] = str(reference.relative_to(shared_root))
         outputs[object_name] = str(
@@ -219,8 +230,9 @@ def main() -> int:
     parser.add_argument("--all-mesh-objects", action="store_true",
                         help="Onboard every immediate --mesh-root-rel subdirectory with an .obj/.ply/.glb mesh.")
     parser.add_argument("--scenario-root-rel", default=None,
-                        help="Restrict to a campaign root under shared_data. Each <object>/0 calibration is "
-                             "used and assets are saved as <object>/foundpose_assets.")
+                        help="Restrict to a campaign root under shared_data. Each object's earliest "
+                             "calibrated numeric episode is used and assets are saved as "
+                             "<mesh-root>/<object>/foundpose_assets.")
     parser.add_argument("--workers", nargs="+", required=True,
                         help="local and/or user@ip. One object runs per worker.")
     parser.add_argument("--fallback-reference-intrinsics-rel",
@@ -232,6 +244,12 @@ def main() -> int:
     parser.set_defaults(auto_reference_intrinsics=True)
     parser.add_argument("--shared-root-rel", default="shared_data",
                         help="Shared storage relative to each worker HOME. Default: shared_data")
+    parser.add_argument(
+        "--state-root-rel",
+        default="mesh_blender/.foundpose_onboard_runs",
+        help="Scheduler state/log root under ~/shared_data. Human campaigns should use "
+             "object_tracking/campaigns/human/onboarding_runs.",
+    )
     parser.add_argument("--mesh-root-rel", default="mesh_new",
                         help="Mesh evidence root under ~/shared_data. Default: mesh_new")
     parser.add_argument("--remote-repo-rel", default="object_tracking",
@@ -256,6 +274,8 @@ def main() -> int:
     shared_root = Path.home() / args.shared_root_rel
     if args.mesh_root_rel.startswith("/") or ".." in Path(args.mesh_root_rel).parts:
         raise ValueError("--mesh-root-rel must be a safe path relative to shared_data")
+    if args.state_root_rel.startswith("/") or ".." in Path(args.state_root_rel).parts:
+        raise ValueError("--state-root-rel must be a safe path relative to shared_data")
     mesh_root = shared_root / args.mesh_root_rel
     if not mesh_root.is_dir():
         raise FileNotFoundError(f"Mesh root is missing: {mesh_root}")
@@ -269,7 +289,9 @@ def main() -> int:
             requested = list(dict.fromkeys(args.objects))
             unknown = sorted(set(requested) - set(objects))
             if unknown:
-                raise ValueError(f"Requested scenario objects have no episode-0 calibration or mesh: {unknown}")
+                raise ValueError(
+                    f"Requested scenario objects have no calibrated numeric episode or mesh: {unknown}"
+                )
             objects = [obj for obj in objects if obj in set(requested)]
             reference_by_object = {obj: reference_by_object[obj] for obj in objects}
             output_by_object = {obj: output_by_object[obj] for obj in objects}
@@ -288,10 +310,7 @@ def main() -> int:
     if len({worker.name for worker in workers}) != len(workers):
         raise ValueError("Worker names must be unique")
     run_name = args.run_name or datetime.now().strftime("foundpose_%Y%m%d_%H%M%S")
-    # Keep durable scheduler state in its historical shared location.  The
-    # selected mesh evidence root may be mesh_new, but it should not split run
-    # logs away from the existing mesh_blender onboarding history.
-    state_dir = shared_root / "mesh_blender" / ".foundpose_onboard_runs" / run_name
+    state_dir = shared_root / args.state_root_rel / run_name
     state_path = state_dir / "state.json"
     logs_dir = state_dir / "logs"
     if state_path.exists():
@@ -301,8 +320,9 @@ def main() -> int:
         if unknown:
             raise ValueError(f"Objects absent from existing run {run_name}: {unknown}")
     else:
-        state_dir.mkdir(parents=True, exist_ok=False)
-        logs_dir.mkdir()
+        if not args.dry_run:
+            state_dir.mkdir(parents=True, exist_ok=False)
+            logs_dir.mkdir()
         jobs = {
             obj: {"status": "pending", "attempts": 0, "history": [],
                   "reference_intrinsics_rel": reference_by_object[obj],
@@ -323,7 +343,8 @@ def main() -> int:
         elif jobs[obj]["status"] == "failed" and args.retry_failed:
             jobs[obj]["status"] = "pending"
     state["updated_utc"] = _utc_now()
-    _atomic_json(state_path, state)
+    if not args.dry_run:
+        _atomic_json(state_path, state)
 
     print(f"[scheduler] state={state_dir}")
     print(f"[scheduler] workers={' '.join(worker.name for worker in workers)}")
