@@ -8,6 +8,13 @@ frame count comes from either an existing ``object_6d_pose.npz`` or a human
 capture's contiguous ``object_6d/pose_*.txt`` sequence. Neither contract source
 is modified.
 
+When the tracked videos do not start at contract frame 0, ``--frame-index-offset``
+shifts every record onto the contract timeline (contract index = record
+``frame_index`` + offset). The ``allegro_v5`` captures need ``3``: their
+``vid/*.mp4`` re-encode dropped the first three frames of the original AVI, so
+record 0 is contract frame 3. Pair it with ``--max-boundary-fill`` so the
+uncovered leading frames are filled from the first tracked pose.
+
 The default is a read-only audit. Pass ``--write`` to atomically create the
 new file in each eligible episode.
 """
@@ -168,7 +175,7 @@ def _frame_contract(
 
 
 def _load_records(
-    path: Path, expected_frames: int, max_boundary_fill: int
+    path: Path, expected_frames: int, max_boundary_fill: int, frame_index_offset: int = 0
 ) -> tuple[dict[str, np.ndarray], list[int]]:
     records = _read_json(path)
     if not isinstance(records, list):
@@ -179,19 +186,26 @@ def _load_records(
         if not isinstance(record, dict):
             raise ValueError(f"record {record_position}: record is not an object")
         frame_index = record.get("frame_index")
-        if not isinstance(frame_index, int) or not 0 <= frame_index < expected_frames:
+        if not isinstance(frame_index, int) or frame_index < 0:
             raise ValueError(f"record {record_position}: invalid frame_index={frame_index!r}")
-        if frame_index in seen_indices:
-            raise ValueError(f"frame {frame_index}: duplicate record")
-        seen_indices.add(frame_index)
+        contract_index = frame_index + frame_index_offset
+        if not 0 <= contract_index < expected_frames:
+            raise ValueError(
+                f"record {record_position}: frame_index={frame_index} with "
+                f"--frame-index-offset={frame_index_offset} maps to contract index "
+                f"{contract_index}, outside [0, {expected_frames})"
+            )
+        if contract_index in seen_indices:
+            raise ValueError(f"frame {contract_index}: duplicate record")
+        seen_indices.add(contract_index)
         if record.get("pose_world") is None:
             continue
         pose = np.asarray(record["pose_world"], dtype=np.float32)
         if pose.shape != (4, 4) or not np.isfinite(pose).all():
-            raise ValueError(f"frame {frame_index}: pose is not a finite 4x4 matrix")
+            raise ValueError(f"frame {contract_index}: pose is not a finite 4x4 matrix")
         if not np.allclose(pose[3], np.array([0, 0, 0, 1], dtype=np.float32), atol=1e-5):
-            raise ValueError(f"frame {frame_index}: invalid homogeneous last row")
-        indexed[frame_index] = pose
+            raise ValueError(f"frame {contract_index}: invalid homogeneous last row")
+        indexed[contract_index] = pose
     if not indexed:
         raise ValueError("no valid poses")
 
@@ -272,6 +286,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Fill up to this many missing leading/trailing poses from the nearest valid pose.",
+    )
+    parser.add_argument(
+        "--frame-index-offset",
+        type=int,
+        default=0,
+        help="Shift record frame_index onto the contract timeline "
+             "(contract index = frame_index + offset). Use 3 for allegro_v5, whose "
+             "vid/*.mp4 dropped the first three frames of the original capture.",
     )
     parser.add_argument("--write", action="store_true", help="Create outputs; default is dry-run.")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing output atomically.")
@@ -367,7 +389,10 @@ def main() -> int:
                     args.text_pose_dir,
                 )
                 poses, filled_frames = _load_records(
-                    record_path, expected_frames, args.max_boundary_fill
+                    record_path,
+                    expected_frames,
+                    args.max_boundary_fill,
+                    args.frame_index_offset,
                 )
                 if output.exists() and not args.overwrite:
                     row.update(status="exists", reason="output already exists")
@@ -412,6 +437,7 @@ def main() -> int:
         "frame_contract": args.frame_contract,
         "output_name": args.output_name,
         "max_boundary_fill": args.max_boundary_fill,
+        "frame_index_offset": args.frame_index_offset,
         "counts": counts,
         "episodes": results,
     }
