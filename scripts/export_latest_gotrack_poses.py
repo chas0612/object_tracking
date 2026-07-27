@@ -4,16 +4,16 @@
 The source of truth is a scheduler task directory and/or ``latest_trials.json``.
 Each selected ``world_pose_records.json`` is converted to the dataset
 convention: one float32 4x4 world pose per ``frame_<index>`` key. The expected
-frame count comes from either an existing ``object_6d_pose.npz`` or a human
-capture's contiguous ``object_6d/pose_*.txt`` sequence. Neither contract source
-is modified.
+frame count comes from an existing ``object_6d_pose.npz``, a human capture's
+contiguous ``object_6d/pose_*.txt`` sequence, or the published videos themselves.
+No contract source is modified.
 
-When the tracked videos do not start at contract frame 0, ``--frame-index-offset``
-shifts every record onto the contract timeline (contract index = record
-``frame_index`` + offset). The ``allegro_v5`` captures need ``3``: their
-``vid/*.mp4`` re-encode dropped the first three frames of the original AVI, so
-record 0 is contract frame 3. Pair it with ``--max-boundary-fill`` so the
-uncovered leading frames are filled from the first tracked pose.
+Use ``--frame-contract video`` when the poses must line up with the published
+videos rather than with an older pose file. The ``allegro_v5`` captures need it:
+their ``vid/*.mp4`` re-encode dropped the first three frames of the original AVI,
+but the existing ``object_6d_pose.npz`` was tracked before that trim and still
+carries the untrimmed length, so it is three frames out of step with the videos
+the new run tracks.
 
 The default is a read-only audit. Pass ``--write`` to atomically create the
 new file in each eligible episode.
@@ -25,6 +25,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -159,11 +160,49 @@ def _text_pose_frame_count(path: Path) -> int:
     return len(indices)
 
 
+def _video_frame_count(path: Path) -> int:
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=nb_frames", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, timeout=120,
+    )
+    value = result.stdout.strip()
+    if result.returncode != 0 or not value or value == "N/A":
+        raise ValueError(f"ffprobe could not count frames in {path}: {value!r}")
+    return int(value)
+
+
+def _video_frame_contract(video_dir: Path, probe_cameras: int) -> int:
+    """Frame count shared by the published videos the tracker actually reads."""
+    if not video_dir.is_dir():
+        raise FileNotFoundError(video_dir)
+    videos = sorted(video_dir.glob("*.mp4")) + sorted(video_dir.glob("*.avi"))
+    if not videos:
+        raise ValueError(f"No videos under {video_dir}")
+    probed = videos if probe_cameras <= 0 else videos[:probe_cameras]
+    counts = {path.name: _video_frame_count(path) for path in probed}
+    distinct = set(counts.values())
+    if len(distinct) != 1:
+        raise ValueError(f"Videos disagree on frame count: {counts}")
+    return distinct.pop()
+
+
 def _frame_contract(
-    episode_dir: Path, mode: str, original_name: str, text_pose_dir: str
+    episode_dir: Path,
+    mode: str,
+    original_name: str,
+    text_pose_dir: str,
+    video_dir: str,
+    video_probe_cameras: int,
 ) -> tuple[int, str, Path]:
     npz_path = episode_dir / original_name
     text_path = episode_dir / text_pose_dir
+    video_path = episode_dir / video_dir
+    # ``video`` is never part of ``auto``: an episode can hold both an older pose
+    # file and the videos it disagrees with, so choosing between them must be
+    # explicit.
+    if mode == "video":
+        return _video_frame_contract(video_path, video_probe_cameras), "video", video_path
     if mode in {"auto", "npz"} and npz_path.is_file():
         return _existing_frame_count(npz_path), "npz", npz_path
     if mode in {"auto", "text"} and text_path.is_dir():
@@ -175,7 +214,7 @@ def _frame_contract(
 
 
 def _load_records(
-    path: Path, expected_frames: int, max_boundary_fill: int, frame_index_offset: int = 0
+    path: Path, expected_frames: int, max_boundary_fill: int
 ) -> tuple[dict[str, np.ndarray], list[int]]:
     records = _read_json(path)
     if not isinstance(records, list):
@@ -186,26 +225,19 @@ def _load_records(
         if not isinstance(record, dict):
             raise ValueError(f"record {record_position}: record is not an object")
         frame_index = record.get("frame_index")
-        if not isinstance(frame_index, int) or frame_index < 0:
+        if not isinstance(frame_index, int) or not 0 <= frame_index < expected_frames:
             raise ValueError(f"record {record_position}: invalid frame_index={frame_index!r}")
-        contract_index = frame_index + frame_index_offset
-        if not 0 <= contract_index < expected_frames:
-            raise ValueError(
-                f"record {record_position}: frame_index={frame_index} with "
-                f"--frame-index-offset={frame_index_offset} maps to contract index "
-                f"{contract_index}, outside [0, {expected_frames})"
-            )
-        if contract_index in seen_indices:
-            raise ValueError(f"frame {contract_index}: duplicate record")
-        seen_indices.add(contract_index)
+        if frame_index in seen_indices:
+            raise ValueError(f"frame {frame_index}: duplicate record")
+        seen_indices.add(frame_index)
         if record.get("pose_world") is None:
             continue
         pose = np.asarray(record["pose_world"], dtype=np.float32)
         if pose.shape != (4, 4) or not np.isfinite(pose).all():
-            raise ValueError(f"frame {contract_index}: pose is not a finite 4x4 matrix")
+            raise ValueError(f"frame {frame_index}: pose is not a finite 4x4 matrix")
         if not np.allclose(pose[3], np.array([0, 0, 0, 1], dtype=np.float32), atol=1e-5):
-            raise ValueError(f"frame {contract_index}: invalid homogeneous last row")
-        indexed[contract_index] = pose
+            raise ValueError(f"frame {frame_index}: invalid homogeneous last row")
+        indexed[frame_index] = pose
     if not indexed:
         raise ValueError("no valid poses")
 
@@ -275,9 +307,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-pose-dir", default="object_6d")
     parser.add_argument(
         "--frame-contract",
-        choices=("auto", "npz", "text"),
+        choices=("auto", "npz", "text", "video"),
         default="auto",
-        help="Expected-frame source. auto prefers the original NPZ, then object_6d text files.",
+        help="Expected-frame source. auto prefers the original NPZ, then object_6d text "
+             "files. video counts the published videos instead, for captures whose "
+             "existing pose file predates a video re-encode.",
+    )
+    parser.add_argument(
+        "--video-dir",
+        default="vid",
+        help="Episode-relative video directory used by --frame-contract video.",
+    )
+    parser.add_argument(
+        "--video-probe-cameras",
+        type=int,
+        default=1,
+        help="Videos to probe per episode for --frame-contract video. 0 probes all.",
     )
     parser.add_argument("--output-name", default="object_6d_pose_v2.npz")
     parser.add_argument("--report", default=None, help="Optional JSON audit/provenance report.")
@@ -286,14 +331,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Fill up to this many missing leading/trailing poses from the nearest valid pose.",
-    )
-    parser.add_argument(
-        "--frame-index-offset",
-        type=int,
-        default=0,
-        help="Shift record frame_index onto the contract timeline "
-             "(contract index = frame_index + offset). Use 3 for allegro_v5, whose "
-             "vid/*.mp4 dropped the first three frames of the original capture.",
     )
     parser.add_argument("--write", action="store_true", help="Create outputs; default is dry-run.")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing output atomically.")
@@ -387,12 +424,11 @@ def main() -> int:
                     args.frame_contract,
                     args.original_name,
                     args.text_pose_dir,
+                    args.video_dir,
+                    args.video_probe_cameras,
                 )
                 poses, filled_frames = _load_records(
-                    record_path,
-                    expected_frames,
-                    args.max_boundary_fill,
-                    args.frame_index_offset,
+                    record_path, expected_frames, args.max_boundary_fill
                 )
                 if output.exists() and not args.overwrite:
                     row.update(status="exists", reason="output already exists")
@@ -435,9 +471,9 @@ def main() -> int:
         "original_name": args.original_name,
         "text_pose_dir": args.text_pose_dir,
         "frame_contract": args.frame_contract,
+        "video_dir": args.video_dir,
         "output_name": args.output_name,
         "max_boundary_fill": args.max_boundary_fill,
-        "frame_index_offset": args.frame_index_offset,
         "counts": counts,
         "episodes": results,
     }

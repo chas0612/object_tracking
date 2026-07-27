@@ -13,12 +13,15 @@ robot captures differ from the human ones in three ways:
 * 22 calibrated cameras and no ego videos, against 21 plus two ego streams.
 * Per-episode payload is ``raw/`` (arm, hand, timestamps); there is no ``hand/``
   MANO directory and no ``object_6d/`` text pose sequence.
-* The frame contract is ``object_6d_pose.npz``, whose length follows
-  ``raw/timestamps/frame_id.npy``.  The published ``vid/*.mp4`` re-encode dropped
-  the first three frames of the original capture, so the contract is longer than
-  the tracked videos and record ``k`` is contract frame ``k + 3``.  This script
-  verifies that offset per episode and records it in the manifest; feed the same
-  value to ``export_latest_gotrack_poses.py --frame-index-offset``.
+* The existing ``object_6d_pose.npz`` is **not** the frame contract for this
+  campaign.  It was tracked before the published ``vid/*.mp4`` re-encode dropped
+  the first three frames, so it sits three frames out of step with the videos.
+  The new poses are defined against the videos instead; export with
+  ``export_latest_gotrack_poses.py --frame-contract video``.
+
+This script therefore does no frame accounting — it builds the links and
+validates the camera set.  The export step counts the videos it aligns to, which
+is the only place that count has to be right.
 
 The default is a read-only audit. Pass ``--write`` to create the workspace.
 """
@@ -38,9 +41,8 @@ DEFAULT_SOURCE_REL = Path("capture/eccv2026/v0/allegro_v5")
 DEFAULT_WORKSPACE_REL = Path("object_tracking/campaigns/allegro_v5/workspace")
 
 # Linked into every workspace episode. ``raw`` carries the arm/hand/timestamp
-# streams that define the frame contract, so keep it reachable from the
-# workspace even though the tracking stages themselves only read cam_param and
-# videos.
+# streams; keep it reachable from the workspace even though the tracking stages
+# themselves only read cam_param and videos.
 LINKED_NAMES = ("cam_param", "C2R.npy", "raw")
 
 # Names that only ever appear as pipeline output. Their presence in the source
@@ -50,21 +52,6 @@ GENERATED_NAMES = (
     "object_tracking_foundpose_gotrack",
     "foundpose_init",
     "gotrack_tracking",
-)
-
-# Manifest keys that describe workspace structure. A re-run must reproduce these
-# exactly; the frame-contract keys are refreshed instead, because they are only
-# populated when verification is enabled.
-STRUCTURAL_KEYS = (
-    "schema_version",
-    "source_episode_rel",
-    "workspace_episode_rel",
-    "object_name",
-    "episode",
-    "fixed_camera_ids",
-    "source_video_directory",
-    "pipeline_video_directory",
-    "linked_names",
 )
 
 
@@ -97,73 +84,6 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def _contract_frame_count(path: Path) -> int:
-    import numpy as np
-
-    with np.load(path, allow_pickle=False) as archive:
-        indices = sorted(
-            int(key.removeprefix("frame_"))
-            for key in archive.files
-            if key.startswith("frame_")
-        )
-    if not indices or indices != list(range(len(indices))):
-        raise ValueError(f"Frame contract keys are not contiguous from 0: {path}")
-    return len(indices)
-
-
-def _video_frame_count(path: Path) -> int:
-    import cv2
-
-    capture = cv2.VideoCapture(str(path))
-    try:
-        if not capture.isOpened():
-            raise ValueError(f"Cannot open video: {path}")
-        count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    finally:
-        capture.release()
-    if count <= 0:
-        raise ValueError(f"Video reports {count} frames: {path}")
-    return count
-
-
-def _verify_frame_offset(
-    episode_dir: Path,
-    camera_ids: list[str],
-    contract_name: str,
-    expected_offset: int,
-    probe_cameras: int,
-) -> tuple[int, int]:
-    """Return (contract_frames, video_frames) and check the expected offset."""
-    contract_frames = _contract_frame_count(episode_dir / contract_name)
-    probed = camera_ids if probe_cameras <= 0 else camera_ids[:probe_cameras]
-    counts = {
-        camera_id: _video_frame_count(episode_dir / "vid" / f"{camera_id}.mp4")
-        for camera_id in probed
-    }
-    distinct = set(counts.values())
-    if len(distinct) != 1:
-        raise ValueError(f"Cameras disagree on frame count: {counts}")
-    video_frames = distinct.pop()
-    offset = contract_frames - video_frames
-    if offset != expected_offset:
-        raise ValueError(
-            f"Frame offset {offset} (contract {contract_frames} - video "
-            f"{video_frames}) differs from --expected-frame-offset={expected_offset}"
-        )
-    return contract_frames, video_frames
-
-
-def _manifest_conflict(existing: dict[str, Any], manifest: dict[str, Any]) -> str | None:
-    for key in STRUCTURAL_KEYS:
-        if existing.get(key) != manifest.get(key):
-            return f"{key}: stored={existing.get(key)!r} expected={manifest.get(key)!r}"
-    for key in ("contract_frames", "video_frames", "frame_index_offset"):
-        stored, current = existing.get(key), manifest.get(key)
-        if stored is not None and current is not None and stored != current:
-            return f"{key}: stored={stored!r} expected={current!r}"
-    return None
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shared-root", type=Path, default=DEFAULT_SHARED_ROOT)
@@ -173,19 +93,6 @@ def main() -> int:
     parser.add_argument("--episodes", nargs="*", default=None)
     parser.add_argument("--expected-cameras", type=int, default=22,
                         help="Required calibrated camera count per episode. 0 disables the check.")
-    parser.add_argument("--contract-name", default="object_6d_pose.npz",
-                        help="Existing per-episode NPZ that defines the frame contract.")
-    parser.add_argument("--expected-frame-offset", type=int, default=3,
-                        help="Required contract_frames - video_frames for every episode.")
-    verify_group = parser.add_mutually_exclusive_group()
-    verify_group.add_argument("--verify-frame-offset", dest="verify_frame_offset",
-                              action="store_true", default=True,
-                              help="Check the frame offset per episode (default).")
-    verify_group.add_argument("--no-verify-frame-offset", dest="verify_frame_offset",
-                              action="store_false",
-                              help="Skip video probing; leaves the offset unrecorded.")
-    parser.add_argument("--frame-offset-probe-cameras", type=int, default=1,
-                        help="Videos to probe per episode. 0 probes every calibrated camera.")
     parser.add_argument("--report", type=Path, default=None,
                         help="Optional JSON summary written even in dry-run mode.")
     parser.add_argument("--write", action="store_true")
@@ -194,8 +101,6 @@ def main() -> int:
     for value in (args.source_rel, args.workspace_rel):
         if value.is_absolute() or ".." in value.parts:
             raise ValueError("Relative roots must not be absolute or contain '..'")
-    if args.frame_offset_probe_cameras < 0:
-        raise ValueError("--frame-offset-probe-cameras must be non-negative")
 
     shared = args.shared_root.expanduser().resolve()
     source = shared / args.source_rel
@@ -209,7 +114,6 @@ def main() -> int:
     episode_filter = set(args.episodes or [])
     planned = 0
     video_links = 0
-    offsets: dict[int, int] = {}
     for object_dir in sorted(path for path in source.iterdir() if path.is_dir()):
         if object_filter and object_dir.name not in object_filter:
             continue
@@ -233,20 +137,6 @@ def main() -> int:
                 raise ValueError(
                     f"{tag}: expected {args.expected_cameras} calibrated cameras, "
                     f"found {len(camera_ids)}"
-                )
-
-            contract_frames: int | None = None
-            video_frames: int | None = None
-            if args.verify_frame_offset:
-                try:
-                    contract_frames, video_frames = _verify_frame_offset(
-                        episode_dir, camera_ids, args.contract_name,
-                        args.expected_frame_offset, args.frame_offset_probe_cameras,
-                    )
-                except ValueError as exc:
-                    raise ValueError(f"{tag}: {exc}") from exc
-                offsets[contract_frames - video_frames] = (
-                    offsets.get(contract_frames - video_frames, 0) + 1
                 )
 
             destination = workspace / object_dir.name / episode_dir.name
@@ -279,26 +169,11 @@ def main() -> int:
                 "source_video_directory": "vid",
                 "pipeline_video_directory": "videos",
                 "linked_names": list(LINKED_NAMES),
-                "contract_frames": contract_frames,
-                "video_frames": video_frames,
-                "frame_index_offset": (
-                    None if contract_frames is None or video_frames is None
-                    else contract_frames - video_frames
-                ),
             }
             manifest_path = destination / "source_episode.json"
             if manifest_path.exists():
-                stored = _read_json(manifest_path)
-                conflict = _manifest_conflict(stored, manifest)
-                if conflict is not None:
-                    raise ValueError(f"Workspace manifest mismatch: {manifest_path} ({conflict})")
-                # A run without verification must not erase an offset an earlier
-                # run already established.
-                for key in ("contract_frames", "video_frames", "frame_index_offset"):
-                    if manifest[key] is None and stored.get(key) is not None:
-                        manifest[key] = stored[key]
-                if args.write and manifest != stored:
-                    _atomic_json(manifest_path, manifest)
+                if _read_json(manifest_path) != manifest:
+                    raise ValueError(f"Workspace manifest mismatch: {manifest_path}")
             elif args.write:
                 _atomic_json(manifest_path, manifest)
             planned += 1
@@ -306,8 +181,7 @@ def main() -> int:
     mode = "write" if args.write else "dry-run"
     print(
         f"mode={mode} source={source} workspace={workspace} "
-        f"episodes={planned} fixed_video_links={video_links} "
-        f"frame_offsets={offsets or 'unverified'}",
+        f"episodes={planned} fixed_video_links={video_links}",
         flush=True,
     )
     if args.write:
@@ -324,10 +198,6 @@ def main() -> int:
             "fixed_video_links": video_links,
             "linked_names": list(LINKED_NAMES),
             "expected_cameras": args.expected_cameras,
-            "expected_frame_offset": args.expected_frame_offset,
-            "verify_frame_offset": args.verify_frame_offset,
-            "frame_offset_probe_cameras": args.frame_offset_probe_cameras,
-            "observed_frame_offsets": {str(k): v for k, v in sorted(offsets.items())},
         })
         print(f"report={report_path}", flush=True)
     return 0
