@@ -67,21 +67,46 @@ def _wxyz(rotation: np.ndarray) -> tuple[float, float, float, float]:
     return tuple(float(x) for x in quat)
 
 
-def _load_records(path: Path) -> dict[int, np.ndarray]:
+def _joint_transform(axis: np.ndarray, origin: np.ndarray, theta: float) -> np.ndarray:
+    """Rotation of ``theta`` about the line through ``origin`` along ``axis``."""
+    axis = np.asarray(axis, dtype=np.float64).reshape(3)
+    axis = axis / float(np.linalg.norm(axis))
+    origin = np.asarray(origin, dtype=np.float64).reshape(3)
+    cross = np.array([[0.0, -axis[2], axis[1]],
+                      [axis[2], 0.0, -axis[0]],
+                      [-axis[1], axis[0], 0.0]])
+    rotation = (np.eye(3) + np.sin(theta) * cross
+                + (1.0 - np.cos(theta)) * (cross @ cross))
+    pose = np.eye(4)
+    pose[:3, :3] = rotation
+    pose[:3, 3] = origin - rotation @ origin
+    return pose
+
+
+def _load_records(path: Path) -> tuple[dict[int, np.ndarray], dict[int, float]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, list):
         raise ValueError(f"Expected a list in {path}")
     poses: dict[int, np.ndarray] = {}
+    # Articulated runs carry a joint angle beside the pose. Reading it here rather
+    # than requiring a separate file keeps a rigid record working untouched: no
+    # angles simply means an empty dict and a lid that never moves.
+    thetas: dict[int, float] = {}
     for row in payload:
         if not isinstance(row, dict) or row.get("pose_world") is None:
             continue
         try:
-            poses[int(row["frame_index"])] = _as_4x4(row["pose_world"])
+            frame_index = int(row["frame_index"])
+            poses[frame_index] = _as_4x4(row["pose_world"])
         except (KeyError, TypeError, ValueError):
             continue
+        if "theta_rad" in row:
+            thetas[frame_index] = float(row["theta_rad"])
+        elif "theta_deg" in row:
+            thetas[frame_index] = float(np.radians(row["theta_deg"]))
     if not poses:
         raise ValueError(f"No valid pose_world entries in {path}")
-    return poses
+    return poses, thetas
 
 
 def _load_calibration(capture_dir: Path) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
@@ -188,7 +213,23 @@ class VideoFrames:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--capture-dir", required=True)
-    parser.add_argument("--object-mesh", required=True)
+    parser.add_argument("--object-mesh", required=True,
+                        help="For an articulated object this is the static part.")
+    parser.add_argument(
+        "--moving-mesh", default=None,
+        help=(
+            "Articulated objects only: the mesh on the far side of the joint, drawn "
+            "as a child of the object frame so it picks up the body pose and then the "
+            "joint angle. Without it an articulated record still displays, but with "
+            "the lid frozen shut -- the body tracks correctly and the error is easy "
+            "to miss, which is why the angle is also printed in the readout."
+        ),
+    )
+    parser.add_argument(
+        "--articulation-json", default=None,
+        help="Joint file with axis and origin in the mesh frame, as written beside "
+             "the part meshes. Required with --moving-mesh.",
+    )
     parser.add_argument("--gotrack-records", required=True)
     parser.add_argument("--video-dir", default=None, help="Default: <capture-dir>/undistorted_video")
     parser.add_argument("--camera-ids", nargs="*", default=None, help="Optional calibrated camera serials to show.")
@@ -229,7 +270,7 @@ def main() -> int:
     if not capture_dir.is_dir() or not mesh_path.is_file() or not records_path.is_file():
         raise FileNotFoundError("--capture-dir, --object-mesh, and --gotrack-records must exist")
 
-    poses = _load_records(records_path)
+    poses, thetas = _load_records(records_path)
     intrinsics, extrinsics = _load_calibration(capture_dir)
     c2r_path = Path(args.c2r).expanduser().resolve() if args.c2r else capture_dir / "C2R.npy"
     if args.coordinate_frame == "robot":
@@ -281,6 +322,25 @@ def main() -> int:
         pass
     object_frame = server.scene.add_frame("/track/object", show_axes=True, axes_length=0.06, axes_radius=0.002)
     server.scene.add_mesh_trimesh("/track/object/mesh", mesh=mesh)
+
+    # The moving part hangs off the object frame, so viser composes the body pose
+    # with the joint transform for us and the update loop only has to set one local
+    # transform per frame.
+    lid_frame = None
+    joint_axis = joint_origin = None
+    if args.moving_mesh:
+        if not args.articulation_json:
+            raise ValueError("--moving-mesh requires --articulation-json")
+        joint = json.loads(Path(args.articulation_json).expanduser().read_text(encoding="utf-8"))
+        joint = joint.get("measured", joint)
+        joint_axis = np.asarray(joint["axis"], dtype=np.float64)
+        joint_origin = np.asarray(joint["origin"], dtype=np.float64)
+        lid_mesh = trimesh.load(Path(args.moving_mesh).expanduser(), process=False)
+        if isinstance(lid_mesh, trimesh.Scene):
+            lid_mesh = trimesh.util.concatenate(tuple(lid_mesh.geometry.values()))
+        lid_frame = server.scene.add_frame(
+            "/track/object/lid", show_axes=False)
+        server.scene.add_mesh_trimesh("/track/object/lid/mesh", mesh=lid_mesh)
 
     readers = VideoFrames(video_dir, serials, args.camera_image_max_side) if args.show_camera_images else None
     camera_handles: dict[str, Any] = {}
@@ -365,7 +425,23 @@ def main() -> int:
             view_pose = view_from_world @ pose
             object_frame.position = tuple(float(value) for value in view_pose[:3, 3])
             object_frame.wxyz = _wxyz(view_pose[:3, :3])
-            text_gui.value = f"frame={frame_index}; source pose={'exact' if frame_index in poses else 'held'}"
+            readout = f"frame={frame_index}; source pose={'exact' if frame_index in poses else 'held'}"
+            if thetas:
+                # Held angles are shown as such: on an articulated run a frame whose
+                # moving part was occluded reports the previous angle, and that is not
+                # the same thing as having measured it again.
+                exact = frame_index in thetas
+                earlier = [index for index in thetas if index <= frame_index]
+                theta = thetas.get(
+                    frame_index,
+                    thetas[max(earlier)] if earlier else thetas[min(thetas)])
+                if lid_frame is not None:
+                    local = _joint_transform(joint_axis, joint_origin, theta)
+                    lid_frame.position = tuple(float(v) for v in local[:3, 3])
+                    lid_frame.wxyz = _wxyz(local[:3, :3])
+                readout += (f"; theta={np.degrees(theta):.1f} deg "
+                            f"({'exact' if exact else 'held'})")
+            text_gui.value = readout
             if robot_vis is not None and robot_qpos is not None:
                 robot_vis.update_cfg(robot_qpos[min(frame_index, len(robot_qpos) - 1)])
                 robot_vis.show_visual = robot_gui.value

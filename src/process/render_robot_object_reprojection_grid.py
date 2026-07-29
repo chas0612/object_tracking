@@ -130,6 +130,38 @@ def _load_object_poses(path: Path) -> tuple[dict[int, np.ndarray], int]:
     return poses, last_recorded_frame
 
 
+def _joint_transform(axis: np.ndarray, origin: np.ndarray, theta: float) -> np.ndarray:
+    """Rotation of ``theta`` about the line through ``origin`` along ``axis``."""
+    axis = np.asarray(axis, dtype=np.float64).reshape(3)
+    axis = axis / float(np.linalg.norm(axis))
+    origin = np.asarray(origin, dtype=np.float64).reshape(3)
+    cross = np.array([[0.0, -axis[2], axis[1]],
+                      [axis[2], 0.0, -axis[0]],
+                      [-axis[1], axis[0], 0.0]])
+    rotation = (np.eye(3) + np.sin(theta) * cross
+                + (1.0 - np.cos(theta)) * (cross @ cross))
+    pose = np.eye(4)
+    pose[:3, :3] = rotation
+    pose[:3, 3] = origin - rotation @ origin
+    return pose
+
+
+def _load_joint_angles(path: Path) -> dict[int, float]:
+    """Per-frame joint angles from a GoTrack record, empty for a rigid one."""
+    if path.suffix.lower() == ".npz":
+        return {}
+    records = json.loads(path.read_text(encoding="utf-8"))
+    angles: dict[int, float] = {}
+    for item in records:
+        if not isinstance(item, dict) or "frame_index" not in item:
+            continue
+        if "theta_rad" in item:
+            angles[int(item["frame_index"])] = float(item["theta_rad"])
+        elif "theta_deg" in item:
+            angles[int(item["frame_index"])] = float(np.radians(item["theta_deg"]))
+    return angles
+
+
 def _load_mesh(path: Path) -> trimesh.Trimesh:
     mesh = trimesh.load(path, process=False)
     if isinstance(mesh, trimesh.Scene):
@@ -149,6 +181,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture-dir", required=True)
     parser.add_argument("--video-dir", default=None,
                         help="Default: <capture-dir>/undistorted_video. Must match intrinsics_undistort.")
+    parser.add_argument(
+        "--moving-mesh", action="append", default=None,
+        help=(
+            "Articulated objects only, repeated alongside --object-mesh: the part on "
+            "the far side of the joint. It is drawn as an extra overlay whose pose is "
+            "the body pose composed with the joint angle read from the same records, "
+            "so it needs no trajectory of its own. Omit it and an articulated run "
+            "still renders, with the lid drawn shut over an open one."
+        ),
+    )
+    parser.add_argument(
+        "--articulation-json", action="append", default=None,
+        help="Joint file per --moving-mesh, with axis and origin in the mesh frame.",
+    )
     parser.add_argument("--object-mesh", action="append", required=True,
                         help="Object mesh. Repeat together with --gotrack-records for multiple objects.")
     parser.add_argument("--gotrack-records", action="append", required=True,
@@ -209,6 +255,35 @@ def main() -> int:
         raise RuntimeError("No usable cameras")
     loaded_trajectories = [_load_object_poses(path) for path in records_paths]
     object_poses = [poses for poses, _ in loaded_trajectories]
+
+    # A moving part becomes one more overlay rather than a special case in the render
+    # loop: its pose is the body pose already loaded, composed with that frame's joint
+    # angle. Everything downstream -- renderers, colours, holding the last pose over a
+    # gap -- then applies to it unchanged.
+    moving_meshes = list(args.moving_mesh or [])
+    joint_files = list(args.articulation_json or [])
+    if moving_meshes:
+        if len(joint_files) != len(moving_meshes):
+            raise ValueError("Repeat --articulation-json once per --moving-mesh")
+        for index, (moving_path, joint_path) in enumerate(zip(moving_meshes, joint_files)):
+            joint = json.loads(Path(joint_path).expanduser().read_text(encoding="utf-8"))
+            joint = joint.get("measured", joint)
+            axis = np.asarray(joint["axis"], dtype=np.float64)
+            origin = np.asarray(joint["origin"], dtype=np.float64)
+            angles = _load_joint_angles(records_paths[index])
+            if not angles:
+                raise ValueError(
+                    f"{records_paths[index]} carries no joint angles, so "
+                    f"{moving_path} cannot be posed"
+                )
+            body = object_poses[index]
+            held = 0.0
+            posed: dict[int, np.ndarray] = {}
+            for frame_index in sorted(body):
+                held = angles.get(frame_index, held)
+                posed[frame_index] = body[frame_index] @ _joint_transform(axis, origin, held)
+            object_mesh_paths.append(Path(moving_path).expanduser().resolve())
+            object_poses.append(posed)
     common_video_frames = min(int(video_timings[serial]["frames"]) for serial in serials)
     total_frames = min(common_video_frames, *(last_frame + 1 for _, last_frame in loaded_trajectories))
     start = max(0, args.start_frame)

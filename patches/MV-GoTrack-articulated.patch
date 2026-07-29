@@ -1,0 +1,1760 @@
+--- a/utils/multiview_geometry.py
++++ b/utils/multiview_geometry.py
+@@ -685,6 +685,316 @@
+     }
+ 
+ 
++def joint_transform(axis_o: np.ndarray, origin_o: np.ndarray, theta: float) -> np.ndarray:
++    """Rotation of ``theta`` about the line through ``origin_o`` along ``axis_o``.
++
++    Object frame throughout, in whatever units the anchor bank uses -- the origin
++    shares those units, the axis is dimensionless.
++    """
++    axis = np.asarray(axis_o, dtype=np.float64).reshape(3)
++    norm = float(np.linalg.norm(axis))
++    if norm < 1.0e-12:
++        raise ValueError("Joint axis is degenerate")
++    axis = axis / norm
++    origin = np.asarray(origin_o, dtype=np.float64).reshape(3)
++
++    cross = np.array([[0.0, -axis[2], axis[1]],
++                      [axis[2], 0.0, -axis[0]],
++                      [-axis[1], axis[0], 0.0]], dtype=np.float64)
++    rotation = (np.eye(3)
++                + np.sin(theta) * cross
++                + (1.0 - np.cos(theta)) * (cross @ cross))
++    pose = np.eye(4, dtype=np.float64)
++    pose[:3, :3] = rotation
++    pose[:3, 3] = origin - rotation @ origin
++    return pose
++
++
++def fit_joint_angle_weighted(
++    source_points_o: np.ndarray,
++    target_points_o: np.ndarray,
++    weights: np.ndarray,
++    axis_o: np.ndarray,
++    origin_o: np.ndarray,
++) -> float:
++    """The angle about a *known* axis that best carries source onto target.
++
++    Both point sets live in the body frame, so the caller has already undone the
++    body pose. With the axis fixed this is one degree of freedom and it has a
++    closed form: drop the component along the axis, and the weighted least-squares
++    rotation in the remaining plane is the argument of the summed complex product.
++
++    Closed form rather than a numerical search on purpose. The silhouette work on
++    this object spent a long time on an optimiser that stopped early on a bumpy
++    surface and returned answers that differed by 8.9 deg from equivalent starts;
++    nothing here can stop early because there is nothing to iterate.
++    """
++    axis = np.asarray(axis_o, dtype=np.float64).reshape(3)
++    axis = axis / float(np.linalg.norm(axis))
++    origin = np.asarray(origin_o, dtype=np.float64).reshape(3)
++    source = np.asarray(source_points_o, dtype=np.float64).reshape(-1, 3) - origin
++    target = np.asarray(target_points_o, dtype=np.float64).reshape(-1, 3) - origin
++    weight = np.asarray(weights, dtype=np.float64).reshape(-1)
++
++    # Only the components perpendicular to the axis can move, so the parallel part
++    # carries no information about the angle and is removed from both sides.
++    source_perp = source - np.outer(source @ axis, axis)
++    target_perp = target - np.outer(target @ axis, axis)
++
++    # An anchor sitting on the axis has no lever arm; its perpendicular component is
++    # numerical noise pointing in an arbitrary direction. The cross and dot products
++    # below already weight by the two radii, so such anchors fall out on their own.
++    cosine = np.sum(weight * np.sum(source_perp * target_perp, axis=1))
++    sine = np.sum(weight * (np.cross(source_perp, target_perp) @ axis))
++    if abs(cosine) < 1.0e-18 and abs(sine) < 1.0e-18:
++        return 0.0
++    return float(np.arctan2(sine, cosine))
++
++
++def fit_articulated_transform_weighted(
++    source_points_o: np.ndarray,
++    target_points_w: np.ndarray,
++    weights: np.ndarray,
++    part_ids: np.ndarray,
++    axis_o: np.ndarray,
++    origin_o: np.ndarray,
++    *,
++    theta_init: float = 0.0,
++    theta_reference_rad: float | None = None,
++    iterations: int = 40,
++    tolerance_rad: float = 1.0e-9,
++) -> tuple[np.ndarray, float, int]:
++    """Body pose and joint angle together, by alternating two exact solves.
++
++    The objective is the rigid one with the moving part carried through the joint::
++
++        argmin_{T, theta}  sum_body w ||T X - Y||^2
++                         + sum_lid  w ||T J(theta) X - Y||^2
++
++    Neither variable has a closed form on its own, but each does given the other:
++    fix ``theta`` and the moving anchors can be pre-swung into the body frame, which
++    leaves an ordinary weighted Kabsch; fix ``T`` and the moving anchors can be
++    pulled back into the body frame, which leaves the one-dimensional problem above.
++    Alternating exact solves is monotone in the objective and converges in a handful
++    of rounds.
++
++    ``part_ids`` is 0 for the static part and 1 for the part on the far side of the
++    joint. Returns the pose, the angle, and the number of rounds actually used.
++
++    The angle only ever enters as a rotation, so every representative differing by a
++    full turn fits equally well and the solve has no way to prefer one. Which one is
++    reported still matters: this joint opens past 180 deg, and an arctangent hands
++    back 215 deg as -145, which then reads as below a lower limit of zero and gets
++    clamped there. ``theta_reference_rad`` names the half-turn window to report in --
++    the previous frame's angle when tracking, which also keeps the series continuous.
++    Default is pi, giving [0, 2*pi), the range a hinge measured from closed occupies.
++    """
++    source = np.asarray(source_points_o, dtype=np.float64).reshape(-1, 3)
++    target = np.asarray(target_points_w, dtype=np.float64).reshape(-1, 3)
++    weight = np.asarray(weights, dtype=np.float64).reshape(-1)
++    moving = np.asarray(part_ids).reshape(-1) == 1
++
++    def _pose_at(angle: float) -> np.ndarray:
++        # Swinging the moving anchors by the angle makes the whole set rigid again,
++        # so this is the untouched weighted Kabsch.
++        swung = source.copy()
++        if moving.any():
++            transform = joint_transform(axis_o, origin_o, angle)
++            swung[moving] = source[moving] @ transform[:3, :3].T + transform[:3, 3]
++        return _coerce_pose_matrix(
++            fit_rigid_transform_weighted(swung, target, weight)).astype(np.float64)
++
++    theta = float(theta_init)
++    pose = _pose_at(theta)
++    used = 0
++    previous_delta = 0.0
++    if moving.any():
++        for used in range(1, int(iterations) + 1):
++            # T -> theta. Bring the moving targets back into the body frame, where
++            # the remaining freedom is exactly the hinge. Unwrapped onto the running
++            # value so the alternation cannot jump a turn mid-iteration.
++            rotation, translation = pose[:3, :3], pose[:3, 3]
++            target_in_object = (target[moving] - translation) @ rotation
++            solved = fit_joint_angle_weighted(
++                source[moving], target_in_object, weight[moving], axis_o, origin_o)
++            delta = float(np.arctan2(np.sin(solved - theta), np.cos(solved - theta)))
++            theta += delta
++
++            # Alternating exact solves converge linearly, and on some geometries the
++            # ratio is close enough to one that the tail outlives any sane iteration
++            # cap -- one pose here still had 0.009 deg left after 40 rounds. The
++            # steps shrink by a near-constant factor, so the rest of the series can
++            # be summed instead of walked: with r = delta_n / delta_{n-1} the
++            # remaining distance is delta_n * r / (1 - r). Aitken extrapolation, and
++            # the alternation that follows polishes whatever it overshoots.
++            if previous_delta != 0.0 and delta != 0.0:
++                ratio = delta / previous_delta
++                if 0.0 < ratio < 0.999:
++                    theta += delta * ratio / (1.0 - ratio)
++            previous_delta = delta
++
++            # theta -> T, every round including the last, so the pair handed back is
++            # always consistent. Returning a pose fitted at the previous angle left
++            # 3.6 deg on the table whenever the loop ran to its iteration limit.
++            pose = _pose_at(theta)
++            if abs(delta) <= tolerance_rad:
++                break
++
++    reference = np.pi if theta_reference_rad is None else float(theta_reference_rad)
++    theta = reference + float(np.arctan2(np.sin(theta - reference), np.cos(theta - reference)))
++    return pose.astype(np.float32), float(theta), int(used)
++
++
++def compute_articulated_fit_residuals(
++    pose_world_from_object: np.ndarray,
++    theta: float,
++    source_points_o: np.ndarray,
++    target_points_w: np.ndarray,
++    part_ids: np.ndarray,
++    axis_o: np.ndarray,
++    origin_o: np.ndarray,
++) -> np.ndarray:
++    """Per-anchor distance, each part carried through its own transform."""
++    pose = _coerce_pose_matrix(pose_world_from_object).astype(np.float64)
++    source = np.asarray(source_points_o, dtype=np.float64).reshape(-1, 3)
++    target = np.asarray(target_points_w, dtype=np.float64).reshape(-1, 3)
++    moving = np.asarray(part_ids).reshape(-1) == 1
++
++    posed = source.copy()
++    if moving.any():
++        transform = joint_transform(axis_o, origin_o, float(theta))
++        posed[moving] = source[moving] @ transform[:3, :3].T + transform[:3, 3]
++    predicted = posed @ pose[:3, :3].T + pose[:3, 3]
++    return np.linalg.norm(predicted - target, axis=1).astype(np.float32)
++
++
++def robust_fit_articulated_pose_from_anchors(
++    source_points_o: np.ndarray,
++    target_points_w: np.ndarray,
++    weights: np.ndarray,
++    part_ids: np.ndarray,
++    axis_o: np.ndarray,
++    origin_o: np.ndarray,
++    *,
++    inlier_threshold_mm: float,
++    min_anchors: int = 3,
++    min_moving_anchors: int = 3,
++    external_unit_scale_to_meter: float = 1.0,
++    theta_init: float = 0.0,
++    theta_reference_rad: float | None = None,
++    theta_limits_rad: tuple[float, float] | None = None,
++) -> dict[str, Any]:
++    """Articulated counterpart of ``robust_fit_pose_from_anchors``.
++
++    Same shape of contract -- fit, threshold on residual, refit on the inliers --
++    so the caller only has to supply the part labels and the joint.
++
++    Two failure modes have no analogue in the rigid version and are reported rather
++    than papered over. Too few anchors on the moving part leaves the angle
++    unobserved, and the honest answer is the previous angle with the body fitted
++    around it, flagged ``theta_unobserved``; averaging in a guess would look like a
++    measurement. And ``theta_limits_rad`` clamps only at the end, because a clamped
++    angle is no longer the least-squares solution -- when it binds, the estimate is
++    censored and ``theta_clamped`` says so. On this object the scanned joint range
++    proved about 9 deg short of the real hinge, so a limit is as likely to be wrong
++    as the estimate it truncates.
++    """
++    source = np.asarray(source_points_o, dtype=np.float64).reshape(-1, 3)
++    target = np.asarray(target_points_w, dtype=np.float64).reshape(-1, 3)
++    weight = np.asarray(weights, dtype=np.float64).reshape(-1)
++    parts = np.asarray(part_ids).reshape(-1)
++    unit_scale_to_meter = _validate_external_unit_scale_to_meter(external_unit_scale_to_meter)
++
++    if source.shape[0] < max(int(min_anchors), 3):
++        return {"status": "insufficient_anchors", "num_input_anchors": int(source.shape[0])}
++
++    moving_count = int(np.count_nonzero(parts == 1))
++    theta_observed = moving_count >= max(int(min_moving_anchors), 1)
++
++    # Which half-turn window to report the angle in. The joint's own range is the
++    # best answer when the caller supplies one -- a hinge that opens to 215 deg has
++    # to report 215 and not the -145 an arctangent prefers, or a lower limit of zero
++    # will clamp a perfectly good estimate to nothing. Falling back to pi gives
++    # [0, 2*pi), which is where a hinge measured from closed lives.
++    reference = theta_reference_rad
++    if reference is None:
++        reference = (float(np.mean(theta_limits_rad)) if theta_limits_rad is not None
++                     else np.pi)
++
++    def _fit(mask: np.ndarray | None) -> tuple[np.ndarray, float, int]:
++        if mask is None:
++            selected = slice(None)
++        else:
++            selected = mask
++        if theta_observed:
++            return fit_articulated_transform_weighted(
++                source[selected], target[selected], weight[selected], parts[selected],
++                axis_o, origin_o, theta_init=theta_init,
++                theta_reference_rad=reference)
++        # The angle is not observable from this frame's anchors; hold it and fit the
++        # body around it, which is the rigid problem with the moving part pre-swung.
++        swung = source[selected].copy()
++        moving_local = parts[selected] == 1
++        if moving_local.any():
++            transform = joint_transform(axis_o, origin_o, float(theta_init))
++            swung[moving_local] = (source[selected][moving_local] @ transform[:3, :3].T
++                                   + transform[:3, 3])
++        pose = fit_rigid_transform_weighted(swung, target[selected], weight[selected])
++        return pose, float(theta_init), 0
++
++    pose_initial, theta_initial, rounds = _fit(None)
++    residuals_initial = compute_articulated_fit_residuals(
++        pose_initial, theta_initial, source, target, parts, axis_o, origin_o)
++    inlier_threshold_external = (float(inlier_threshold_mm) / 1000.0) / unit_scale_to_meter
++    inlier_mask = residuals_initial <= inlier_threshold_external
++
++    enough_inliers = int(np.count_nonzero(inlier_mask)) >= max(int(min_anchors), 3)
++    # Refitting on inliers that happen to exclude the moving part would silently turn
++    # an articulated fit into a rigid one at the previous angle, so keep the first
++    # fit unless the inliers still see the joint.
++    keeps_joint = (not theta_observed) or int(
++        np.count_nonzero(inlier_mask & (parts == 1))) >= max(int(min_moving_anchors), 1)
++    if enough_inliers and keeps_joint:
++        pose_final, theta_final, rounds = _fit(inlier_mask)
++        residuals_final = compute_articulated_fit_residuals(
++            pose_final, theta_final, source, target, parts, axis_o, origin_o)
++        status = "ok" if theta_observed else "theta_unobserved"
++    else:
++        pose_final, theta_final = pose_initial, theta_initial
++        residuals_final = residuals_initial
++        status = "no_inlier_refit" if theta_observed else "theta_unobserved"
++
++    theta_clamped = False
++    if theta_limits_rad is not None:
++        lower, upper = (float(theta_limits_rad[0]), float(theta_limits_rad[1]))
++        limited = float(np.clip(theta_final, lower, upper))
++        theta_clamped = not np.isclose(limited, theta_final)
++        if theta_clamped:
++            theta_final = limited
++            residuals_final = compute_articulated_fit_residuals(
++                pose_final, theta_final, source, target, parts, axis_o, origin_o)
++
++    residuals_m = residuals_final * unit_scale_to_meter
++    return {
++        "status": status,
++        "pose_world_from_object": pose_final.astype(np.float32),
++        "theta_rad": float(theta_final),
++        "theta_deg": float(np.degrees(theta_final)),
++        "theta_observed": bool(theta_observed),
++        "theta_clamped": bool(theta_clamped),
++        "residuals_external_units": residuals_final.astype(np.float32),
++        "residuals_m": residuals_m.astype(np.float32),
++        "residuals_mm": (residuals_m * 1000.0).astype(np.float32),
++        "inlier_mask": inlier_mask.astype(bool),
++        "num_input_anchors": int(source.shape[0]),
++        "num_inlier_anchors": int(np.count_nonzero(inlier_mask)),
++        "num_moving_anchors": moving_count,
++        "num_rounds": int(rounds),
++        "mean_residual_mm": float(np.mean(residuals_m) * 1000.0),
++        "max_residual_mm": float(np.max(residuals_m) * 1000.0),
++    }
++
++
+ def triangulate_anchor_observations(
+     observations_by_anchor: dict[int, list[dict[str, Any]]],
+     intrinsics_map: dict[str, np.ndarray],
+--- a/utils/anchor_bank.py
++++ b/utils/anchor_bank.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import json
++from collections.abc import Sequence
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -251,6 +252,107 @@
+     }
+ 
+ 
++def sample_articulated_mesh_anchors(
++    part_mesh_paths: Sequence[str | Path],
++    num_anchors: int,
++    joint_axis_o: Sequence[float],
++    joint_origin_o: Sequence[float],
++    *,
++    mesh_scale: float = 1.0,
++    method: str = "fps",
++    seed: int = 0,
++    part_names: Sequence[str] | None = None,
++    theta_limits_rad: Sequence[float] | None = None,
++    **sample_kwargs: Any,
++) -> dict[str, Any]:
++    """An anchor bank over two or more rigid parts joined by one revolute joint.
++
++    Each part is sampled on its own and the banks are concatenated, so every anchor
++    carries the ``part_ids`` label the articulated fit needs. Part 0 is the static
++    body and part 1 is the one on the far side of the joint; the ordering of
++    ``part_mesh_paths`` is what defines that, and it is not inferred.
++
++    The anchor budget is split by surface area rather than evenly. A lid with a
++    third of the body's area would otherwise be sampled three times as densely,
++    which quietly reweights the fit toward the part that happens to be smaller --
++    and since the moving part is the only one carrying angle information, that would
++    also change how strongly the angle is determined.
++
++    ``face_indices`` and ``vertex_indices`` are offset by the running vertex and
++    face counts, so they index the parts concatenated in this order -- the same mesh
++    the renderer builds when it fuses the parts at an angle.
++    """
++    paths = [Path(p).expanduser().resolve() for p in part_mesh_paths]
++    if len(paths) < 2:
++        raise ValueError("Articulated sampling needs at least two part meshes")
++    if part_names is not None and len(part_names) != len(paths):
++        raise ValueError("part_names must match part_mesh_paths")
++
++    meshes = [load_mesh(path, mesh_scale=mesh_scale) for path in paths]
++    areas = np.array([float(mesh.area) for mesh in meshes], dtype=np.float64)
++    if not np.all(areas > 0.0):
++        raise ValueError("Every part mesh must have positive surface area")
++
++    # Largest-remainder apportionment, so the parts sum to exactly num_anchors and
++    # no part is rounded away to nothing.
++    exact = areas / areas.sum() * float(num_anchors)
++    counts = np.floor(exact).astype(int)
++    counts = np.maximum(counts, 1)
++    while counts.sum() > int(num_anchors) and counts.max() > 1:
++        counts[int(np.argmax(counts))] -= 1
++    for index in np.argsort(-(exact - np.floor(exact)))[: max(0, int(num_anchors) - counts.sum())]:
++        counts[int(index)] += 1
++
++    banks, part_ids = [], []
++    vertex_offset = 0
++    for part_id, (path, mesh, count) in enumerate(zip(paths, meshes, counts)):
++        bank = sample_mesh_anchors(
++            path, int(count), mesh_scale=mesh_scale, method=method,
++            seed=int(seed) + part_id, **sample_kwargs)
++        face_offset = sum(int(np.asarray(m.faces).shape[0]) for m in meshes[:part_id])
++        bank["face_indices"] = bank["face_indices"] + face_offset
++        bank["vertex_indices"] = bank["vertex_indices"] + vertex_offset
++        vertex_offset += int(np.asarray(mesh.vertices).shape[0])
++        banks.append(bank)
++        part_ids.append(np.full(int(bank["positions_o"].shape[0]), part_id, dtype=np.int64))
++
++    axis = np.asarray(joint_axis_o, dtype=np.float64).reshape(3)
++    axis_norm = float(np.linalg.norm(axis))
++    if axis_norm < 1.0e-12:
++        raise ValueError("joint_axis_o is degenerate")
++    axis = axis / axis_norm
++
++    merged = {
++        key: np.concatenate([bank[key] for bank in banks], axis=0)
++        for key in ("positions_o", "normals_o", "face_indices", "vertex_indices", "barycentric")
++    }
++    merged["part_ids"] = np.concatenate(part_ids, axis=0)
++    merged["metadata"] = {
++        "mesh_path": str(paths[0]),
++        "part_mesh_paths": [str(p) for p in paths],
++        "part_names": list(part_names) if part_names is not None
++        else [p.stem for p in paths],
++        "part_anchor_counts": [int(c) for c in counts],
++        "part_areas": areas.tolist(),
++        "mesh_scale": float(mesh_scale),
++        "anchor_unit_space": "external_mesh",
++        "num_anchors": int(merged["positions_o"].shape[0]),
++        "method": str(method),
++        "seed": int(seed),
++        "mesh_num_vertices": int(vertex_offset),
++        "mesh_num_faces": int(sum(int(np.asarray(m.faces).shape[0]) for m in meshes)),
++        "articulated": True,
++        # External mesh units, matching positions_o. The axis is a direction and so
++        # is unitless; the origin is a point and scales with the anchors.
++        "joint_axis_o": axis.tolist(),
++        "joint_origin_o": np.asarray(joint_origin_o, dtype=np.float64).reshape(3).tolist(),
++        "theta_limits_rad": (None if theta_limits_rad is None
++                             else [float(v) for v in theta_limits_rad]),
++        "moving_part_id": 1,
++    }
++    return merged
++
++
+ def prepare_anchor_bank_for_gotrack(
+     anchor_bank: dict[str, Any],
+     *,
+@@ -274,10 +376,85 @@
+     metadata["gotrack_anchor_scale_factor"] = float(scale)
+     metadata["positions_o_external_unit"] = metadata.get("anchor_unit_space", "external_mesh")
+     metadata["positions_o_gotrack_unit"] = "gotrack_internal"
++    # The joint has to follow the anchors into GoTrack units, and its two halves do
++    # not scale alike: the origin is a point and scales, the axis is a direction and
++    # does not. Scaling the axis would leave it non-unit and silently change the
++    # rotation; leaving the origin unscaled would put the hinge somewhere else
++    # entirely. Both are stored explicitly so no caller has to remember which.
++    if metadata.get("articulated") and "joint_origin_o" in metadata:
++        origin = np.asarray(metadata["joint_origin_o"], dtype=np.float64)
++        metadata["joint_origin_o_external"] = origin.tolist()
++        metadata["joint_origin_o_gotrack"] = (origin * scale).tolist()
++        metadata["joint_axis_o_gotrack"] = list(metadata["joint_axis_o"])
+     output["metadata"] = metadata
+     return output
+ 
+ 
++def fuse_articulated_parts(
++    part_mesh_paths: Sequence[str | Path],
++    *,
++    mesh_scale: float = 1.0,
++) -> tuple[trimesh.Trimesh, np.ndarray]:
++    """Concatenate the parts at zero angle, and say which vertices are the moving one.
++
++    The renderer needs one mesh, and it must be the same mesh the anchor bank's
++    ``vertex_indices`` were offset against -- parts in this order, vertices
++    concatenated, nothing reordered. Building it here rather than asking for a
++    pre-fused asset is what guarantees that: a fused mesh made elsewhere could have
++    its parts in the other order, or be welded, and the anchors would then be
++    labelled against a vertex numbering that no longer exists.
++
++    Zero angle because the joint is applied at render time, not baked in.
++    """
++    paths = [Path(p).expanduser().resolve() for p in part_mesh_paths]
++    meshes = [load_mesh(path, mesh_scale=mesh_scale) for path in paths]
++    counts = [int(np.asarray(mesh.vertices).shape[0]) for mesh in meshes]
++    fused = trimesh.util.concatenate(meshes)
++    if int(np.asarray(fused.vertices).shape[0]) != sum(counts):
++        raise ValueError(
++            "Concatenation changed the vertex count, so anchor vertex indices would "
++            "no longer line up with the fused mesh"
++        )
++    moving = np.zeros(sum(counts), dtype=bool)
++    moving[counts[0]:] = True
++    return fused, moving
++
++
++def articulation_from_anchor_bank(
++    anchor_bank: dict[str, Any],
++    *,
++    units: str = "external",
++) -> dict[str, Any] | None:
++    """The joint carried by a bank, or ``None`` when the bank is a rigid object.
++
++    ``units`` picks which copy of the origin to return. Both the projection and the
++    fit work in external units -- they read ``positions_o_external`` -- so that is
++    the default and the other is here for callers working inside GoTrack's scale.
++    Getting this wrong does not raise: the hinge simply sits a thousand times too
++    far away and the angle comes out meaningless, so the choice is explicit.
++    """
++    metadata = anchor_bank.get("metadata") or {}
++    if not metadata.get("articulated") or "joint_axis_o" not in metadata:
++        return None
++    part_ids = np.asarray(anchor_bank.get(
++        "part_ids", np.zeros(len(anchor_bank["positions_o"]), dtype=np.int64)), dtype=np.int64)
++    if units == "gotrack":
++        origin = metadata.get("joint_origin_o_gotrack", metadata["joint_origin_o"])
++    elif units == "external":
++        origin = metadata.get("joint_origin_o_external", metadata["joint_origin_o"])
++    else:
++        raise ValueError(f"units must be 'external' or 'gotrack', got {units!r}")
++    limits = metadata.get("theta_limits_rad")
++    return {
++        "part_ids": part_ids,
++        "joint_axis_o": np.asarray(metadata["joint_axis_o"], dtype=np.float64),
++        "joint_origin_o": np.asarray(origin, dtype=np.float64),
++        "theta_limits_rad": None if limits is None else tuple(float(v) for v in limits),
++        "moving_part_id": int(metadata.get("moving_part_id", 1)),
++        "part_names": list(metadata.get("part_names", [])),
++    }
++
++
+ def save_anchor_bank(path: str | Path, anchor_bank: dict[str, Any]) -> None:
+     path = Path(path).expanduser().resolve()
+     path.parent.mkdir(parents=True, exist_ok=True)
+@@ -292,6 +469,8 @@
+         "barycentric": np.asarray(anchor_bank["barycentric"], dtype=np.float32),
+         "metadata_json": np.asarray(json.dumps(metadata, sort_keys=True)),
+     }
++    if "part_ids" in anchor_bank:
++        payload["part_ids"] = np.asarray(anchor_bank["part_ids"], dtype=np.int64)
+     if "positions_o_external" in anchor_bank:
+         payload["positions_o_external"] = np.asarray(anchor_bank["positions_o_external"], dtype=np.float32)
+     if "positions_o_gotrack" in anchor_bank:
+@@ -310,6 +489,14 @@
+             "face_indices": np.asarray(payload["face_indices"], dtype=np.int64),
+             "vertex_indices": np.asarray(payload["vertex_indices"], dtype=np.int64),
+             "barycentric": np.asarray(payload["barycentric"], dtype=np.float32),
++            # A bank written before articulation existed is one rigid part, and
++            # labelling it part 0 lets the articulated fit accept it unchanged --
++            # with no moving anchors it reports the angle as unobserved rather than
++            # inventing one.
++            "part_ids": np.asarray(
++                payload["part_ids"], dtype=np.int64,
++            ) if "part_ids" in payload else np.zeros(
++                int(np.asarray(payload["positions_o"]).shape[0]), dtype=np.int64),
+             "positions_o_external": np.asarray(
+                 payload["positions_o_external"],
+                 dtype=np.float32,
+--- a/utils/anchor_tracking.py
++++ b/utils/anchor_tracking.py
+@@ -34,6 +34,37 @@
+     return uv.astype(np.float32), depth.astype(np.float32)
+ 
+ 
++def pose_anchors_at_joint_angle(
++    anchors_o: np.ndarray,
++    part_ids: np.ndarray,
++    joint_axis_o: np.ndarray,
++    joint_origin_o: np.ndarray,
++    theta: float,
++    *,
++    moving_part_id: int = 1,
++) -> np.ndarray:
++    """Canonical anchors with the moving part swung to ``theta``, still in object frame.
++
++    This is the whole of what articulation adds to the front half of the tracker.
++    Once the anchors are posed, the object is rigid again for everything downstream:
++    projection, flow lookup, grouping across views and triangulation never need to
++    know a joint exists, because none of them can tell a moved anchor from an anchor
++    that was always there. Only the fit at the end has to model the joint, because
++    only it has to invert this.
++    """
++    from utils.multiview_geometry import joint_transform
++
++    anchors = np.asarray(anchors_o, dtype=np.float32)
++    moving = np.asarray(part_ids).reshape(-1) == int(moving_part_id)
++    if not moving.any():
++        return anchors
++    transform = joint_transform(joint_axis_o, joint_origin_o, float(theta))
++    posed = anchors.copy()
++    posed[moving] = (anchors[moving].astype(np.float64) @ transform[:3, :3].T
++                     + transform[:3, 3]).astype(np.float32)
++    return posed
++
++
+ def project_anchors_to_view(
+     anchors_o: np.ndarray,
+     pose_world_from_object: np.ndarray,
+@@ -43,13 +74,26 @@
+     *,
+     rendered_depth: np.ndarray | None = None,
+     depth_tolerance: float = 0.01,
++    part_ids: np.ndarray | None = None,
++    joint_axis_o: np.ndarray | None = None,
++    joint_origin_o: np.ndarray | None = None,
++    theta: float = 0.0,
++    moving_part_id: int = 1,
+ ) -> dict[str, np.ndarray]:
+     anchors_o = np.asarray(anchors_o, dtype=np.float32)
++    # Swing before projecting. The returned ``anchors_o`` stays canonical -- callers
++    # feed it back to the fit, which expects unposed anchors and the angle
++    # separately, so posing it here would apply the joint twice.
++    anchors_posed = anchors_o
++    if part_ids is not None and joint_axis_o is not None and joint_origin_o is not None:
++        anchors_posed = pose_anchors_at_joint_angle(
++            anchors_o, part_ids, joint_axis_o, joint_origin_o, theta,
++            moving_part_id=moving_part_id)
+     pose_world_from_object = _coerce_pose_matrix(pose_world_from_object)
+     extrinsic_cw = _coerce_pose_matrix(extrinsic_cw)
+     image_width, image_height = int(image_size[0]), int(image_size[1])
+ 
+-    points_world = transform_points(anchors_o, pose_world_from_object)
++    points_world = transform_points(anchors_posed, pose_world_from_object)
+     points_camera = transform_points(points_world, extrinsic_cw)
+     uv, depth = project_points_camera(points_camera, intrinsic)
+ 
+@@ -77,6 +121,7 @@
+ 
+     return {
+         "anchors_o": anchors_o,
++        "anchors_posed_o": anchors_posed,
+         "points_world": points_world,
+         "points_camera": points_camera,
+         "uv": uv,
+--- a/utils/renderer_nvdiffrast.py
++++ b/utils/renderer_nvdiffrast.py
+@@ -46,6 +46,10 @@
+         self.backend_name = "nvdiffrast_cuda"
+         self.object_meshes: Dict[int, trimesh.Trimesh] = {}
+         self._mesh_cache: Dict[int, Dict[str, torch.Tensor]] = {}
++        # Articulation, empty for every rigid object and therefore inert by default.
++        self._object_joints: Dict[int, Dict[str, Any]] = {}
++        self._object_joint_angles: Dict[int, float] = {}
++        self._posed_mesh_cache: Dict[int, tuple] = {}
+         self._contexts: Dict[int, Any] = {}
+ 
+         requested_device = torch.device(
+@@ -203,14 +207,94 @@
+                 )
+             return buffers
+ 
++    def set_object_joint(
++        self,
++        obj_id: int,
++        moving_vertex_mask: np.ndarray,
++        axis_o: np.ndarray,
++        origin_o: np.ndarray,
++    ) -> None:
++        """Declare one revolute joint on an already-registered object.
++
++        ``moving_vertex_mask`` selects the vertices on the far side of the joint,
++        indexed against the mesh as registered. ``origin_o`` must be in that mesh's
++        units -- the renderer works in metres, and a mesh loaded from disk here is
++        divided by 1000, so an origin taken from a millimetre asset will put the
++        hinge a thousand times too far away and quietly bend the object around a
++        point outside the room.
++
++        The alternative was to rebuild the mesh every time the angle moved, which
++        re-uploads vertices, faces and textures for a 326k-face model on every
++        frame. Only the vertices move, so only the vertices are recomputed, and the
++        face and texture buffers are never touched.
++        """
++        buffers = self._get_object_buffers(obj_id)
++        mask = np.asarray(moving_vertex_mask, dtype=bool).reshape(-1)
++        if mask.shape[0] != int(buffers["vertices"].shape[0]):
++            raise ValueError(
++                f"moving_vertex_mask has {mask.shape[0]} entries but object {obj_id} "
++                f"has {int(buffers['vertices'].shape[0])} vertices"
++            )
++        axis = np.asarray(axis_o, dtype=np.float64).reshape(3)
++        norm = float(np.linalg.norm(axis))
++        if norm < 1.0e-12:
++            raise ValueError("Joint axis is degenerate")
++        with torch.cuda.device(self.device):
++            self._object_joints[obj_id] = {
++                "mask": torch.as_tensor(mask, dtype=torch.bool, device=self.device),
++                "axis": np.asarray(axis / norm, dtype=np.float64),
++                "origin": np.asarray(origin_o, dtype=np.float64).reshape(3),
++            }
++        self._object_joint_angles.pop(obj_id, None)
++        self._posed_mesh_cache.pop(obj_id, None)
++
++    def set_object_joint_angle(self, obj_id: int, theta: float) -> None:
++        """Set the current joint angle. Cheap to call; recompute is lazy and cached."""
++        if obj_id not in self._object_joints:
++            raise ValueError(f"Object {obj_id} has no joint; call set_object_joint first")
++        self._object_joint_angles[obj_id] = float(theta)
++
+     def _get_object_buffers(self, obj_id: int) -> Dict[str, torch.Tensor]:
+         if obj_id not in self._mesh_cache:
+             self.add_object_model(obj_id=obj_id)
+-        return self._mesh_cache[obj_id]
++        buffers = self._mesh_cache[obj_id]
++        joint = self._object_joints.get(obj_id)
++        if joint is None:
++            return buffers
++        theta = float(self._object_joint_angles.get(obj_id, 0.0))
++
++        # Every camera in a frame renders at the same angle -- twenty-two of them on
++        # this rig -- so the posed vertices are built once per angle, not once per
++        # render.
++        cached = self._posed_mesh_cache.get(obj_id)
++        if cached is not None and cached[0] == theta:
++            return cached[1]
++
++        from utils.multiview_geometry import joint_transform
++
++        transform = joint_transform(joint["axis"], joint["origin"], theta)
++        with torch.cuda.device(self.device):
++            rotation = torch.as_tensor(
++                transform[:3, :3], dtype=torch.float32, device=self.device)
++            translation = torch.as_tensor(
++                transform[:3, 3], dtype=torch.float32, device=self.device)
++            mask = joint["mask"]
++            posed = dict(buffers)
++            vertices = buffers["vertices"].clone()
++            vertices[mask] = vertices[mask] @ rotation.T + translation
++            posed["vertices"] = vertices
++            # Normals rotate but do not translate; leaving them unrotated would light
++            # the moving part as though it had never turned.
++            normals = buffers["normals"].clone()
++            normals[mask] = normals[mask] @ rotation.T
++            posed["normals"] = normals
++        self._posed_mesh_cache[obj_id] = (theta, posed)
++        return posed
+ 
+     def free_object_buffers(self, obj_id: int) -> None:
+         """Release GPU buffers for a single object."""
+         self._mesh_cache.pop(obj_id, None)
++        self._posed_mesh_cache.pop(obj_id, None)
+ 
+     def add_object_model(
+         self,
+--- a/archive/run_multiview_gotrack_anchor_online.py
++++ b/archive/run_multiview_gotrack_anchor_online.py
+@@ -51,6 +51,7 @@
+ from run_multiview_gotrack_visualize import render_world_pose_visualizations
+ from utils import im_util
+ from utils.anchor_bank import (
++    articulation_from_anchor_bank,
+     load_anchor_bank,
+     prepare_anchor_bank_for_gotrack,
+     sample_mesh_anchors,
+@@ -448,8 +449,14 @@
+     external_unit_scale_to_meter: float,
+     compact_observations: bool = False,
+     keep_per_view_anchor_data: bool = True,
++    theta: float = 0.0,
+ ) -> tuple[dict[str, dict[str, np.ndarray]], Any, dict[str, Any]]:
+     per_view_anchor_data: dict[str, dict[str, np.ndarray]] = {}
++    # For an articulated object the anchors on the moving part have to be swung to
++    # the current angle before they are projected, or the flow is read at the pixels
++    # the lid occupied some frames ago. Everything after the projection stays rigid
++    # and untouched -- see ``pose_anchors_at_joint_angle``.
++    articulation = articulation_from_anchor_bank(anchor_bank, units="external")
+     observations_by_anchor: dict[int, list[dict[str, Any]]] = {}
+     compact_anchor_id_chunks: list[np.ndarray] = []
+     compact_camera_ids: list[str] = []
+@@ -535,6 +542,13 @@
+                 else np.asarray(rendered_depth, dtype=np.float32)
+             ),
+             depth_tolerance=float(args.anchor_depth_tolerance_m) / float(external_unit_scale_to_meter),
++            **({} if articulation is None else {
++                "part_ids": articulation["part_ids"],
++                "joint_axis_o": articulation["joint_axis_o"],
++                "joint_origin_o": articulation["joint_origin_o"],
++                "theta": float(theta),
++                "moving_part_id": articulation["moving_part_id"],
++            }),
+         )
+         observations = build_anchor_observations_for_view(
+             anchor_bank=anchor_bank,
+@@ -694,6 +708,18 @@
+         "mean_triangulation_residual_mm": float(
+             np.mean([record["triangulation_residual_mm"] for record in triangulation_records])
+         ) if triangulation_records else 0.0,
++        # Present only for an articulated object. ``theta_observed`` false means the
++        # moving part had too few anchors this frame and the angle was carried over
++        # rather than measured; ``theta_clamped`` means the joint limit bound and the
++        # value is censored. Both are recorded because a downstream reader cannot
++        # tell either case from a genuine measurement by looking at the angle.
++        **({} if "theta_rad" not in fit_result else {
++            "theta_rad": float(fit_result["theta_rad"]),
++            "theta_deg": float(fit_result["theta_deg"]),
++            "theta_observed": bool(fit_result.get("theta_observed", False)),
++            "theta_clamped": bool(fit_result.get("theta_clamped", False)),
++            "num_moving_anchors": int(fit_result.get("num_moving_anchors", 0)),
++        }),
+         "views": [
+             {"camera_id": str(camera_id), **summary}
+             for camera_id, summary in per_view_summary.items()
+--- a/archive/run_multiview_gotrack_anchor_online_multi_object.py
++++ b/archive/run_multiview_gotrack_anchor_online_multi_object.py
+@@ -2,6 +2,7 @@
+ from __future__ import annotations
+ 
+ import argparse
++import json
+ import multiprocessing as mp
+ import os
+ import time
+@@ -58,8 +59,11 @@
+     _build_devices,
+ )
+ from utils.anchor_bank import (
++    articulation_from_anchor_bank,
++    fuse_articulated_parts,
+     load_anchor_bank,
+     prepare_anchor_bank_for_gotrack,
++    sample_articulated_mesh_anchors,
+     sample_mesh_anchors,
+     save_anchor_bank,
+     summarize_anchor_bank,
+@@ -68,6 +72,7 @@
+ from utils import structs
+ from utils.multiview_geometry import (
+     build_fit_weights_from_triangulation_records,
++    robust_fit_articulated_pose_from_anchors,
+     robust_fit_pose_from_anchors,
+     triangulate_anchor_observations,
+ )
+@@ -155,6 +160,13 @@
+     per_camera_fused_records: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+     per_camera_singleview_results: dict[str, dict[str, Any]] = field(default_factory=dict)
+     previous_fused_world_pose: np.ndarray | None = None
++    # Rigid objects leave this at zero and never read it. For an articulated one
++    # it is the running joint angle: the seed for the next frame's fit, the angle
++    # the anchors are swung to before projection, and the reference that keeps the
++    # reported series continuous instead of jumping a turn at +/-180 deg.
++    theta: float = 0.0
++    theta_observed: bool = False
++    renderer_joint_ready: bool = False
+     processed_frames: int = 0
+     total_ok_singleview_frames: int = 0
+     total_pose_ok_singleview_frames: int = 0
+@@ -192,6 +204,10 @@
+     diameter_mm: float | None
+     diameter_source: str
+     observations_by_anchor: Any
++    # Small enough to pickle per frame, unlike the anchor bank. ``None`` for a
++    # rigid object, which keeps the worker on the original code path.
++    articulation: dict[str, Any] | None
++    theta: float
+     intrinsics_map: dict[str, np.ndarray]
+     extrinsics_map: dict[str, np.ndarray]
+     # Full argparse.Namespace (picklable) — avoids future breakage if the
+@@ -641,6 +657,37 @@
+     parser.add_argument("--anchor-fit-inlier-threshold-mm", type=float, default=-1.0)
+     parser.add_argument("--anchor-fit-min-anchors", type=int, default=6)
+     parser.add_argument(
++        "--anchor-fit-min-moving-anchors", type=int, default=3,
++        help=(
++            "Articulated objects only. Below this many anchors on the moving part the "
++            "joint angle is not observable from the frame, and it is carried over and "
++            "flagged rather than fitted to whatever few points remain."
++        ),
++    )
++    parser.add_argument(
++        "--init-theta-deg", type=float, nargs="*", default=None,
++        help=(
++            "Articulated objects only, one value per object. The joint angle to start "
++            "from, which together with the initial 6-DoF pose is the seven-degree-of-"
++            "freedom initialisation. Also read from the init pose records when they "
++            "carry a 'theta_deg', which is where the articulated silhouette pipeline "
++            "already writes it. Leaving it at zero starts a lid that is actually open "
++            "from closed, and the templates render closed too, so the anchors on the "
++            "lid never pass the visibility test and the angle can never recover."
++        ),
++    )
++    parser.add_argument(
++        "--articulation-json", type=str, default=None,
++        help=(
++            "Articulated objects only. A joint description used when an anchor bank "
++            "has to be generated: {\"parts\": [body_obj, lid_obj], \"axis\": [3], "
++            "\"origin\": [3], \"range_rad\": [lo, hi]}, all in the mesh's own units "
++            "and frame. The measured joint written by the articulation pipeline is "
++            "already in this shape. An existing bank carries its own joint and ignores "
++            "this. Omit it and every object is tracked rigidly, as before."
++        ),
++    )
++    parser.add_argument(
+         "--confidence-weight-mode",
+         type=str,
+         default="linear",
+@@ -735,6 +782,32 @@
+     if anchor_bank_path.is_file():
+         return load_anchor_bank(anchor_bank_path), anchor_bank_path
+     anchor_bank_path.parent.mkdir(parents=True, exist_ok=True)
++    articulation_json = getattr(args, "articulation_json", None)
++    if articulation_json:
++        joint = json.loads(Path(articulation_json).expanduser().read_text(encoding="utf-8"))
++        # Accept the articulation pipeline's own file shape, which nests the joint
++        # recovered from the two scans under "measured" next to a predicted one that
++        # is deliberately not used.
++        if "measured" in joint:
++            joint = {**joint["measured"], "parts": joint.get("parts")}
++        parts = joint.get("parts")
++        if not parts:
++            # Default to the layout the articulation pipeline writes beside joint.json.
++            root = Path(articulation_json).expanduser().parent
++            parts = [str(root / "parts/body.obj"), str(root / "parts/lid.obj")]
++        anchor_bank = sample_articulated_mesh_anchors(
++            part_mesh_paths=parts,
++            num_anchors=args.num_anchors,
++            joint_axis_o=joint["axis"],
++            joint_origin_o=joint["origin"],
++            mesh_scale=args.mesh_scale,
++            method=args.anchor_method,
++            seed=args.anchor_seed,
++            part_names=["body", "lid"],
++            theta_limits_rad=joint.get("range_rad"),
++        )
++        save_anchor_bank(anchor_bank_path, anchor_bank)
++        return anchor_bank, anchor_bank_path
+     anchor_bank = sample_mesh_anchors(
+         mesh_path=mesh_path,
+         num_anchors=args.num_anchors,
+@@ -835,6 +908,7 @@
+             ),
+             compact_observations=True,
+             keep_per_view_anchor_data=keep_per_view_anchor_data,
++            theta=float(object_state.theta),
+         )
+     )
+     anchor_obs_runtime_sec = time.perf_counter() - obs_start_time
+@@ -863,6 +937,9 @@
+         diameter_mm=object_state.diameter_mm,
+         diameter_source=str(object_state.diameter_source),
+         observations_by_anchor=observations_by_anchor,
++        articulation=articulation_from_anchor_bank(
++            object_state.anchor_bank, units="external"),
++        theta=float(object_state.theta),
+         intrinsics_map=intrinsics_map,
+         extrinsics_map=extrinsics_map,
+         args=args,
+@@ -939,18 +1016,50 @@
+             geometry_parallax_power=float(args.geometry_fit_parallax_power),
+             geometry_min_weight=float(args.geometry_fit_min_weight),
+         )
+-        fit_result = robust_fit_pose_from_anchors(
+-            source_points_o=np.asarray(
+-                triangulation_result["positions_o"], dtype=np.float32
+-            ),
+-            target_points_w=np.asarray(
+-                triangulation_result["positions_w"], dtype=np.float32
+-            ),
+-            weights=fit_weights,
+-            inlier_threshold_mm=float(thresholds.anchor_fit_inlier_mm),
+-            min_anchors=int(args.anchor_fit_min_anchors),
+-            external_unit_scale_to_meter=payload.external_unit_scale_to_meter,
++        source_points_o = np.asarray(
++            triangulation_result["positions_o"], dtype=np.float32
++        )
++        target_points_w = np.asarray(
++            triangulation_result["positions_w"], dtype=np.float32
+         )
++        if payload.articulation is None:
++            fit_result = robust_fit_pose_from_anchors(
++                source_points_o=source_points_o,
++                target_points_w=target_points_w,
++                weights=fit_weights,
++                inlier_threshold_mm=float(thresholds.anchor_fit_inlier_mm),
++                min_anchors=int(args.anchor_fit_min_anchors),
++                external_unit_scale_to_meter=payload.external_unit_scale_to_meter,
++            )
++        else:
++            # Triangulation keeps every record's ``anchor_id``, and that is the index
++            # into the anchor bank, so the part labels can be looked up here rather
++            # than carried through observation building, grouping and triangulation --
++            # none of which have any use for them. Records are a filtered subset by
++            # this point, so the lookup has to go through the ids and not position.
++            articulation = payload.articulation
++            anchor_ids = np.asarray(
++                [int(record["anchor_id"]) for record in triangulation_result["records"]],
++                dtype=np.int64,
++            )
++            fit_result = robust_fit_articulated_pose_from_anchors(
++                source_points_o=source_points_o,
++                target_points_w=target_points_w,
++                weights=fit_weights,
++                part_ids=np.asarray(articulation["part_ids"], dtype=np.int64)[anchor_ids],
++                axis_o=articulation["joint_axis_o"],
++                origin_o=articulation["joint_origin_o"],
++                inlier_threshold_mm=float(thresholds.anchor_fit_inlier_mm),
++                min_anchors=int(args.anchor_fit_min_anchors),
++                min_moving_anchors=int(
++                    getattr(args, "anchor_fit_min_moving_anchors", 3)),
++                external_unit_scale_to_meter=payload.external_unit_scale_to_meter,
++                theta_init=float(payload.theta),
++                # Report in the half turn around the previous angle, so a lid that
++                # opens past 180 deg keeps counting up instead of wrapping negative.
++                theta_reference_rad=float(payload.theta),
++                theta_limits_rad=articulation["theta_limits_rad"],
++            )
+     else:
+         fit_result = {
+             "status": "skipped_fit",
+@@ -1138,13 +1247,13 @@
+     extrinsics_map: dict[str, np.ndarray],
+ ) -> list[ObjectRuntimeState]:
+     object_states: list[ObjectRuntimeState] = []
+-    for object_name, object_id, mesh_path_raw, init_pose_source_raw, anchor_bank_path_raw in zip(
++    for object_index, (object_name, object_id, mesh_path_raw, init_pose_source_raw, anchor_bank_path_raw) in enumerate(zip(
+         args.object_names,
+         args.object_ids,
+         args.mesh_paths,
+         args.init_pose_sources,
+         args.anchor_bank_paths,
+-    ):
++    )):
+         mesh_path = Path(mesh_path_raw).expanduser().resolve()
+         init_pose_source = Path(init_pose_source_raw).expanduser().resolve()
+         output_dir = (output_root / str(object_name)).expanduser().resolve()
+@@ -1247,6 +1356,26 @@
+             per_camera_fused_records=per_camera_fused_records,
+             per_camera_singleview_results=per_camera_singleview_results,
+         )
++        # Seed the joint angle. The init pose records are the natural home for it --
++        # they already carry the 6-DoF half of the same estimate -- and the flag is
++        # there for records written before articulation existed.
++        init_theta_list = getattr(args, "init_theta_deg", None) or []
++        seed_theta_deg = (float(init_theta_list[object_index])
++                          if object_index < len(init_theta_list) else None)
++        if seed_theta_deg is None:
++            for lookup in init_pose_lookups.values():
++                for record in lookup.values():
++                    if "theta_deg" in record:
++                        seed_theta_deg = float(record["theta_deg"])
++                        break
++                if seed_theta_deg is not None:
++                    break
++        if seed_theta_deg is not None:
++            object_state.theta = float(np.radians(seed_theta_deg))
++            _status_print(
++                f"[articulated] {object_state.object_name}: initial joint angle "
++                f"{seed_theta_deg:.2f} deg"
++            )
+         _status_print(
+             "[gotrack_multiview_anchor_online_multi_object] object prepared | "
+             f"name={object_state.object_name} object_id={object_state.object_id} "
+@@ -1354,6 +1483,11 @@
+             f"{device} in {time.perf_counter() - renderer_start:.1f}s "
+             f"(objects={[object_state.object_name for object_state in object_states]})"
+         )
++        _register_articulated_joints_on_renderer(
++            renderer=getattr(model, "renderer", None),
++            object_states=object_states,
++            args=args,
++        )
+         states.append(
+             DeviceState(
+                 device=device,
+@@ -1365,6 +1499,64 @@
+     return states
+ 
+ 
++def _register_articulated_joints_on_renderer(
++    *,
++    renderer: Any,
++    object_states: list[ObjectRuntimeState],
++    args: argparse.Namespace,
++) -> None:
++    """Tell the renderer which vertices swing, for every object whose bank has a joint.
++
++    Done once per device. The mesh registered by ``configure_renderer_multi`` is
++    whatever ``--mesh-paths`` pointed at, and for an articulated object that has to
++    be the parts concatenated in the same order the anchor bank used -- otherwise
++    the moving-vertex mask selects the wrong half of the model. Rather than trust a
++    pre-fused asset, the parts are concatenated here and the result replaces the
++    registered mesh, which is the only way the two orderings are guaranteed to
++    agree.
++
++    An object without a joint is left exactly as it was.
++    """
++    if renderer is None or not hasattr(renderer, "set_object_joint"):
++        return
++    for object_state in object_states:
++        articulation = articulation_from_anchor_bank(
++            object_state.anchor_bank, units="external")
++        if articulation is None:
++            continue
++        parts = (object_state.anchor_bank.get("metadata") or {}).get("part_mesh_paths")
++        if not parts:
++            _status_print(
++                f"[articulated] {object_state.object_name}: bank has a joint but no part "
++                "meshes recorded; templates would render the rigid mesh, so the joint "
++                "is not registered"
++            )
++            continue
++
++        # The renderer works in metres and divides a disk-loaded mesh by 1000, so
++        # rebuild through the same path the anchors used and scale to match.
++        scale_to_meter = float(
++            object_state.unit_scale_info.external_unit_scale_to_meter)
++        fused, moving = fuse_articulated_parts(parts, mesh_scale=scale_to_meter)
++        object_id = int(object_state.object_id)
++        renderer.free_object_buffers(object_id)
++        renderer.object_meshes[object_id] = fused
++        renderer.add_object_model(obj_id=object_id)
++        renderer.set_object_joint(
++            obj_id=object_id,
++            moving_vertex_mask=moving,
++            axis_o=articulation["joint_axis_o"],
++            origin_o=np.asarray(articulation["joint_origin_o"]) * scale_to_meter,
++        )
++        renderer.set_object_joint_angle(object_id, float(object_state.theta))
++        object_state.renderer_joint_ready = True
++        _status_print(
++            f"[articulated] {object_state.object_name}: joint registered, "
++            f"{int(moving.sum())}/{len(moving)} vertices on the moving part, "
++            f"parts={[Path(p).name for p in parts]}"
++        )
++
++
+ def _process_group_for_timestep_anchor_multi(
+     *,
+     device_state: DeviceState,
+@@ -1382,6 +1574,18 @@
+     results: dict[str, dict[str, dict[str, Any]]] = {
+         object_state.object_name: {} for object_state in active_objects
+     }
++    # Templates are rendered from the object's mesh, so an articulated object has to
++    # have its lid put where the tracker currently believes it is before any camera
++    # renders. Skipping this does not fail loudly: the templates keep showing a
++    # closed box, the depth-based visibility test then rejects every anchor on the
++    # open lid, and the angle stays frozen at whatever it was initialised to while
++    # the body keeps tracking perfectly.
++    renderer = getattr(device_state.model, "renderer", None)
++    if renderer is not None and hasattr(renderer, "set_object_joint_angle"):
++        for object_state in active_objects:
++            if getattr(object_state, "renderer_joint_ready", False):
++                renderer.set_object_joint_angle(
++                    int(object_state.object_id), float(object_state.theta))
+     pending_metadata: list[tuple[str, str, dict[str, Any], np.ndarray]] = []
+     pending_scene_observations: list[Any] = []
+     pending_direct_samples: list[dict[str, Any]] = []
+@@ -2515,6 +2719,12 @@
+                         context["current_pose"] = coerce_homogeneous_matrix(
+                             fit_result["pose_world_from_object"]
+                         )
++                        # Feed the angle back between refinement iterations too, so
++                        # the next projection swings the anchors to where this
++                        # iteration just put them.
++                        if fit_result.get("theta_observed"):
++                            object_state.theta = float(fit_result["theta_rad"])
++                            object_state.theta_observed = True
+                     else:
+                         if int(context["target_iters"]) > 1:
+                             _status_print(
+@@ -2602,6 +2812,13 @@
+                     object_state.previous_fused_world_pose = coerce_homogeneous_matrix(
+                         world_record["pose_world"]
+                     )
++                    # Advance the joint angle only when this frame actually measured
++                    # it. Writing back a carried-over value would make the next frame
++                    # unable to tell a held angle from a fresh one, and a run of
++                    # occluded frames would look like a confidently static lid.
++                    if world_record.get("theta_observed"):
++                        object_state.theta = float(world_record["theta_rad"])
++                        object_state.theta_observed = True
+                     ok_worlds += 1
+                 else:
+                     object_state.previous_fused_world_pose = None
+--- a/tests/test_articulated_fit.py
++++ b/tests/test_articulated_fit.py
+@@ -0,0 +1,227 @@
++#!/usr/bin/env python3
++"""Recover a known body pose and joint angle from anchors that have been corrupted.
++
++The articulated fit is the one piece of the articulated tracker that can be checked
++without a GPU, a renderer, or a capture: build anchors from a pose and an angle that
++are known exactly, damage them the way the real pipeline will, and see what comes
++back. Everything downstream inherits whatever this gets wrong, so it is worth
++testing on its own before any of it exists.
++
++Run: python tests/test_articulated_fit.py
++"""
++
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++
++import numpy as np
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from utils.multiview_geometry import (  # noqa: E402
++    compute_articulated_fit_residuals,
++    fit_articulated_transform_weighted,
++    fit_joint_angle_weighted,
++    joint_transform,
++    robust_fit_articulated_pose_from_anchors,
++)
++
++# Roughly the blue box: a 180 x 140 x 120 mm body, hinged along its top rear edge,
++# with the lid extending forward from that hinge. Metres, matching the capture.
++AXIS = np.array([1.0, 0.0, 0.0])
++ORIGIN = np.array([0.0, 0.07, 0.06])
++FAILURES: list[str] = []
++
++
++def _random_pose(rng: np.random.Generator) -> np.ndarray:
++    axis = rng.normal(size=3)
++    axis /= np.linalg.norm(axis)
++    angle = rng.uniform(0.0, np.pi)
++    cross = np.array([[0.0, -axis[2], axis[1]],
++                      [axis[2], 0.0, -axis[0]],
++                      [-axis[1], axis[0], 0.0]])
++    pose = np.eye(4)
++    pose[:3, :3] = (np.eye(3) + np.sin(angle) * cross
++                    + (1.0 - np.cos(angle)) * (cross @ cross))
++    pose[:3, 3] = rng.uniform(-0.5, 0.5, size=3)
++    return pose
++
++
++def _anchors(rng: np.random.Generator, n_body: int = 120, n_lid: int = 80):
++    body = np.column_stack([rng.uniform(-0.09, 0.09, n_body),
++                            rng.uniform(-0.07, 0.07, n_body),
++                            rng.uniform(-0.06, 0.06, n_body)])
++    # The lid hangs off the hinge, so its anchors have a real lever arm about the
++    # axis -- anchors sitting on the axis carry no angle information at all.
++    lid = np.column_stack([rng.uniform(-0.09, 0.09, n_lid),
++                           rng.uniform(0.07, 0.21, n_lid),
++                           rng.uniform(0.055, 0.065, n_lid)])
++    source = np.vstack([body, lid])
++    parts = np.concatenate([np.zeros(n_body, dtype=int), np.ones(n_lid, dtype=int)])
++    return source, parts
++
++
++def _observe(source, parts, pose, theta):
++    posed = source.copy()
++    moving = parts == 1
++    transform = joint_transform(AXIS, ORIGIN, theta)
++    posed[moving] = source[moving] @ transform[:3, :3].T + transform[:3, 3]
++    return posed @ pose[:3, :3].T + pose[:3, 3]
++
++
++def _check(name: str, condition: bool, detail: str = "") -> None:
++    print(f"  {'PASS' if condition else 'FAIL'}  {name}{'  ' + detail if detail else ''}")
++    if not condition:
++        FAILURES.append(name)
++
++
++def test_exact() -> None:
++    """No noise: the answer should come back to numerical precision."""
++    print("\nexact anchors")
++    rng = np.random.default_rng(0)
++    for theta_true_deg in (0.0, 47.4, 163.6, 215.0):
++        pose_true = _random_pose(rng)
++        source, parts = _anchors(rng)
++        target = _observe(source, parts, pose_true, np.radians(theta_true_deg))
++        pose, theta, rounds = fit_articulated_transform_weighted(
++            source, target, np.ones(len(source)), parts, AXIS, ORIGIN)
++        angle_error = np.degrees(abs(np.arctan2(
++            np.sin(theta - np.radians(theta_true_deg)),
++            np.cos(theta - np.radians(theta_true_deg)))))
++        shift = np.linalg.norm(pose[:3, 3] - pose_true[:3, 3]) * 1000.0
++        _check(f"theta {theta_true_deg:6.1f} deg recovered", angle_error < 1.0e-3,
++               f"err {angle_error:.2e} deg, {shift:.2e} mm, {rounds} rounds")
++
++
++def test_theta_from_body_frame() -> None:
++    """The one-dimensional solve, isolated from the pose."""
++    print("\njoint angle alone, body frame")
++    rng = np.random.default_rng(1)
++    source, parts = _anchors(rng)
++    lid = source[parts == 1]
++    for theta_true_deg in (-30.0, 0.0, 90.0, 215.0):
++        transform = joint_transform(AXIS, ORIGIN, np.radians(theta_true_deg))
++        target = lid @ transform[:3, :3].T + transform[:3, 3]
++        theta = fit_joint_angle_weighted(lid, target, np.ones(len(lid)), AXIS, ORIGIN)
++        error = np.degrees(abs(np.arctan2(np.sin(theta - np.radians(theta_true_deg)),
++                                          np.cos(theta - np.radians(theta_true_deg)))))
++        _check(f"theta {theta_true_deg:6.1f} deg", error < 1.0e-6, f"err {error:.2e} deg")
++
++
++def test_noise() -> None:
++    """Anchor noise at the scale triangulation actually delivers."""
++    print("\nGaussian anchor noise")
++    for sigma_mm in (1.0, 3.0, 10.0):
++        errors, shifts = [], []
++        for trial in range(20):
++            rng = np.random.default_rng(100 + trial)
++            pose_true = _random_pose(rng)
++            theta_true = np.radians(rng.uniform(0.0, 215.0))
++            source, parts = _anchors(rng)
++            target = _observe(source, parts, pose_true, theta_true)
++            target = target + rng.normal(scale=sigma_mm / 1000.0, size=target.shape)
++            pose, theta, _ = fit_articulated_transform_weighted(
++                source, target, np.ones(len(source)), parts, AXIS, ORIGIN)
++            errors.append(np.degrees(abs(np.arctan2(np.sin(theta - theta_true),
++                                                    np.cos(theta - theta_true)))))
++            shifts.append(np.linalg.norm(pose[:3, 3] - pose_true[:3, 3]) * 1000.0)
++        _check(f"sigma {sigma_mm:4.1f} mm", float(np.median(errors)) < sigma_mm * 0.5,
++               f"median theta err {np.median(errors):.2f} deg, "
++               f"median shift {np.median(shifts):.2f} mm")
++
++
++def test_outliers() -> None:
++    """Gross outliers, which the inlier refit is there to remove."""
++    print("\noutliers, 20 percent")
++    for trial in range(5):
++        rng = np.random.default_rng(200 + trial)
++        pose_true = _random_pose(rng)
++        theta_true = np.radians(rng.uniform(20.0, 200.0))
++        source, parts = _anchors(rng)
++        target = _observe(source, parts, pose_true, theta_true)
++        target = target + rng.normal(scale=0.002, size=target.shape)
++        corrupt = rng.choice(len(target), size=len(target) // 5, replace=False)
++        target[corrupt] += rng.normal(scale=0.08, size=(len(corrupt), 3))
++
++        result = robust_fit_articulated_pose_from_anchors(
++            source, target, np.ones(len(source)), parts, AXIS, ORIGIN,
++            inlier_threshold_mm=10.0)
++        error = np.degrees(abs(np.arctan2(np.sin(result["theta_rad"] - theta_true),
++                                          np.cos(result["theta_rad"] - theta_true))))
++        _check(f"trial {trial}", error < 2.0,
++               f"theta err {error:5.2f} deg, status {result['status']}, "
++               f"{result['num_inlier_anchors']}/{result['num_input_anchors']} inliers")
++
++
++def test_unobservable_theta() -> None:
++    """No anchors on the moving part: the angle must be held, not invented."""
++    print("\nmoving part invisible")
++    rng = np.random.default_rng(7)
++    pose_true = _random_pose(rng)
++    theta_true = np.radians(120.0)
++    source, parts = _anchors(rng)
++    keep = parts == 0
++    target = _observe(source, parts, pose_true, theta_true)
++
++    result = robust_fit_articulated_pose_from_anchors(
++        source[keep], target[keep], np.ones(int(keep.sum())), parts[keep], AXIS, ORIGIN,
++        inlier_threshold_mm=10.0, theta_init=theta_true)
++    shift = np.linalg.norm(result["pose_world_from_object"][:3, 3] - pose_true[:3, 3]) * 1000.0
++    _check("status reports theta unobserved", result["status"] == "theta_unobserved",
++           f"status {result['status']}, theta_observed={result['theta_observed']}")
++    _check("held angle is returned unchanged",
++           abs(result["theta_rad"] - theta_true) < 1.0e-9)
++    _check("body pose still recovered", shift < 1.0e-3, f"{shift:.2e} mm")
++
++
++def test_clamp_is_flagged() -> None:
++    """A binding limit censors the estimate, and that has to be visible."""
++    print("\njoint limit")
++    rng = np.random.default_rng(11)
++    pose_true = _random_pose(rng)
++    theta_true = np.radians(215.0)
++    source, parts = _anchors(rng)
++    target = _observe(source, parts, pose_true, theta_true)
++
++    loose = robust_fit_articulated_pose_from_anchors(
++        source, target, np.ones(len(source)), parts, AXIS, ORIGIN,
++        inlier_threshold_mm=10.0, theta_limits_rad=(0.0, np.radians(260.0)))
++    tight = robust_fit_articulated_pose_from_anchors(
++        source, target, np.ones(len(source)), parts, AXIS, ORIGIN,
++        inlier_threshold_mm=10.0, theta_limits_rad=(0.0, np.radians(205.8)))
++    _check("within limits, not flagged", not loose["theta_clamped"],
++           f"theta {loose['theta_deg']:.2f} deg")
++    _check("beyond limits, flagged", tight["theta_clamped"],
++           f"theta {tight['theta_deg']:.2f} deg, was {loose['theta_deg']:.2f}")
++
++
++def test_residuals_are_per_part() -> None:
++    """A wrong angle must show up on the moving part and not on the static one."""
++    print("\nresiduals by part")
++    rng = np.random.default_rng(13)
++    pose_true = _random_pose(rng)
++    theta_true = np.radians(100.0)
++    source, parts = _anchors(rng)
++    target = _observe(source, parts, pose_true, theta_true)
++    residuals = compute_articulated_fit_residuals(
++        pose_true, theta_true + np.radians(10.0), source, target, parts, AXIS, ORIGIN)
++    _check("static part unaffected", float(np.max(residuals[parts == 0])) < 1.0e-6,
++           f"max {np.max(residuals[parts == 0]) * 1000.0:.2e} mm")
++    # Not the minimum: an anchor sitting on the hinge has no lever arm, so a wrong
++    # angle genuinely cannot move it. The median is what a 10 deg error should show.
++    _check("moving part shows the error", float(np.median(residuals[parts == 1])) > 0.005,
++           f"median {np.median(residuals[parts == 1]) * 1000.0:.1f} mm, "
++           f"min {np.min(residuals[parts == 1]) * 1000.0:.2f} mm")
++
++
++if __name__ == "__main__":
++    test_exact()
++    test_theta_from_body_frame()
++    test_noise()
++    test_outliers()
++    test_unobservable_theta()
++    test_clamp_is_flagged()
++    test_residuals_are_per_part()
++    print(f"\n{len(FAILURES)} failures" + (f": {FAILURES}" if FAILURES else ""))
++    raise SystemExit(1 if FAILURES else 0)
+--- a/tests/test_articulated_anchor_bank.py
++++ b/tests/test_articulated_anchor_bank.py
+@@ -0,0 +1,196 @@
++#!/usr/bin/env python3
++"""Build an articulated anchor bank from the real box parts and fit against it.
++
++The solver test uses invented anchors. This one uses the actual body and lid meshes
++and the joint measured from the two scans, so it also exercises the parts that only
++break on real data: apportioning anchors between meshes of very different area,
++offsetting face and vertex indices onto the fused mesh, and carrying the joint into
++GoTrack's internal units -- where the origin scales and the axis must not.
++
++Run: python tests/test_articulated_anchor_bank.py
++"""
++
++from __future__ import annotations
++
++import json
++import sys
++import tempfile
++from pathlib import Path
++
++import numpy as np
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from utils.anchor_bank import (  # noqa: E402
++    load_anchor_bank,
++    load_mesh,
++    prepare_anchor_bank_for_gotrack,
++    sample_articulated_mesh_anchors,
++    save_anchor_bank,
++)
++from utils.multiview_geometry import (  # noqa: E402
++    joint_transform,
++    robust_fit_articulated_pose_from_anchors,
++)
++
++PARTS = Path.home() / "shared_data/mesh_new/blue_plastic_box/articulation_particulate"
++FAILURES: list[str] = []
++
++
++def _check(name: str, condition: bool, detail: str = "") -> None:
++    print(f"  {'PASS' if condition else 'FAIL'}  {name}{'  ' + detail if detail else ''}")
++    if not condition:
++        FAILURES.append(name)
++
++
++def main() -> int:
++    joint = json.loads((PARTS / "joint.json").read_text(encoding="utf-8"))["measured"]
++    axis = np.asarray(joint["axis"], dtype=np.float64)
++    origin = np.asarray(joint["origin"], dtype=np.float64)
++    limits = tuple(float(v) for v in joint["range_rad"])
++    body_path, lid_path = PARTS / "parts/body.obj", PARTS / "parts/lid.obj"
++
++    print("\nsampling")
++    bank = sample_articulated_mesh_anchors(
++        [body_path, lid_path], num_anchors=512,
++        joint_axis_o=axis, joint_origin_o=origin,
++        part_names=["body", "lid"], theta_limits_rad=limits, seed=0)
++    parts = bank["part_ids"]
++    meta = bank["metadata"]
++    _check("anchor count honoured", bank["positions_o"].shape[0] == 512,
++           f"{bank['positions_o'].shape[0]} anchors")
++    _check("both parts sampled", set(np.unique(parts).tolist()) == {0, 1},
++           f"body {int((parts == 0).sum())}, lid {int((parts == 1).sum())}")
++
++    # Density, not count, should match: the lid is much the smaller part.
++    areas = meta["part_areas"]
++    density = [int((parts == i).sum()) / areas[i] for i in (0, 1)]
++    _check("density is uniform across parts",
++           abs(density[0] - density[1]) / max(density) < 0.05,
++           f"{density[0]:.0f} vs {density[1]:.0f} anchors per m^2, "
++           f"areas {areas[0]:.4f} / {areas[1]:.4f} m^2")
++
++    body_mesh, lid_mesh = load_mesh(body_path), load_mesh(lid_path)
++    n_body_faces = int(np.asarray(body_mesh.faces).shape[0])
++    n_body_verts = int(np.asarray(body_mesh.vertices).shape[0])
++    total_faces = n_body_faces + int(np.asarray(lid_mesh.faces).shape[0])
++    _check("face indices land on the fused mesh",
++           int(bank["face_indices"][parts == 0].max()) < n_body_faces
++           and int(bank["face_indices"][parts == 1].min()) >= n_body_faces
++           and int(bank["face_indices"].max()) < total_faces,
++           f"body < {n_body_faces} <= lid, max {int(bank['face_indices'].max())}")
++    _check("vertex indices offset with them",
++           int(bank["vertex_indices"][parts == 1].min()) >= n_body_verts)
++
++    print("\ngotrack units")
++    scale = 1000.0  # metres in, millimetres inside GoTrack
++    prepared = prepare_anchor_bank_for_gotrack(bank, translation_scale_to_gotrack=scale)
++    pm = prepared["metadata"]
++    _check("origin scales with the anchors",
++           np.allclose(pm["joint_origin_o_gotrack"], origin * scale),
++           f"{np.asarray(pm['joint_origin_o_gotrack']).round(2).tolist()}")
++    _check("axis does not scale",
++           np.allclose(pm["joint_axis_o_gotrack"], axis / np.linalg.norm(axis))
++           and abs(np.linalg.norm(pm["joint_axis_o_gotrack"]) - 1.0) < 1e-9)
++
++    print("\nsave and load")
++    with tempfile.TemporaryDirectory() as tmp:
++        path = Path(tmp) / "bank.npz"
++        save_anchor_bank(path, prepared)
++        restored = load_anchor_bank(path)
++    _check("part ids survive the round trip",
++           np.array_equal(restored["part_ids"], parts))
++    _check("joint survives the round trip",
++           np.allclose(restored["metadata"]["joint_axis_o"], pm["joint_axis_o"])
++           and np.allclose(restored["metadata"]["joint_origin_o"], pm["joint_origin_o"]))
++
++    print("\nfit against this bank")
++    rng = np.random.default_rng(0)
++    source = restored["positions_o"].astype(np.float64)
++    for theta_true_deg in (0.0, 47.4, 163.6, 205.7):
++        pose_true = np.eye(4)
++        pose_true[:3, 3] = [0.4, -0.1, 0.25]
++        angle = np.radians(37.0)
++        pose_true[:3, :3] = np.array([[np.cos(angle), -np.sin(angle), 0.0],
++                                      [np.sin(angle), np.cos(angle), 0.0],
++                                      [0.0, 0.0, 1.0]])
++        posed = source.copy()
++        moving = parts == 1
++        transform = joint_transform(axis, origin, np.radians(theta_true_deg))
++        posed[moving] = source[moving] @ transform[:3, :3].T + transform[:3, 3]
++        target = posed @ pose_true[:3, :3].T + pose_true[:3, 3]
++        target += rng.normal(scale=0.003, size=target.shape)   # 3 mm triangulation noise
++
++        result = robust_fit_articulated_pose_from_anchors(
++            source, target, np.ones(len(source)), parts, axis, origin,
++            inlier_threshold_mm=15.0, theta_limits_rad=limits)
++        error = abs(result["theta_deg"] - theta_true_deg)
++        shift = np.linalg.norm(
++            result["pose_world_from_object"][:3, 3] - pose_true[:3, 3]) * 1000.0
++        _check(f"theta {theta_true_deg:6.1f} deg", error < 1.0 and not result["theta_clamped"],
++               f"err {error:.3f} deg, shift {shift:.2f} mm, "
++               f"{result['num_inlier_anchors']}/{result['num_input_anchors']} inliers")
++
++    # Projection and fit have to be exact inverses. Each is self-consistent on its
++    # own even if the joint is applied twice, or with the wrong sign, or in the wrong
++    # frame -- the error only shows when one is asked to undo the other.
++    print("\nprojection and fit agree")
++    from utils.anchor_tracking import project_anchors_to_view  # noqa: E402
++
++    pose_true = np.eye(4)
++    pose_true[:3, 3] = [0.35, -0.05, 0.30]
++    tilt = np.radians(20.0)
++    pose_true[:3, :3] = np.array([[1.0, 0.0, 0.0],
++                                  [0.0, np.cos(tilt), -np.sin(tilt)],
++                                  [0.0, np.sin(tilt), np.cos(tilt)]])
++    intrinsic = np.array([[900.0, 0.0, 640.0], [0.0, 900.0, 480.0], [0.0, 0.0, 1.0]])
++    extrinsic = np.eye(4)
++    extrinsic[:3, 3] = [0.0, 0.0, 1.2]
++
++    for theta_true_deg in (0.0, 90.0, 163.6):
++        theta_true = np.radians(theta_true_deg)
++        projected = project_anchors_to_view(
++            source.astype(np.float32), pose_true, extrinsic, intrinsic, (1280, 960),
++            part_ids=parts, joint_axis_o=axis, joint_origin_o=origin, theta=theta_true)
++
++        # The canonical anchors must come back untouched, or a caller that hands
++        # them to the fit would apply the joint a second time.
++        _check(f"theta {theta_true_deg:5.1f}: canonical anchors unchanged",
++               np.allclose(projected["anchors_o"], source.astype(np.float32)))
++
++        # Feed the projection's own world points straight back to the fit.
++        result = robust_fit_articulated_pose_from_anchors(
++            source, projected["points_world"].astype(np.float64),
++            np.ones(len(source)), parts, axis, origin,
++            inlier_threshold_mm=5.0, theta_limits_rad=limits)
++        angle_error = abs(result["theta_deg"] - theta_true_deg)
++        pose_error = float(np.max(np.abs(
++            np.asarray(result["pose_world_from_object"], dtype=np.float64) - pose_true)))
++        _check(f"theta {theta_true_deg:5.1f}: fit inverts the projection",
++               angle_error < 0.05 and pose_error < 1.0e-3,
++               f"theta err {angle_error:.4f} deg, pose max err {pose_error:.2e}")
++
++    # A bank saved before articulation existed must still load and fit.
++    print("\nbackward compatibility")
++    legacy = {k: bank[k] for k in
++              ("positions_o", "normals_o", "face_indices", "vertex_indices", "barycentric")}
++    legacy["metadata"] = {"anchor_unit_space": "external_mesh"}
++    with tempfile.TemporaryDirectory() as tmp:
++        path = Path(tmp) / "legacy.npz"
++        save_anchor_bank(path, legacy)
++        restored_legacy = load_anchor_bank(path)
++    _check("legacy bank loads as one rigid part",
++           np.array_equal(restored_legacy["part_ids"],
++                          np.zeros(len(source), dtype=np.int64)))
++    rigid = robust_fit_articulated_pose_from_anchors(
++        source, source, np.ones(len(source)), restored_legacy["part_ids"], axis, origin,
++        inlier_threshold_mm=15.0)
++    _check("and reports the angle as unobserved", rigid["status"] == "theta_unobserved",
++           f"status {rigid['status']}, theta_observed={rigid['theta_observed']}")
++
++    print(f"\n{len(FAILURES)} failures" + (f": {FAILURES}" if FAILURES else ""))
++    return 1 if FAILURES else 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+--- a/tests/test_articulated_runtime_wiring.py
++++ b/tests/test_articulated_runtime_wiring.py
+@@ -0,0 +1,166 @@
++#!/usr/bin/env python3
++"""Exercise the runtime's articulated path without a GPU, a model, or a capture.
++
++The tracker's real loop needs cameras, checkpoints and images. The wiring it grew
++does not: what was added is a joint travelling from an anchor bank into the
++projection and the fit, an angle carried between frames, and a per-frame record
++that says whether the angle was measured or merely held. All of that is decidable
++from arrays.
++
++The failure this is really guarding against is the joint arriving in the wrong
++units or the anchors being swung twice -- neither raises, both quietly return an
++angle that means nothing.
++
++Run: python tests/test_articulated_runtime_wiring.py
++"""
++
++from __future__ import annotations
++
++import json
++import sys
++import tempfile
++from pathlib import Path
++
++import numpy as np
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from utils.anchor_bank import (  # noqa: E402
++    articulation_from_anchor_bank,
++    load_anchor_bank,
++    prepare_anchor_bank_for_gotrack,
++    sample_articulated_mesh_anchors,
++    sample_mesh_anchors,
++    save_anchor_bank,
++)
++from utils.anchor_tracking import pose_anchors_at_joint_angle  # noqa: E402
++from utils.multiview_geometry import (  # noqa: E402
++    joint_transform,
++    robust_fit_articulated_pose_from_anchors,
++)
++
++PARTS = Path.home() / "shared_data/mesh_new/blue_plastic_box/articulation_particulate"
++FAILURES: list[str] = []
++
++
++def _check(name: str, condition: bool, detail: str = "") -> None:
++    print(f"  {'PASS' if condition else 'FAIL'}  {name}{'  ' + detail if detail else ''}")
++    if not condition:
++        FAILURES.append(name)
++
++
++def main() -> int:
++    joint = json.loads((PARTS / "joint.json").read_text(encoding="utf-8"))["measured"]
++    axis = np.asarray(joint["axis"], dtype=np.float64)
++    origin = np.asarray(joint["origin"], dtype=np.float64)
++    limits = tuple(float(v) for v in joint["range_rad"])
++
++    bank = sample_articulated_mesh_anchors(
++        [PARTS / "parts/body.obj", PARTS / "parts/lid.obj"], num_anchors=384,
++        joint_axis_o=axis, joint_origin_o=origin,
++        part_names=["body", "lid"], theta_limits_rad=limits, seed=0)
++    bank = prepare_anchor_bank_for_gotrack(bank, translation_scale_to_gotrack=1000.0)
++
++    print("\nthe joint the runtime will read")
++    articulation = articulation_from_anchor_bank(bank, units="external")
++    _check("bank reports itself articulated", articulation is not None)
++    _check("external origin is the mesh's own",
++           np.allclose(articulation["joint_origin_o"], origin),
++           f"{articulation['joint_origin_o'].round(4).tolist()}")
++    gotrack = articulation_from_anchor_bank(bank, units="gotrack")
++    _check("gotrack origin is scaled, axis is not",
++           np.allclose(gotrack["joint_origin_o"], origin * 1000.0)
++           and np.allclose(gotrack["joint_axis_o"], articulation["joint_axis_o"]))
++    _check("limits travel with it", articulation["theta_limits_rad"] == limits)
++
++    print("\na rigid bank stays on the old path")
++    rigid = sample_mesh_anchors(PARTS / "parts/body.obj", 64, seed=0)
++    _check("rigid bank reports no joint", articulation_from_anchor_bank(rigid) is None)
++
++    print("\nswinging is not applied twice")
++    source = bank["positions_o"].astype(np.float64)
++    parts = bank["part_ids"]
++    theta = np.radians(120.0)
++    once = pose_anchors_at_joint_angle(source, parts, axis, origin, theta)
++    twice = pose_anchors_at_joint_angle(once, parts, axis, origin, theta)
++    direct = pose_anchors_at_joint_angle(source, parts, axis, origin, 2.0 * theta)
++    _check("posing twice equals posing by twice the angle",
++           np.allclose(twice, direct, atol=1e-5))
++    _check("and differs from posing once",
++           float(np.max(np.abs(twice - once))) > 0.01,
++           f"max {float(np.max(np.abs(twice - once))):.3f} m apart")
++    _check("static part never moves",
++           np.allclose(once[parts == 0], source[parts == 0], atol=1e-6))
++
++    print("\nangle carried across a frame series")
++    # Anchors are always canonical; each frame swings them by its own angle, which
++    # is what the runtime does through project_anchors_to_view.
++    pose_true = np.eye(4)
++    pose_true[:3, 3] = [0.4, -0.1, 0.25]
++    rng = np.random.default_rng(0)
++    carried = 0.0
++    recovered = []
++    for theta_true_deg in (0.0, 12.7, 47.4, 92.8, 163.6, 196.7, 215.0):
++        posed = pose_anchors_at_joint_angle(
++            source, parts, axis, origin, np.radians(theta_true_deg)).astype(np.float64)
++        target = posed @ pose_true[:3, :3].T + pose_true[:3, 3]
++        target += rng.normal(scale=0.003, size=target.shape)
++        result = robust_fit_articulated_pose_from_anchors(
++            source, target, np.ones(len(source)), parts, axis, origin,
++            inlier_threshold_mm=15.0, theta_init=carried,
++            theta_reference_rad=carried, theta_limits_rad=None)
++        carried = float(result["theta_rad"])   # what the runtime writes back
++        recovered.append(result["theta_deg"])
++        _check(f"frame at {theta_true_deg:6.1f} deg",
++               abs(result["theta_deg"] - theta_true_deg) < 1.0 and result["theta_observed"],
++               f"got {result['theta_deg']:7.2f} deg")
++    _check("series never wraps negative past 180 deg",
++           all(value > -1.0 for value in recovered),
++           f"min {min(recovered):.2f} deg, max {max(recovered):.2f} deg")
++
++    print("\nmoving part occluded away")
++    visible = parts == 0
++    posed = pose_anchors_at_joint_angle(
++        source, parts, axis, origin, np.radians(163.6)).astype(np.float64)
++    target = posed @ pose_true[:3, :3].T + pose_true[:3, 3]
++    held = np.radians(163.6)
++    result = robust_fit_articulated_pose_from_anchors(
++        source[visible], target[visible], np.ones(int(visible.sum())), parts[visible],
++        axis, origin, inlier_threshold_mm=15.0, theta_init=held, theta_reference_rad=held)
++    _check("angle is flagged unobserved", not result["theta_observed"]
++           and result["status"] == "theta_unobserved")
++    _check("held angle comes back unchanged", abs(result["theta_rad"] - held) < 1e-9)
++    shift = np.linalg.norm(
++        result["pose_world_from_object"][:3, 3] - pose_true[:3, 3]) * 1000.0
++    _check("body pose still solved", shift < 1.0, f"{shift:.3f} mm")
++
++    print("\nbank round trip through disk, as the runtime loads it")
++    with tempfile.TemporaryDirectory() as tmp:
++        path = Path(tmp) / "bank.npz"
++        save_anchor_bank(path, bank)
++        reloaded = articulation_from_anchor_bank(load_anchor_bank(path), units="external")
++    _check("joint survives", np.allclose(reloaded["joint_axis_o"], articulation["joint_axis_o"])
++           and np.allclose(reloaded["joint_origin_o"], articulation["joint_origin_o"])
++           and np.array_equal(reloaded["part_ids"], articulation["part_ids"]))
++
++    print("\nwrong units are visibly wrong, not silently wrong")
++    # If someone hands the fit the GoTrack-scaled origin while the anchors are in
++    # metres, the hinge sits a thousand times too far away. The point of this check
++    # is that such a mistake produces a bad angle rather than a plausible one.
++    posed = pose_anchors_at_joint_angle(
++        source, parts, axis, origin, np.radians(90.0)).astype(np.float64)
++    target = posed @ pose_true[:3, :3].T + pose_true[:3, 3]
++    wrong = robust_fit_articulated_pose_from_anchors(
++        source, target, np.ones(len(source)), parts, axis, origin * 1000.0,
++        inlier_threshold_mm=15.0)
++    _check("mismatched origin units give a large residual",
++           wrong["mean_residual_mm"] > 10.0,
++           f"mean residual {wrong['mean_residual_mm']:.1f} mm, "
++           f"theta {wrong['theta_deg']:.1f} deg")
++
++    print(f"\n{len(FAILURES)} failures" + (f": {FAILURES}" if FAILURES else ""))
++    return 1 if FAILURES else 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
