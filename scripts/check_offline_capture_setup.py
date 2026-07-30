@@ -79,8 +79,34 @@ def _run_gotrack(args: argparse.Namespace, errors: list[str], checks: list[str])
     for path in (gotrack_dir, runner, patched_runner, renderer):
         if not path.exists():
             errors.append(f"missing required MV-GoTrack path: {path}")
-    if patched_runner.is_file() and "--camera-micro-batch-size" not in patched_runner.read_text(encoding="utf-8"):
+    runner_source = patched_runner.read_text(encoding="utf-8") if patched_runner.is_file() else ""
+    if runner_source and "--camera-micro-batch-size" not in runner_source:
         errors.append("MV-GoTrack micro-batch patch is not present in the runner")
+    if args.require_articulated:
+        # Marker-based, like the micro-batch check above: the articulated patch is
+        # applied by hand to a private checkout, so nothing else can tell whether it
+        # is there. Without this an articulated run against an unpatched tree does not
+        # fail, it silently tracks the object as rigid at whatever angle it was seeded
+        # with -- which looks like a plausible result.
+        for marker, description in (
+            ("--theta-extrapolate-max-deg", "joint-angle prediction"),
+            ("--articulation-json", "articulation wiring"),
+        ):
+            if runner_source and marker not in runner_source:
+                errors.append(
+                    f"MV-GoTrack articulated patch is not present in the runner "
+                    f"({description}: {marker} missing)")
+        geometry = gotrack_dir / "utils" / "multiview_geometry.py"
+        if geometry.is_file():
+            geometry_source = geometry.read_text(encoding="utf-8")
+            for symbol in ("robust_fit_articulated_pose_from_anchors",
+                           "reject_wrong_surface_anchors"):
+                if symbol not in geometry_source:
+                    errors.append(
+                        f"MV-GoTrack articulated patch is incomplete: {symbol} missing "
+                        f"from {geometry.name}")
+        else:
+            errors.append(f"missing required MV-GoTrack path: {geometry}")
     if not checkpoint.is_file():
         errors.append(f"missing GoTrack checkpoint: {checkpoint}")
     elif args.checkpoint_sha256:
@@ -120,6 +146,9 @@ def main() -> int:
                         help="Pass an empty string to skip checksum validation.")
     parser.add_argument("--require-repo-sam3", action="store_true",
                         help="Fail if SAM3 is not imported from this repository's thirdparty checkout.")
+    parser.add_argument("--require-articulated", action="store_true",
+                        help=("Also require patches/MV-GoTrack-articulated.patch to be applied. "
+                              "Only the 7-DoF articulated pipeline needs it; 6-DoF runs do not."))
     parser.add_argument("--json", action="store_true", help="Print a machine-readable report.")
     args = parser.parse_args()
     errors: list[str] = []

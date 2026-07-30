@@ -29,6 +29,7 @@ src/                        # Scripts & CLI wrappers
 │   ├── batch_depth_auto.py # Stereo depth (auto pair selection, all cameras, TRT)
 │   ├── batch_pose.py       # FoundationPose batch tracking
 │   ├── batch_pose_overlay.py # Per-camera pose tracking + mesh overlay video
+│   ├── articulated/        # 7-DoF (body + 1 revolute joint) pipeline (has its own README)
 │   ├── download_videos.py  # Network FS → local cache
 │   └── upload_results.py   # Local cache → network FS
 ├── demo/                   # Demo scripts
@@ -514,6 +515,30 @@ Each exp dir has: `raw/`, `images/`, `cam_param/`, `pose_world.npy`, `pose_overl
 ### Reference
 
 `~/RSS_2026/planner/inference/train/run_auto_v2.py` = ref impl. All exec seq (init → approach → pregrasp → grasp → squeeze → lift → release) match this ref.
+
+## Articulated (7-DoF) Tracking
+
+Body 6-DoF + 1 revolute joint. `src/process/articulated/` (has its own README).
+Seed = FoundationPose proposals ranked by multi-view silhouette IoU; tracking =
+MV-GoTrack with `patches/MV-GoTrack-articulated.patch` applied.
+
+- **6-DoF init uses FoundPose (inside MV-GoTrack); 7-DoF uses FoundationPose.** Not an
+  accident: FoundPose onboards a template bank per pose config, i.e. per joint angle,
+  ~20 min and 1 GB each. Do not unify them.
+- **`--theta-extrapolate-max-deg` is required** for a fast joint. Projecting anchors at
+  the previous frame's angle put them a full frame behind (~7 deg/frame), the flow
+  attached the lid's anchors to the body, and the angle ran to its ceiling for 85
+  frames while the body pose was dragged 7 deg with it. Extrapolating took the angle
+  error from median 6.0 deg to 0.4 and the body error from 5.15 deg to 0.29.
+- **A coherently wrong angle is undetectable by residuals.** `--theta-residual-ratio`
+  and `--anchor-wrong-surface-margin` both decide where the lid should be *from the
+  angle*, which is the corrupted quantity. Prevention worked; detection did not.
+- **Joint range is not a constant.** `joint.json` reports 205.8 deg (the open scan's
+  reach); the lid gets to 213-217. The real limit is table contact, so it depends on
+  body orientation. Pass `--theta-max-deg 260` and treat the bound as a guard.
+- Verify the patch is applied: `scripts/check_offline_capture_setup.py --component
+  gotrack --require-articulated`. Without it an articulated run does not fail, it
+  silently tracks rigidly at the seed angle.
 
 ## Ongoing Refactoring
 

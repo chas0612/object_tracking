@@ -104,12 +104,39 @@ cd "$REPO/autodex/perception/thirdparty/MV-GoTrack"
 git checkout a9f033734c0bdf2d191265d22ea732a914c861f6
 git apply --check "$REPO/patches/MV-GoTrack-offline-capture.patch"
 git apply "$REPO/patches/MV-GoTrack-offline-capture.patch"
+
+# 7-DoF articulated tracking만 필요. 6-DoF만 쓸 경우 생략한다.
+git apply --check "$REPO/patches/MV-GoTrack-articulated.patch"
+git apply "$REPO/patches/MV-GoTrack-articulated.patch"
 ```
 
+### Patch 적용 순서 (이 문서가 기준)
+
+세 patch가 있고 **동시에 쓰는 조합은 하나뿐**이다.
+
+| patch | 언제 | 순서 |
+|---|---|---|
+| `MV-GoTrack-offline-capture.patch` | 항상 | 1 |
+| `MV-GoTrack-articulated.patch` | 7-DoF articulated tracking을 쓸 때만 | 2 (offline-capture 위에) |
+| `MV-GoTrack-renderer-fix.patch` | **쓰지 않는다** | — |
+
+`MV-GoTrack-renderer-fix.patch`는 이전 renderer revision용이고 그 내용은
+offline-capture patch에 포함되어 있으므로, 이 pipeline에 적용하면 안 된다.
+`docs/distributed_tracking.md`의 이전 판이 이 patch를 적용하라고 안내했는데
+그것은 offline-capture patch 이전 절차이므로 따르지 않는다.
+
 상세한 patch 범위와 재적용 방법은
-[MV-GoTrack-offline-capture.md](../patches/MV-GoTrack-offline-capture.md)를 참고한다.
-기존 `MV-GoTrack-renderer-fix.patch`는 이전 renderer revision용이므로 이 offline
-pipeline에 적용하면 안 된다.
+[MV-GoTrack-offline-capture.md](../patches/MV-GoTrack-offline-capture.md)와
+[MV-GoTrack-articulated.md](../patches/MV-GoTrack-articulated.md)를 참고한다.
+
+적용 여부는 marker로 검증한다 — patch는 손으로 적용하므로 이것 외에
+확인할 방법이 없다:
+
+```bash
+python scripts/check_offline_capture_setup.py --component gotrack \
+    --gotrack-dir "$REPO/autodex/perception/thirdparty/MV-GoTrack" \
+    --require-articulated      # articulated patch까지 요구할 때
+```
 
 ## 3. 모델 파일
 
@@ -145,6 +172,52 @@ conda run --no-capture-output -n gotrack python -u \
 
 object별 output lock이 있으므로 여러 PC는 **서로 다른 object**를 동시에 처리할 수
 있다. 같은 object를 동시에 실행하지 않는다.
+
+### FoundationPose (7-DoF articulated tracking 전용)
+
+6-DoF pipeline은 FoundPose를 쓰고 FoundationPose repo를 **전혀 참조하지 않는다**
+(`autodex/perception/foundpose_init.py`가 MV-GoTrack의 `model.foundpose`를 import한다).
+FoundationPose가 필요한 것은 articulated seed 단계뿐이며, 그 이유는 FoundPose가
+template 기반이라 **joint angle마다 onboarding(약 20분 / 1 GB)** 이 필요해 theta sweep에
+쓸 수 없기 때문이다. FoundationPose는 mesh를 직접 render-and-compare하므로 새 각도가
+render 한 번의 비용이다. 이 둘을 하나로 합치지 않는다.
+
+FoundationPose는 public repo이고 코드는 이미 vendored + git 추적 상태이므로 private
+접근이 필요 없다. 두 가지만 준비한다.
+
+**1. mycpp 확장 build.** 이 머신에는 system Eigen이 없으므로 `object_6d` 환경 안의
+Eigen과 pybind11을 가리켜야 한다.
+
+```bash
+ENVROOT="$(conda info --base)/envs/object_6d"
+cd "$REPO/autodex/perception/thirdparty/FoundationPose/mycpp"
+rm -rf build && mkdir build && cd build
+conda run -n object_6d cmake .. \
+  -DCMAKE_PREFIX_PATH="$ENVROOT" \
+  -DEigen3_DIR="$ENVROOT/share/eigen3/cmake" \
+  -Dpybind11_DIR="$ENVROOT/lib/python3.10/site-packages/pybind11/share/cmake/pybind11"
+conda run -n object_6d make -j"$(nproc)"
+# -> mycpp.cpython-310-x86_64-linux-gnu.so
+```
+
+**2. network weight 2개.** vendored `readme.md`에 있는 공개 NVlabs Drive에서
+`2023-10-28-18-33-37`(refiner)과 `2024-01-11-20-02-45`(scorer)를 받아
+`autodex/perception/thirdparty/FoundationPose/weights/` 아래에 둔다(247 MB, gitignore
+대상). `scripts/setup_weights.sh`는 `~/shared_data/AutoDex`를 가리키는데 이 경로는
+다른 사용자 home으로 향하는 **dangling symlink**이므로 이 머신에서는 동작하지 않는다.
+
+환경은 `object_6d`를 쓴다(Python 3.10.20, torch 2.5.1+cu124, pytorch3d 0.7.9). repo의
+`foundationpose` 환경은 3.9라서 cpython-310 `.so`를 import하지 못한다.
+
+vendored 사본은 standalone checkout보다 앞서 있다 — `Utils.py`의 pytorch3d import가
+try/except로 감싸져 있고 UV texture fallback이 있으며, 두 predictor의 batch size가
+공유 GPU OOM을 피해 512 → 64로 낮춰져 있다. seed script는
+`FOUNDATIONPOSE_ROOT` 환경변수로 어느 트리를 쓸지 고를 수 있다.
+
+검증: `box_articulated/2` frame 12에서 vendored 사본으로 seed를 재실행하면
+theta 1.345°, IoU 0.7438이 나온다(standalone: 0.695°, 0.7431). 0.65° 차이는 그 실행
+자체의 start-to-start spread(0.7°)와 같은 크기이므로 method의 재현성 범위 안이고,
+bit-identical하지는 않다 — batch size 변경만으로도 그 정도는 달라진다.
 
 ### 여러 PC에 object 전처리 분배
 
@@ -269,6 +342,41 @@ cd "$REPO"
 conda run -n gotrack python src/process/gotrack_capture.py --help
 conda run -n gotrack python src/process/foundpose_init_capture.py --help
 conda run -n sam3 python src/process/mask.py --help
+```
+
+patch 적용 여부와 checkpoint 무결성은 아래 검증기가 확인한다. 6-DoF만 쓸 경우
+`--require-articulated`를 생략한다.
+
+```bash
+conda run -n gotrack python scripts/check_offline_capture_setup.py \
+    --component gotrack --gotrack-dir "$GOTRACK_DIR"
+conda run -n gotrack python scripts/check_offline_capture_setup.py \
+    --component gotrack --gotrack-dir "$GOTRACK_DIR" --require-articulated
+conda run -n sam3 python scripts/check_offline_capture_setup.py \
+    --component sam3 --require-repo-sam3
+```
+
+articulated 검증은 marker 기반이다(`--theta-extrapolate-max-deg`,
+`--articulation-json`, `robust_fit_articulated_pose_from_anchors`,
+`reject_wrong_surface_anchors`). patch를 손으로 적용하므로 다른 확인 방법이 없고,
+빠뜨린 채 articulated runner를 돌리면 **실패하지 않고** seed 각도에 고정된 rigid
+tracking 결과가 나온다 — 그럴듯해 보이는 결과라서 더 위험하다.
+
+7-DoF articulated seed를 쓸 경우 FoundationPose도 함께 확인한다.
+
+```bash
+FP="$REPO/autodex/perception/thirdparty/FoundationPose"
+conda run -n object_6d python -c "
+import sys
+from pathlib import Path
+fp = Path('$FP')
+sys.path[:0] = [str(fp), str(fp / 'mycpp/build')]
+import mycpp
+from estimater import FoundationPose
+assert (fp / 'weights/2023-10-28-18-33-37').is_dir(), 'refiner weights missing'
+assert (fp / 'weights/2024-01-11-20-02-45').is_dir(), 'scorer weights missing'
+print('FoundationPose ok:', Path(mycpp.__file__).name)
+"
 ```
 
 ## 6. capture 하나를 실행하는 순서

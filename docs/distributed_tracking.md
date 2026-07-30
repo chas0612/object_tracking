@@ -91,8 +91,13 @@ sha256sum gotrack_checkpoint.pt    # expect f7d127abe2b8...
 
 # (i) Apply our local patches (CRITICAL — removes silent pyrender fallback in
 #     renderer_nvdiffrast.py; without this you get the 25x slowdown described
-#     in Anti-patterns). The patch lives in the AutoDex repo.
-git apply ~/AutoDex/patches/MV-GoTrack-renderer-fix.patch
+#     in Anti-patterns).
+#
+#     SUPERSEDED: MV-GoTrack-renderer-fix.patch was for an earlier renderer
+#     revision and its content is already inside the offline-capture patch.
+#     Do not apply both. docs/offline_capture_pipeline_setup.md is the single
+#     authority on which patches to apply and in what order.
+git apply ~/AutoDex/patches/MV-GoTrack-offline-capture.patch
 ```
 
 After this, sanity-check that the env can import GoTrack and create a CUDA

@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Split one articulated seed into two independent rigid seeds, body and lid.
+
+Diagnostic only.  The articulated tracker fits both parts in one Kabsch solve, so a
+failure cannot be attributed to a part from its output alone.  Tracking each part as
+an ordinary rigid object from the same frame, the same cameras and the same answer
+isolates that: the body seed is the fitted pose as-is, and the lid seed is that pose
+composed with the joint at the fitted angle, which is exactly the transform the
+articulated renderer applies to the lid's vertices.
+
+The two runs share no state, so whatever they disagree about is the coupling.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+
+from common import load_cameras
+
+SCORE_KEYS = (
+    "certainty_count_above_threshold",
+    "stage3_correspondence_count",
+    "inliers_ratio",
+    "pose_score",
+    "confidence_count_above_threshold",
+)
+
+
+def joint_transform(axis: np.ndarray, origin: np.ndarray, theta: float) -> np.ndarray:
+    axis = np.asarray(axis, dtype=np.float64)
+    axis = axis / np.linalg.norm(axis)
+    cross = np.array([[0.0, -axis[2], axis[1]],
+                      [axis[2], 0.0, -axis[0]],
+                      [-axis[1], axis[0], 0.0]])
+    rotation = (np.eye(3) + np.sin(theta) * cross
+                + (1.0 - np.cos(theta)) * (cross @ cross))
+    transform = np.eye(4)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = np.asarray(origin, dtype=np.float64) - rotation @ origin
+    return transform
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--capture-dir", type=Path, required=True)
+    parser.add_argument("--joint-json", type=Path, required=True)
+    parser.add_argument("--frame-index", type=int, default=40)
+    parser.add_argument("--repeat-frames", type=int, default=0)
+    args = parser.parse_args()
+
+    probe = args.capture_dir / "articulated_probe" / f"frame_{args.frame_index:06d}"
+    record = json.loads((probe / "hybrid/hybrid_result.json").read_text(encoding="utf-8"))
+    answer = record.get("answer") or max(
+        (record.get("starts") or record["results"]).values(),
+        key=lambda r: r["silhouette_iou"])
+    pose_body = np.asarray(answer["pose_body"], dtype=np.float64)
+    theta = float(np.radians(answer["theta_deg"]))
+
+    joint = json.loads(args.joint_json.read_text(encoding="utf-8"))
+    pose_lid = pose_body @ joint_transform(joint["axis"], joint["origin"], theta)
+
+    cameras = load_cameras(args.capture_dir)
+    frames = sorted({args.frame_index, *range(max(0, int(args.repeat_frames)))})
+    for name, pose in (("body", pose_body), ("lid", pose_lid)):
+        out_dir = args.capture_dir / f"gotrack_init_{name}" / f"frame_{args.frame_index:06d}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # No ``theta_deg`` here on purpose: these are rigid seeds, and a leftover angle
+        # in a rigid record would be a claim the run cannot honour.
+        records = [{
+            "frame_index": int(frame),
+            "pose_world": pose.tolist(),
+            "source": f"articulated_probe frame {args.frame_index} ({name} only)",
+            "silhouette_iou": float(answer["silhouette_iou"]),
+            **{key: 1.0 for key in SCORE_KEYS},
+        } for frame in frames]
+        for camera_id in cameras:
+            (out_dir / f"{camera_id}.json").write_text(
+                json.dumps(records, indent=2) + "\n", encoding="utf-8")
+        print(f"{name}: {len(cameras)} cameras -> {out_dir}", flush=True)
+
+    print(f"seed frame {args.frame_index}: theta {answer['theta_deg']:.2f} deg", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
