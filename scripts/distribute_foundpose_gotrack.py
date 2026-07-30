@@ -363,8 +363,10 @@ def _foundpose_command(
         "--global-dino-score-margin", str(args.foundpose_global_dino_score_margin),
         "--global-dino-inlier-threshold-px", str(args.foundpose_global_dino_inlier_threshold_px),
         "--output-dir", str(output_dir),
-    ] + (["--global-dino-rerank"] if args.foundpose_global_dino_rerank else
-         ["--no-global-dino-rerank"])
+    ] + (["--global-asymmetry-force"] if args.foundpose_global_asymmetry_force else []) + (
+        ["--global-dino-rerank"] if args.foundpose_global_dino_rerank else
+        ["--no-global-dino-rerank"]
+    )
 
 
 def _attempt_tail_recovery(
@@ -612,6 +614,24 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                 object_name=task["object_name"], assets=assets,
                 output_dir=init_dir, args=args,
             ), log, REPO_ROOT)
+            if args.foundpose_init_only:
+                result_path = init_dir / "result.json"
+                result = _read_json(result_path) if result_path.is_file() else {}
+                task["foundpose_init_summary"] = {
+                    "result_rel": str(result_path.relative_to(shared)),
+                    "candidate_bank_rel": str(
+                        (init_dir / "candidate_bank.json").relative_to(shared)
+                    ),
+                    "num_input_views": result.get("num_input_views"),
+                    "num_foundpose_candidates": result.get("num_foundpose_candidates"),
+                    "global_asymmetry_forced": result.get("global_asymmetry_forced"),
+                    "global_asymmetry_detected": result.get("global_asymmetry_detected"),
+                    "global_asymmetry_applied": result.get("global_asymmetry_applied"),
+                }
+                task.update({"status": "completed", "reason": None})
+                log.write("[init-only] FoundPose candidate generation completed; skipping GoTrack.\n")
+                log.flush()
+                return task
             task["phase"] = "gotrack"
             _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
             _run_command(gotrack + ["src/process/gotrack_capture.py", "--capture-dir", str(episode), "--video-dir", str(episode / "undistorted_video"),
@@ -705,9 +725,11 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
                                                 "foundpose_global_asymmetry_max_side": args.foundpose_global_asymmetry_max_side,
                                                 "foundpose_global_asymmetry_score_margin": args.foundpose_global_asymmetry_score_margin,
                                                 "foundpose_global_asymmetry_weight": args.foundpose_global_asymmetry_weight,
+                                                "foundpose_global_asymmetry_force": args.foundpose_global_asymmetry_force,
                                                 "foundpose_global_dino_rerank": args.foundpose_global_dino_rerank,
                                                 "foundpose_global_dino_score_margin": args.foundpose_global_dino_score_margin,
                                                 "foundpose_global_dino_inlier_threshold_px": args.foundpose_global_dino_inlier_threshold_px,
+                                                "foundpose_init_only": args.foundpose_init_only,
                                                 "debug_sheets": args.debug_sheets,
                                                 "debug_sheet_max_cameras": args.debug_sheet_max_cameras,
                                                 "debug_sheet_output_root_rel": args.debug_sheet_output_root_rel,
@@ -773,9 +795,11 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
     args.foundpose_global_asymmetry_max_side = int(manifest.get("foundpose_global_asymmetry_max_side", args.foundpose_global_asymmetry_max_side))
     args.foundpose_global_asymmetry_score_margin = float(manifest.get("foundpose_global_asymmetry_score_margin", args.foundpose_global_asymmetry_score_margin))
     args.foundpose_global_asymmetry_weight = float(manifest.get("foundpose_global_asymmetry_weight", args.foundpose_global_asymmetry_weight))
+    args.foundpose_global_asymmetry_force = bool(manifest.get("foundpose_global_asymmetry_force", args.foundpose_global_asymmetry_force))
     args.foundpose_global_dino_rerank = bool(manifest.get("foundpose_global_dino_rerank", args.foundpose_global_dino_rerank))
     args.foundpose_global_dino_score_margin = float(manifest.get("foundpose_global_dino_score_margin", args.foundpose_global_dino_score_margin))
     args.foundpose_global_dino_inlier_threshold_px = float(manifest.get("foundpose_global_dino_inlier_threshold_px", args.foundpose_global_dino_inlier_threshold_px))
+    args.foundpose_init_only = bool(manifest.get("foundpose_init_only", args.foundpose_init_only))
     args.debug_sheets = bool(manifest.get("debug_sheets", args.debug_sheets))
     args.debug_sheet_max_cameras = int(manifest.get("debug_sheet_max_cameras", args.debug_sheet_max_cameras))
     args.debug_sheet_output_root_rel = str(manifest.get("debug_sheet_output_root_rel", args.debug_sheet_output_root_rel))
@@ -841,6 +865,10 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
         command.append("--tail-recovery" if args.tail_recovery else "--no-tail-recovery")
         command.append("--foundpose-global-dino-rerank" if args.foundpose_global_dino_rerank else
                        "--no-foundpose-global-dino-rerank")
+        if args.foundpose_global_asymmetry_force:
+            command.append("--foundpose-global-asymmetry-force")
+        if args.foundpose_init_only:
+            command.append("--foundpose-init-only")
         if args.retry_failed:
             command.append("--retry-failed")
         rendered = " ".join(part if part.startswith("$HOME/") else shlex.quote(part) for part in command)
@@ -947,6 +975,8 @@ def main() -> int:
     p.add_argument("--foundpose-global-asymmetry-max-side", type=int, default=512)
     p.add_argument("--foundpose-global-asymmetry-score-margin", type=float, default=0.005)
     p.add_argument("--foundpose-global-asymmetry-weight", type=float, default=0.7)
+    p.add_argument("--foundpose-global-asymmetry-force", action="store_true",
+                   help="Force the global asymmetry refinement/reranking branch.")
     dino_group = p.add_mutually_exclusive_group()
     dino_group.add_argument("--foundpose-global-dino-rerank", dest="foundpose_global_dino_rerank",
                             action="store_true",
@@ -956,6 +986,8 @@ def main() -> int:
     p.set_defaults(foundpose_global_dino_rerank=False)
     p.add_argument("--foundpose-global-dino-score-margin", type=float, default=0.02)
     p.add_argument("--foundpose-global-dino-inlier-threshold-px", type=float, default=10.0)
+    p.add_argument("--foundpose-init-only", action="store_true",
+                   help="Stop after SAM3 + FoundPose candidate generation; skip GoTrack and debug sheets.")
     p.add_argument("--max-attempts", type=int, default=2)
     debug_group = p.add_mutually_exclusive_group()
     debug_group.add_argument("--debug-sheets", dest="debug_sheets", action="store_true",

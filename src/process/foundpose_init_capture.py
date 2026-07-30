@@ -132,6 +132,13 @@ def main() -> int:
     parser.add_argument("--global-asymmetry-score-margin", type=float, default=0.005,
                         help="Robust-IoU margin that triggers symmetry-breaking reranking.")
     parser.add_argument("--global-asymmetry-weight", type=float, default=0.7)
+    parser.add_argument(
+        "--global-asymmetry-force",
+        action="store_true",
+        help=("Always refine and asymmetry-rerank the diverse global hypothesis pool. "
+              "Useful when a small symmetry-breaking feature is known to be missed "
+              "by the automatic ambiguity trigger."),
+    )
     parser.add_argument("--global-dino-rerank", action=argparse.BooleanOptionalAction, default=False,
                         help=("Experimental: use FoundPose's cached cross-view DINO correspondences "
                               "as a tie-break among near-equal silhouette candidates."))
@@ -346,14 +353,20 @@ def main() -> int:
         print(f"[global] hypotheses={len(hypotheses)} refine_top_k={initial_count}", flush=True)
         refined = [refine_seed(item) for item in refine_seed_pool[:initial_count]]
         refined_ranked = sorted(refined, key=lambda item: float(item["robust_iou"]), reverse=True)
-        asymmetry_applied = has_rotation_ambiguous_top_poses(
+        asymmetry_detected = has_rotation_ambiguous_top_poses(
             refined_ranked,
             score_margin=args.global_asymmetry_score_margin,
             min_rotation_deg=25.0,
         )
+        asymmetry_applied = args.global_asymmetry_force or asymmetry_detected
         if asymmetry_applied:
             extra_seeds = refine_seed_pool[initial_count:]
-            print(f"[global] rotation ambiguity detected; refining {len(extra_seeds)} extra hypotheses", flush=True)
+            trigger = "forced" if args.global_asymmetry_force else "detected"
+            print(
+                f"[global] rotation ambiguity {trigger}; "
+                f"refining {len(extra_seeds)} extra hypotheses",
+                flush=True,
+            )
             refined.extend(refine_seed(item) for item in extra_seeds)
             refined_ranked = score_pose_hypotheses_by_asymmetry(
                 refined,
@@ -472,6 +485,8 @@ def main() -> int:
         "pose_candidate_rank": args.pose_candidate_rank,
         "global_rotation_count": args.global_rotation_count if args.pose_selection_mode == "global" else None,
         "global_refine_top_k": args.global_refine_top_k if args.pose_selection_mode == "global" else None,
+        "global_asymmetry_forced": args.global_asymmetry_force if args.pose_selection_mode == "global" else None,
+        "global_asymmetry_detected": asymmetry_detected if args.pose_selection_mode == "global" else None,
         "global_asymmetry_applied": asymmetry_applied if args.pose_selection_mode == "global" else None,
         "global_dino_rerank_requested": args.global_dino_rerank if args.pose_selection_mode == "global" else None,
         "global_dino_rerank_applied": dino_rerank_applied if args.pose_selection_mode == "global" else None,
