@@ -244,7 +244,13 @@ def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[st
     return tasks, skipped
 
 
-def _tracking_summary(task: dict[str, Any], attempt_dir: Path, min_coverage: float, max_trailing_missing: int) -> dict[str, Any]:
+def _tracking_summary(
+    task: dict[str, Any],
+    attempt_dir: Path,
+    min_coverage: float,
+    max_trailing_missing: int,
+    first_required_frame: int = 0,
+) -> dict[str, Any]:
     records = attempt_dir / "gotrack_tracking" / "gotrack_output" / task["object_name"] / "world_pose_records.json"
     if not records.is_file():
         return {"complete": False, "reason": "records_missing", "records": 0, "valid_poses": 0,
@@ -257,13 +263,24 @@ def _tracking_summary(task: dict[str, Any], attempt_dir: Path, min_coverage: flo
     if not isinstance(data, list) or not data:
         return {"complete": False, "reason": "records_empty", "records": 0, "valid_poses": 0,
                 "coverage": 0.0, "trailing_missing": 0}
-    valid = sum(isinstance(row, dict) and row.get("pose_world") is not None for row in data)
+    evaluated = [
+        row for index, row in enumerate(data)
+        if isinstance(row, dict) and int(row.get("frame_index", index)) >= first_required_frame
+    ]
+    if not evaluated:
+        return {
+            "complete": False, "reason": f"no_records_at_or_after_frame={first_required_frame}",
+            "records": 0, "total_records": len(data), "valid_poses": 0,
+            "coverage": 0.0, "trailing_missing": 0,
+            "first_required_frame": first_required_frame,
+        }
+    valid = sum(row.get("pose_world") is not None for row in evaluated)
     trailing_missing = 0
-    for row in reversed(data):
-        if isinstance(row, dict) and row.get("pose_world") is not None:
+    for row in reversed(evaluated):
+        if row.get("pose_world") is not None:
             break
         trailing_missing += 1
-    coverage = valid / len(data)
+    coverage = valid / len(evaluated)
     complete = coverage >= min_coverage and trailing_missing <= max_trailing_missing
     if coverage < min_coverage:
         reason = f"coverage={coverage:.3f}<{min_coverage:.3f}"
@@ -271,8 +288,12 @@ def _tracking_summary(task: dict[str, Any], attempt_dir: Path, min_coverage: flo
         reason = f"trailing_missing={trailing_missing}>{max_trailing_missing}"
     else:
         reason = None
-    return {"complete": complete, "reason": reason, "records": len(data), "valid_poses": valid,
-            "coverage": coverage, "trailing_missing": trailing_missing}
+    return {
+        "complete": complete, "reason": reason,
+        "records": len(evaluated), "total_records": len(data), "valid_poses": valid,
+        "coverage": coverage, "trailing_missing": trailing_missing,
+        "first_required_frame": first_required_frame,
+    }
 
 
 def _record_list(path: Path) -> list[dict[str, Any]]:
@@ -639,9 +660,13 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                                     "--num-cameras", str(args.num_cameras), "--allow-fewer-cameras",
                                     "--camera-micro-batch-size", str(args.camera_micro_batch_size),
                                     "--init-frame-index", str(init_frame_index),
+                                    "--reverse-stop-frame-index", str(args.reverse_stop_frame_index),
                                     "--max-video-duration-skew-sec", str(args.max_video_duration_skew_sec),
                                     "--max-frames", str(args.max_frames), "--output-dir", str(track_dir)], log, REPO_ROOT)
-            tracking_summary = _tracking_summary(task, attempt_dir, args.min_valid_pose_coverage, args.max_trailing_missing_frames)
+            tracking_summary = _tracking_summary(
+                task, attempt_dir, args.min_valid_pose_coverage, args.max_trailing_missing_frames,
+                args.reverse_stop_frame_index,
+            )
             task["tracking_summary"] = tracking_summary
             tracking_ok = bool(tracking_summary["complete"])
             if (not tracking_ok and args.tail_recovery
@@ -655,6 +680,7 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                 )
                 tracking_summary = _tracking_summary(
                     task, attempt_dir, args.min_valid_pose_coverage, args.max_trailing_missing_frames,
+                    args.reverse_stop_frame_index,
                 )
                 task["tracking_summary"] = tracking_summary
                 task.setdefault("tail_recovery", {})["published"] = recovered
@@ -682,7 +708,10 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                     task["debug_sheet_error"] = f"{type(exc).__name__}: {exc}"
                     log.write(f"[debug-sheet] nonfatal failure: {task['debug_sheet_error']}\n")
                     log.flush()
-        tracking_summary = _tracking_summary(task, attempt_dir, args.min_valid_pose_coverage, args.max_trailing_missing_frames)
+        tracking_summary = _tracking_summary(
+            task, attempt_dir, args.min_valid_pose_coverage, args.max_trailing_missing_frames,
+            args.reverse_stop_frame_index,
+        )
         task["tracking_summary"] = tracking_summary
         task["status"] = "completed" if tracking_summary["complete"] else "failed"
         task["reason"] = None if task["status"] == "completed" else f"tracking_incomplete: {tracking_summary['reason']}"
@@ -714,6 +743,7 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
                                                 "camera_micro_batch_size": args.camera_micro_batch_size,
                                                 "max_video_duration_skew_sec": args.max_video_duration_skew_sec,
                                                 "init_frame_index": args.init_frame_index,
+                                                "reverse_stop_frame_index": args.reverse_stop_frame_index,
                                                 "foundpose_selection_mode": args.foundpose_selection_mode,
                                                 "foundpose_candidate_rank": args.foundpose_candidate_rank,
                                                 "foundpose_per_view_candidates": args.foundpose_per_view_candidates,
@@ -784,6 +814,7 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
     args.camera_micro_batch_size = int(manifest["camera_micro_batch_size"])
     args.max_video_duration_skew_sec = float(manifest["max_video_duration_skew_sec"])
     args.init_frame_index = int(manifest.get("init_frame_index", 0))
+    args.reverse_stop_frame_index = int(manifest.get("reverse_stop_frame_index", 0))
     args.foundpose_selection_mode = str(manifest.get("foundpose_selection_mode", args.foundpose_selection_mode))
     args.foundpose_candidate_rank = int(manifest.get("foundpose_candidate_rank", args.foundpose_candidate_rank))
     args.foundpose_per_view_candidates = int(manifest.get("foundpose_per_view_candidates", args.foundpose_per_view_candidates))
@@ -832,6 +863,7 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
                    "--camera-micro-batch-size", str(args.camera_micro_batch_size),
                    "--max-video-duration-skew-sec", str(args.max_video_duration_skew_sec),
                    "--init-frame-index", str(args.init_frame_index),
+                   "--reverse-stop-frame-index", str(args.reverse_stop_frame_index),
                    "--foundpose-selection-mode", args.foundpose_selection_mode,
                    "--foundpose-candidate-rank", str(args.foundpose_candidate_rank),
                    "--foundpose-per-view-candidates", str(args.foundpose_per_view_candidates),
@@ -960,6 +992,8 @@ def main() -> int:
     p.add_argument("--max-frames", type=int, default=-1)
     p.add_argument("--init-frame-index", type=int, default=30,
                    help="SAM3/FoundPose bootstrap frame. Default 30 avoids stale frame-0 captures; GoTrack merges reverse prefix poses automatically.")
+    p.add_argument("--reverse-stop-frame-index", type=int, default=0,
+                   help="Earliest frame tracked backward from --init-frame-index. Default: 0.")
     p.add_argument("--foundpose-selection-mode", choices=("silhouette", "consensus", "hybrid", "global"),
                    default="silhouette",
                    help="FoundPose wrapper selector. global adds coarse SO(3) search and multi-start silhouette refinement.")
@@ -1027,6 +1061,7 @@ def main() -> int:
     if (args.connect_timeout < 1 or args.num_cameras < 1 or args.camera_micro_batch_size < 0
             or args.max_video_duration_skew_sec < 0 or args.max_frames == 0 or args.max_attempts < 1
             or args.init_frame_index < 0 or args.foundpose_candidate_rank < 0
+            or not 0 <= args.reverse_stop_frame_index <= args.init_frame_index
             or args.foundpose_per_view_candidates < 1
             or args.foundpose_global_rotation_count < 1 or args.foundpose_global_coarse_max_side < 32
             or args.foundpose_global_refine_top_k < 1 or args.foundpose_global_min_rotation_separation_deg < 0
