@@ -1,6 +1,5 @@
-diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archive/run_multiview_gotrack_anchor_online_multi_object.py
---- a/archive/run_multiview_gotrack_anchor_online_multi_object.py	2026-07-14 13:25:40.162303872 +0900
-+++ b/archive/run_multiview_gotrack_anchor_online_multi_object.py	2026-07-30 11:53:29.701543417 +0900
+--- a/archive/run_multiview_gotrack_anchor_online_multi_object.py
++++ b/archive/run_multiview_gotrack_anchor_online_multi_object.py
 @@ -2,6 +2,7 @@
  from __future__ import annotations
  
@@ -30,7 +29,7 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
      robust_fit_pose_from_anchors,
      triangulate_anchor_observations,
  )
-@@ -155,6 +161,26 @@
+@@ -155,6 +161,31 @@
      per_camera_fused_records: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
      per_camera_singleview_results: dict[str, dict[str, Any]] = field(default_factory=dict)
      previous_fused_world_pose: np.ndarray | None = None
@@ -54,10 +53,15 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
 +    theta_last_frame: float | None = None
 +    theta_predicted: float = 0.0
 +    renderer_joint_ready: bool = False
++    # What to multiply the joint coordinate by before handing it to the renderer,
++    # which works in metres while the joint is tracked in the anchors' external
++    # units. An angle is dimensionless and this stays 1.0; a prismatic displacement
++    # is a length and needs the same factor the origin and the mesh already get.
++    renderer_joint_value_scale: float = 1.0
      processed_frames: int = 0
      total_ok_singleview_frames: int = 0
      total_pose_ok_singleview_frames: int = 0
-@@ -192,6 +218,13 @@
+@@ -192,6 +223,13 @@
      diameter_mm: float | None
      diameter_source: str
      observations_by_anchor: Any
@@ -71,7 +75,7 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
      intrinsics_map: dict[str, np.ndarray]
      extrinsics_map: dict[str, np.ndarray]
      # Full argparse.Namespace (picklable) — avoids future breakage if the
-@@ -641,6 +674,79 @@
+@@ -641,6 +679,103 @@
      parser.add_argument("--anchor-fit-inlier-threshold-mm", type=float, default=-1.0)
      parser.add_argument("--anchor-fit-min-anchors", type=int, default=6)
      parser.add_argument(
@@ -92,6 +96,27 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
 +            "already writes it. Leaving it at zero starts a lid that is actually open "
 +            "from closed, and the templates render closed too, so the anchors on the "
 +            "lid never pass the visibility test and the angle can never recover."
++        ),
++    )
++    parser.add_argument(
++        "--init-joint-value", type=float, nargs="*", default=None,
++        help=(
++            "Prismatic joints only, one value per object, in the mesh's own units. "
++            "The displacement counterpart of --init-theta-deg. Separate because a "
++            "displacement is a length and an angle is not: a single flag would take "
++            "0.15 as either 150 mm of travel or 8.6 degrees depending on a joint type "
++            "declared in a different file, and neither reading raises."
++        ),
++    )
++    parser.add_argument(
++        "--joint-extrapolate-max", type=float, default=0.0,
++        help=(
++            "Prismatic joints only. The displacement counterpart of "
++            "--theta-extrapolate-max-deg, in the mesh's own units. 0 disables. The "
++            "same reasoning applies -- a joint that moves appreciably between frames "
++            "otherwise starts every frame a full frame behind -- but the value has to "
++            "be chosen against the joint's speed in length per frame, and no default "
++            "can be carried over from the hinge."
 +        ),
 +    )
 +    parser.add_argument(
@@ -144,14 +169,17 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
 +            "\"origin\": [3], \"range_rad\": [lo, hi]}, all in the mesh's own units "
 +            "and frame. The measured joint written by the articulation pipeline is "
 +            "already in this shape. An existing bank carries its own joint and ignores "
-+            "this. Omit it and every object is tracked rigidly, as before."
++            "this. Omit it and every object is tracked rigidly, as before. "
++            "Add \"joint_type\": \"prismatic\" for a sliding joint, which ignores "
++            "\"origin\" and takes its travel as \"range\": [lo, hi] in the mesh's "
++            "units rather than \"range_rad\"."
 +        ),
 +    )
 +    parser.add_argument(
          "--confidence-weight-mode",
          type=str,
          default="linear",
-@@ -735,6 +841,32 @@
+@@ -735,6 +870,49 @@
      if anchor_bank_path.is_file():
          return load_anchor_bank(anchor_bank_path), anchor_bank_path
      anchor_bank_path.parent.mkdir(parents=True, exist_ok=True)
@@ -168,23 +196,40 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
 +            # Default to the layout the articulation pipeline writes beside joint.json.
 +            root = Path(articulation_json).expanduser().parent
 +            parts = [str(root / "parts/body.obj"), str(root / "parts/lid.obj")]
++        # The joint file is the single place the type is declared. Keeping it here
++        # rather than on the command line means a bank and the joint it was built
++        # from cannot disagree, and a bank that already exists carries the type
++        # forward without the caller having to remember it.
++        joint_type = str(joint.get("joint_type", "revolute"))
++        if joint_type == "prismatic":
++            # A travel range is a pair of lengths in the mesh's own units, so it goes
++            # in the argument that scales. "range_rad" is refused rather than
++            # reinterpreted: the two differ by a factor nothing can detect.
++            limit_kwargs = {"joint_limits": joint.get("range") or joint.get("travel")}
++            if joint.get("range_rad") is not None:
++                raise ValueError(
++                    f"{articulation_json}: a prismatic joint cannot have 'range_rad'; "
++                    "use 'range', in the same units as the meshes")
++        else:
++            limit_kwargs = {"theta_limits_rad": joint.get("range_rad")}
 +        anchor_bank = sample_articulated_mesh_anchors(
 +            part_mesh_paths=parts,
 +            num_anchors=args.num_anchors,
 +            joint_axis_o=joint["axis"],
-+            joint_origin_o=joint["origin"],
++            joint_origin_o=joint.get("origin", [0.0, 0.0, 0.0]),
 +            mesh_scale=args.mesh_scale,
 +            method=args.anchor_method,
 +            seed=args.anchor_seed,
-+            part_names=["body", "lid"],
-+            theta_limits_rad=joint.get("range_rad"),
++            part_names=joint.get("part_names") or ["body", "lid"],
++            joint_type=joint_type,
++            **limit_kwargs,
 +        )
 +        save_anchor_bank(anchor_bank_path, anchor_bank)
 +        return anchor_bank, anchor_bank_path
      anchor_bank = sample_mesh_anchors(
          mesh_path=mesh_path,
          num_anchors=args.num_anchors,
-@@ -749,6 +881,57 @@
+@@ -749,6 +927,60 @@
      return anchor_bank, anchor_bank_path
  
  
@@ -232,7 +277,10 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
 +        positions_o=np.asarray(triangulation_result["positions_o"], dtype=np.float32),
 +        positions_w=np.asarray(triangulation_result["positions_w"], dtype=np.float32),
 +        weights=np.asarray(triangulation_result["weights"], dtype=np.float32),
++        # theta_rad is absent on a prismatic fit by design, so the neutral name is the
++        # one that is always written; the angle stays for readers that predate it.
 +        theta_rad=np.float32(fit_result.get("theta_rad", np.nan)),
++        joint_value=np.float32(fit_result.get("joint_value", np.nan)),
 +        pose_world_from_object=np.asarray(
 +            fit_result.get("pose_world_from_object", np.full((4, 4), np.nan)),
 +            dtype=np.float64),
@@ -242,7 +290,7 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
  def _build_tri_fit_payload(
      task: "TriFitTask",
      *,
-@@ -757,6 +940,7 @@
+@@ -757,6 +989,7 @@
      args: argparse.Namespace,
      triangulation_parallel_workers: int,
      keep_per_view_anchor_data: bool = True,
@@ -250,7 +298,7 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
  ) -> tuple["TriFitPayload", dict[str, Any], float]:
      """Build compact worker payload and keep heavy context in the parent."""
      object_state = task.object_state
-@@ -835,6 +1019,10 @@
+@@ -835,6 +1068,10 @@
              ),
              compact_observations=True,
              keep_per_view_anchor_data=keep_per_view_anchor_data,
@@ -261,7 +309,7 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
          )
      )
      anchor_obs_runtime_sec = time.perf_counter() - obs_start_time
-@@ -863,6 +1051,12 @@
+@@ -863,6 +1100,12 @@
          diameter_mm=object_state.diameter_mm,
          diameter_source=str(object_state.diameter_source),
          observations_by_anchor=observations_by_anchor,
@@ -274,7 +322,7 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
          intrinsics_map=intrinsics_map,
          extrinsics_map=extrinsics_map,
          args=args,
-@@ -939,18 +1133,96 @@
+@@ -939,18 +1182,103 @@
              geometry_parallax_power=float(args.geometry_fit_parallax_power),
              geometry_min_weight=float(args.geometry_fit_min_weight),
          )
@@ -291,10 +339,10 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
 -            external_unit_scale_to_meter=payload.external_unit_scale_to_meter,
 +        source_points_o = np.asarray(
 +            triangulation_result["positions_o"], dtype=np.float32
-         )
++        )
 +        target_points_w = np.asarray(
 +            triangulation_result["positions_w"], dtype=np.float32
-+        )
+         )
 +        if payload.articulation is None:
 +            fit_result = robust_fit_pose_from_anchors(
 +                source_points_o=source_points_o,
@@ -341,6 +389,7 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
 +                    part_surface_samples_o=samples,
 +                    part_surface_offsets=articulation["part_surface_offsets"],
 +                    margin_external=margin_external,
++                    joint_type=articulation["joint_type"],
 +                )
 +                keep = np.asarray(surface_reject["keep_mask"], dtype=bool)
 +                # Keeping every anchor is safer than fitting from a handful: a frame
@@ -369,8 +418,14 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
 +                theta_init=float(payload.theta),
 +                # Report in the half turn around the previous angle, so a lid that
 +                # opens past 180 deg keeps counting up instead of wrapping negative.
-+                theta_reference_rad=float(payload.theta),
-+                theta_limits_rad=articulation["theta_limits_rad"],
++                # A displacement has no turns to wrap, so it gets no window -- and
++                # the fit refuses one rather than ignoring it.
++                **({} if articulation["joint_type"] == "prismatic"
++                   else {"theta_reference_rad": float(payload.theta)}),
++                # ``joint_limits`` is already in the joint's own unit, picked by the
++                # anchor bank from the unit system this fit runs in.
++                joint_limits=articulation["joint_limits"],
++                joint_type=articulation["joint_type"],
 +                theta_residual_ratio=float(
 +                    getattr(args, "theta_residual_ratio", 3.0)),
 +            )
@@ -382,7 +437,7 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
      else:
          fit_result = {
              "status": "skipped_fit",
-@@ -1138,13 +1410,13 @@
+@@ -1138,13 +1466,13 @@
      extrinsics_map: dict[str, np.ndarray],
  ) -> list[ObjectRuntimeState]:
      object_states: list[ObjectRuntimeState] = []
@@ -398,35 +453,58 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
          mesh_path = Path(mesh_path_raw).expanduser().resolve()
          init_pose_source = Path(init_pose_source_raw).expanduser().resolve()
          output_dir = (output_root / str(object_name)).expanduser().resolve()
-@@ -1247,6 +1519,27 @@
+@@ -1247,6 +1575,50 @@
              per_camera_fused_records=per_camera_fused_records,
              per_camera_singleview_results=per_camera_singleview_results,
          )
 +        # Seed the joint angle. The init pose records are the natural home for it --
 +        # they already carry the 6-DoF half of the same estimate -- and the flag is
 +        # there for records written before articulation existed.
-+        init_theta_list = getattr(args, "init_theta_deg", None) or []
-+        seed_theta_deg = (float(init_theta_list[object_index])
-+                          if object_index < len(init_theta_list) else None)
-+        if seed_theta_deg is None:
-+            for lookup in init_pose_lookups.values():
-+                for record in lookup.values():
-+                    if "theta_deg" in record:
-+                        seed_theta_deg = float(record["theta_deg"])
++        seed_articulation = articulation_from_anchor_bank(
++            object_state.anchor_bank, units="external")
++        seed_is_prismatic = (seed_articulation is not None
++                             and seed_articulation["joint_type"] == "prismatic")
++        if seed_is_prismatic:
++            # A displacement, in the anchors' own units, taken as given. There is no
++            # degree-to-radian step here and inventing one would be the whole bug.
++            init_value_list = getattr(args, "init_joint_value", None) or []
++            seed_value = (float(init_value_list[object_index])
++                          if object_index < len(init_value_list) else None)
++            if seed_value is None:
++                for lookup in init_pose_lookups.values():
++                    for record in lookup.values():
++                        if "joint_value" in record:
++                            seed_value = float(record["joint_value"])
++                            break
++                    if seed_value is not None:
 +                        break
-+                if seed_theta_deg is not None:
-+                    break
-+        if seed_theta_deg is not None:
-+            object_state.theta = float(np.radians(seed_theta_deg))
++            seed_label = None if seed_value is None else f"{seed_value:.4f} (mesh units)"
++        else:
++            init_theta_list = getattr(args, "init_theta_deg", None) or []
++            seed_theta_deg = (float(init_theta_list[object_index])
++                              if object_index < len(init_theta_list) else None)
++            if seed_theta_deg is None:
++                for lookup in init_pose_lookups.values():
++                    for record in lookup.values():
++                        if "theta_deg" in record:
++                            seed_theta_deg = float(record["theta_deg"])
++                            break
++                    if seed_theta_deg is not None:
++                        break
++            seed_value = (None if seed_theta_deg is None
++                          else float(np.radians(seed_theta_deg)))
++            seed_label = None if seed_theta_deg is None else f"{seed_theta_deg:.2f} deg"
++        if seed_value is not None:
++            object_state.theta = float(seed_value)
 +            object_state.theta_predicted = object_state.theta
 +            _status_print(
-+                f"[articulated] {object_state.object_name}: initial joint angle "
-+                f"{seed_theta_deg:.2f} deg"
++                f"[articulated] {object_state.object_name}: initial joint value "
++                f"{seed_label}"
 +            )
          _status_print(
              "[gotrack_multiview_anchor_online_multi_object] object prepared | "
              f"name={object_state.object_name} object_id={object_state.object_id} "
-@@ -1354,6 +1647,11 @@
+@@ -1354,6 +1726,11 @@
              f"{device} in {time.perf_counter() - renderer_start:.1f}s "
              f"(objects={[object_state.object_name for object_state in object_states]})"
          )
@@ -438,7 +516,7 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
          states.append(
              DeviceState(
                  device=device,
-@@ -1365,6 +1663,65 @@
+@@ -1365,6 +1742,74 @@
      return states
  
  
@@ -490,9 +568,18 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
 +            moving_vertex_mask=moving,
 +            axis_o=articulation["joint_axis_o"],
 +            origin_o=np.asarray(articulation["joint_origin_o"]) * scale_to_meter,
++            joint_type=articulation["joint_type"],
 +        )
++        # The origin above is scaled into the renderer's metres, and for a sliding
++        # joint the coordinate itself is a length in the same units and needs the
++        # same treatment. Left unscaled it would move the part by millimetres where
++        # metres were meant, which renders as a joint that barely opens.
++        object_state.renderer_joint_value_scale = (
++            scale_to_meter if articulation["joint_type"] == "prismatic" else 1.0)
 +        renderer.set_object_joint_angle(
-+            object_id, float(object_state.theta_predicted or object_state.theta))
++            object_id,
++            float(object_state.theta_predicted or object_state.theta)
++            * object_state.renderer_joint_value_scale)
 +        object_state.renderer_joint_ready = True
 +        _status_print(
 +            f"[articulated] {object_state.object_name}: joint registered, "
@@ -504,7 +591,7 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
  def _process_group_for_timestep_anchor_multi(
      *,
      device_state: DeviceState,
-@@ -1382,6 +1739,18 @@
+@@ -1382,6 +1827,20 @@
      results: dict[str, dict[str, dict[str, Any]]] = {
          object_state.object_name: {} for object_state in active_objects
      }
@@ -519,16 +606,29 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
 +        for object_state in active_objects:
 +            if getattr(object_state, "renderer_joint_ready", False):
 +                renderer.set_object_joint_angle(
-+                    int(object_state.object_id), float(object_state.theta_predicted))
++                    int(object_state.object_id),
++                    float(object_state.theta_predicted)
++                    * float(object_state.renderer_joint_value_scale))
      pending_metadata: list[tuple[str, str, dict[str, Any], np.ndarray]] = []
      pending_scene_observations: list[Any] = []
      pending_direct_samples: list[dict[str, Any]] = []
-@@ -2223,6 +2592,12 @@
+@@ -2223,6 +2682,23 @@
              "[gotrack_multiview_anchor_online_multi_object] entering frame loop | "
              f"total_frames={total_frames} frame_step={args.frame_step} max_frames={args.max_frames}"
          )
++        # One cap, in whatever unit the joint is tracked in. The two flags stay
++        # separate because their units are, and only one can be non-zero for a given
++        # joint -- a degree figure applied to a displacement would cap the step at
++        # 0.017 of a millimetre and freeze the joint.
 +        theta_extrapolate_max_rad = float(
 +            np.radians(max(float(args.theta_extrapolate_max_deg), 0.0)))
++        joint_extrapolate_max = max(float(getattr(args, "joint_extrapolate_max", 0.0)), 0.0)
++        if joint_extrapolate_max > 0.0:
++            if theta_extrapolate_max_rad > 0.0:
++                raise ValueError(
++                    "Pass --theta-extrapolate-max-deg for a revolute joint or "
++                    "--joint-extrapolate-max for a prismatic one, not both")
++            theta_extrapolate_max_rad = joint_extrapolate_max
 +        dump_anchor_target_frames = {
 +            int(token) for token in str(args.dump_anchor_target_frames).split(",")
 +            if token.strip()
@@ -536,7 +636,7 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
          progress = tqdm(range(total_frames), desc="gotrack_anchor_mv_multiobj")
          for frame_idx in progress:
              frame_loop_start_time = time.perf_counter()
-@@ -2332,6 +2707,12 @@
+@@ -2332,6 +2808,12 @@
                      init_source_mode = "external_init_pose"
  
                  assert object_state.previous_fused_world_pose is not None
@@ -549,7 +649,7 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
                  refine_iters = 1
                  if (
                      init_source_mode == "external_init_pose"
-@@ -2431,6 +2812,10 @@
+@@ -2431,6 +2913,10 @@
                          args=args,
                          triangulation_parallel_workers=triangulation_parallel_workers,
                          keep_per_view_anchor_data=debug_this_frame,
@@ -560,7 +660,7 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
                      )
  
                  tri_fit_payloads: list[TriFitPayload] = []
-@@ -2511,10 +2896,27 @@
+@@ -2511,10 +2997,27 @@
                      fit_result = tri_fit["fit_result"]
                      triangulation_result = tri_fit["triangulation_result"]
  
@@ -582,13 +682,13 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
 +                        # the next projection swings the anchors to where this
 +                        # iteration just put them.
 +                        if fit_result.get("theta_observed"):
-+                            object_state.theta = float(fit_result["theta_rad"])
++                            object_state.theta = float(fit_result["joint_value"])
 +                            object_state.theta_predicted = object_state.theta
 +                            object_state.theta_observed = True
                      else:
                          if int(context["target_iters"]) > 1:
                              _status_print(
-@@ -2602,6 +3004,14 @@
+@@ -2602,6 +3105,14 @@
                      object_state.previous_fused_world_pose = coerce_homogeneous_matrix(
                          world_record["pose_world"]
                      )
@@ -597,15 +697,14 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online_multi_object.py pb/archi
 +                    # unable to tell a held angle from a fresh one, and a run of
 +                    # occluded frames would look like a confidently static lid.
 +                    if world_record.get("theta_observed"):
-+                        object_state.theta = float(world_record["theta_rad"])
++                        object_state.theta = float(world_record["joint_value"])
 +                        object_state.theta_predicted = object_state.theta
 +                        object_state.theta_observed = True
                      ok_worlds += 1
                  else:
                      object_state.previous_fused_world_pose = None
-diff -ruN a/archive/run_multiview_gotrack_anchor_online.py pb/archive/run_multiview_gotrack_anchor_online.py
---- a/archive/run_multiview_gotrack_anchor_online.py	2026-07-13 13:00:39.781231883 +0900
-+++ b/archive/run_multiview_gotrack_anchor_online.py	2026-07-30 11:30:47.082076240 +0900
+--- a/archive/run_multiview_gotrack_anchor_online.py
++++ b/archive/run_multiview_gotrack_anchor_online.py
 @@ -51,6 +51,7 @@
  from run_multiview_gotrack_visualize import render_world_pose_visualizations
  from utils import im_util
@@ -629,7 +728,7 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online.py pb/archive/run_multiv
      observations_by_anchor: dict[int, list[dict[str, Any]]] = {}
      compact_anchor_id_chunks: list[np.ndarray] = []
      compact_camera_ids: list[str] = []
-@@ -535,6 +542,13 @@
+@@ -535,6 +542,14 @@
                  else np.asarray(rendered_depth, dtype=np.float32)
              ),
              depth_tolerance=float(args.anchor_depth_tolerance_m) / float(external_unit_scale_to_meter),
@@ -639,11 +738,12 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online.py pb/archive/run_multiv
 +                "joint_origin_o": articulation["joint_origin_o"],
 +                "theta": float(theta),
 +                "moving_part_id": articulation["moving_part_id"],
++                "joint_type": articulation["joint_type"],
 +            }),
          )
          observations = build_anchor_observations_for_view(
              anchor_bank=anchor_bank,
-@@ -694,6 +708,29 @@
+@@ -694,6 +709,37 @@
          "mean_triangulation_residual_mm": float(
              np.mean([record["triangulation_residual_mm"] for record in triangulation_records])
          ) if triangulation_records else 0.0,
@@ -652,9 +752,17 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online.py pb/archive/run_multiv
 +        # rather than measured; ``theta_clamped`` means the joint limit bound and the
 +        # value is censored. Both are recorded because a downstream reader cannot
 +        # tell either case from a genuine measurement by looking at the angle.
-+        **({} if "theta_rad" not in fit_result else {
-+            "theta_rad": float(fit_result["theta_rad"]),
-+            "theta_deg": float(fit_result["theta_deg"]),
++        # Gated on the type-neutral key, which every articulated fit writes. Gating on
++        # ``theta_rad`` would drop the whole block for a prismatic joint, which does
++        # not have one -- and silently, since the reader downstream only asks whether
++        # the angle was observed.
++        **({} if "joint_value" not in fit_result else {
++            "joint_type": str(fit_result.get("joint_type", "revolute")),
++            "joint_value": float(fit_result["joint_value"]),
++            **({} if "theta_rad" not in fit_result else {
++                "theta_rad": float(fit_result["theta_rad"]),
++                "theta_deg": float(fit_result["theta_deg"]),
++            }),
 +            "theta_observed": bool(fit_result.get("theta_observed", False)),
 +            "theta_clamped": bool(fit_result.get("theta_clamped", False)),
 +            # Set when the moving anchors could not be explained by any angle and
@@ -673,9 +781,8 @@ diff -ruN a/archive/run_multiview_gotrack_anchor_online.py pb/archive/run_multiv
          "views": [
              {"camera_id": str(camera_id), **summary}
              for camera_id, summary in per_view_summary.items()
-diff -ruN a/tests/test_articulated_anchor_bank.py pb/tests/test_articulated_anchor_bank.py
---- a/tests/test_articulated_anchor_bank.py	1970-01-01 09:00:00.000000000 +0900
-+++ b/tests/test_articulated_anchor_bank.py	2026-07-29 16:36:50.564346209 +0900
+--- a/tests/test_articulated_anchor_bank.py
++++ b/tests/test_articulated_anchor_bank.py
 @@ -0,0 +1,196 @@
 +#!/usr/bin/env python3
 +"""Build an articulated anchor bank from the real box parts and fit against it.
@@ -873,9 +980,8 @@ diff -ruN a/tests/test_articulated_anchor_bank.py pb/tests/test_articulated_anch
 +
 +if __name__ == "__main__":
 +    raise SystemExit(main())
-diff -ruN a/tests/test_articulated_fit.py pb/tests/test_articulated_fit.py
---- a/tests/test_articulated_fit.py	1970-01-01 09:00:00.000000000 +0900
-+++ b/tests/test_articulated_fit.py	2026-07-30 11:35:08.703658818 +0900
+--- a/tests/test_articulated_fit.py
++++ b/tests/test_articulated_fit.py
 @@ -0,0 +1,458 @@
 +#!/usr/bin/env python3
 +"""Recover a known body pose and joint angle from anchors that have been corrupted.
@@ -1335,9 +1441,8 @@ diff -ruN a/tests/test_articulated_fit.py pb/tests/test_articulated_fit.py
 +    test_surface_test_needs_no_reference_pose()
 +    print(f"\n{len(FAILURES)} failures" + (f": {FAILURES}" if FAILURES else ""))
 +    raise SystemExit(1 if FAILURES else 0)
-diff -ruN a/tests/test_articulated_runtime_wiring.py pb/tests/test_articulated_runtime_wiring.py
---- a/tests/test_articulated_runtime_wiring.py	1970-01-01 09:00:00.000000000 +0900
-+++ b/tests/test_articulated_runtime_wiring.py	2026-07-29 16:56:05.072938817 +0900
+--- a/tests/test_articulated_runtime_wiring.py
++++ b/tests/test_articulated_runtime_wiring.py
 @@ -0,0 +1,166 @@
 +#!/usr/bin/env python3
 +"""Exercise the runtime's articulated path without a GPU, a model, or a capture.
@@ -1505,10 +1610,508 @@ diff -ruN a/tests/test_articulated_runtime_wiring.py pb/tests/test_articulated_r
 +
 +if __name__ == "__main__":
 +    raise SystemExit(main())
-diff -ruN a/utils/anchor_bank.py pb/utils/anchor_bank.py
---- a/utils/anchor_bank.py	2026-07-13 13:00:39.799232576 +0900
-+++ b/utils/anchor_bank.py	2026-07-30 11:28:16.302820149 +0900
-@@ -1,6 +1,7 @@
+--- a/tests/test_prismatic_joint.py
++++ b/tests/test_prismatic_joint.py
+@@ -0,0 +1,496 @@
++#!/usr/bin/env python3
++"""Recover a known body pose and joint *displacement* from synthetic anchors.
++
++There is no prismatic object scanned and no capture of one, so this file is the only
++thing standing between the prismatic path and a silent mistake. It is written to
++cover the two failures that a real capture would *not* reveal, rather than the ones
++it would:
++
++  * A displacement is a length, so it scales between unit systems. An angle does not.
++    Every existing unit boundary was built when the joint coordinate was an angle and
++    therefore passes it through untouched, which is correct for a hinge and wrong for
++    a slide by whatever the scale factor happens to be. Nothing raises.
++  * A displacement has no period, so the half-turn reporting window that keeps a
++    215 deg hinge from being reported as -145 deg has to be skipped entirely. Left in,
++    it folds any displacement into a band around pi and returns a plausible number.
++
++Both would produce a track that runs, reports sensible-looking residuals, and is
++wrong. The solver, by contrast, fails loudly when it is wrong, which is why it gets
++less attention here than the bookkeeping around it.
++
++Run: python tests/test_prismatic_joint.py
++"""
++
++from __future__ import annotations
++
++import sys
++import tempfile
++from pathlib import Path
++
++import numpy as np
++import trimesh
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from utils.anchor_bank import (  # noqa: E402
++    articulation_from_anchor_bank,
++    load_anchor_bank,
++    prepare_anchor_bank_for_gotrack,
++    sample_articulated_mesh_anchors,
++    save_anchor_bank,
++)
++from utils.multiview_geometry import (  # noqa: E402
++    compute_articulated_fit_residuals,
++    fit_articulated_transform_weighted,
++    fit_joint_displacement_weighted,
++    joint_transform,
++    robust_fit_articulated_pose_from_anchors,
++)
++
++# A drawer: a 200 x 200 x 150 mm housing with a slightly smaller drawer sliding out
++# along +y. Metres, matching the capture units the rest of the pipeline uses.
++AXIS = np.array([0.0, 1.0, 0.0])
++# Deliberately not the origin of anything. A sliding joint has no centre, and this
++# value existing in the tests is what proves the code ignores it.
++BOGUS_ORIGIN = np.array([0.31, -0.47, 0.22])
++TRAVEL = (0.0, 0.15)
++FAILURES: list[str] = []
++
++
++def _check(name: str, condition: bool, detail: str = "") -> None:
++    print(f"  {'PASS' if condition else 'FAIL'}  {name}{'  ' + detail if detail else ''}")
++    if not condition:
++        FAILURES.append(name)
++
++
++def _random_pose(rng: np.random.Generator) -> np.ndarray:
++    axis = rng.normal(size=3)
++    axis /= np.linalg.norm(axis)
++    angle = rng.uniform(0.0, np.pi)
++    cross = np.array([[0.0, -axis[2], axis[1]],
++                      [axis[2], 0.0, -axis[0]],
++                      [-axis[1], axis[0], 0.0]])
++    pose = np.eye(4)
++    pose[:3, :3] = (np.eye(3) + np.sin(angle) * cross
++                    + (1.0 - np.cos(angle)) * (cross @ cross))
++    pose[:3, 3] = rng.uniform(-0.5, 0.5, size=3)
++    return pose
++
++
++def _anchors(rng: np.random.Generator, n_housing: int = 120, n_drawer: int = 80):
++    """Anchors on the housing and on the drawer front and sides.
++
++    Unlike a hinge there is no such thing as an anchor with no lever arm here: every
++    anchor on the moving part has the same sensitivity to the displacement, so where
++    they sit does not matter to the solve. It matters to nothing else in this file
++    either, which is itself the point being recorded.
++    """
++    housing = np.column_stack([rng.uniform(-0.10, 0.10, n_housing),
++                               rng.uniform(-0.10, 0.10, n_housing),
++                               rng.uniform(-0.075, 0.075, n_housing)])
++    drawer = np.column_stack([rng.uniform(-0.09, 0.09, n_drawer),
++                              rng.uniform(-0.09, 0.09, n_drawer),
++                              rng.uniform(-0.065, 0.065, n_drawer)])
++    source = np.vstack([housing, drawer])
++    parts = np.concatenate([np.zeros(n_housing, dtype=int), np.ones(n_drawer, dtype=int)])
++    return source, parts
++
++
++def _observe(source, parts, pose, displacement):
++    posed = source.copy()
++    moving = parts == 1
++    transform = joint_transform(AXIS, BOGUS_ORIGIN, displacement, joint_type="prismatic")
++    posed[moving] = source[moving] @ transform[:3, :3].T + transform[:3, 3]
++    return posed @ pose[:3, :3].T + pose[:3, 3]
++
++
++def _write_boxes(directory: Path) -> tuple[Path, Path]:
++    housing = trimesh.creation.box(extents=(0.20, 0.20, 0.15))
++    drawer = trimesh.creation.box(extents=(0.18, 0.18, 0.13))
++    housing_path, drawer_path = directory / "housing.obj", directory / "drawer.obj"
++    housing.export(housing_path)
++    drawer.export(drawer_path)
++    return housing_path, drawer_path
++
++
++def test_transform_is_a_pure_translation() -> None:
++    """The joint transform itself, and its indifference to the origin."""
++    print("\nprismatic joint transform")
++    for displacement in (0.0, 0.05, -0.05, 7.5):
++        transform = joint_transform(AXIS, BOGUS_ORIGIN, displacement, joint_type="prismatic")
++        expected = np.eye(4)
++        expected[:3, 3] = displacement * AXIS
++        _check(f"d {displacement:+7.3f} m is a pure translation",
++               np.allclose(transform, expected, atol=1e-12),
++               f"max dev {np.abs(transform - expected).max():.2e}")
++
++    # A sliding part has no centre, so a caller passing one -- and every caller will,
++    # because the joint description carries an origin field -- must not change the
++    # answer. If this ever fails it means the origin has been wired into the prismatic
++    # branch, and every bank whose origin is in the wrong unit system becomes wrong.
++    a = joint_transform(AXIS, np.zeros(3), 0.06, joint_type="prismatic")
++    b = joint_transform(AXIS, BOGUS_ORIGIN * 1000.0, 0.06, joint_type="prismatic")
++    _check("origin is ignored", np.allclose(a, b, atol=1e-15))
++
++    # Only the direction of the axis matters; its length must not leak into the
++    # displacement, or the joint travels by |axis| times too much.
++    scaled = joint_transform(AXIS * 37.0, BOGUS_ORIGIN, 0.06, joint_type="prismatic")
++    _check("axis length does not scale the travel",
++           np.allclose(scaled, a, atol=1e-15))
++
++
++def test_displacement_alone() -> None:
++    """The one-dimensional solve, isolated from the pose."""
++    print("\njoint displacement alone, body frame")
++    rng = np.random.default_rng(1)
++    source, parts = _anchors(rng)
++    drawer = source[parts == 1]
++    for truth in (-0.05, 0.0, 0.075, 0.15, 7.5):
++        transform = joint_transform(AXIS, BOGUS_ORIGIN, truth, joint_type="prismatic")
++        target = drawer @ transform[:3, :3].T + transform[:3, 3]
++        solved = fit_joint_displacement_weighted(
++            drawer, target, np.ones(len(drawer)), AXIS)
++        _check(f"d {truth:+7.3f} m", abs(solved - truth) < 1e-12,
++               f"err {abs(solved - truth):.2e} m")
++
++
++def test_exact() -> None:
++    """Pose and displacement together, no noise."""
++    print("\nexact anchors")
++    rng = np.random.default_rng(0)
++    for truth in (0.0, 0.037, 0.15, -0.05):
++        pose_true = _random_pose(rng)
++        source, parts = _anchors(rng)
++        target = _observe(source, parts, pose_true, truth)
++        pose, solved, rounds = fit_articulated_transform_weighted(
++            source, target, np.ones(len(source)), parts, AXIS, BOGUS_ORIGIN,
++            joint_type="prismatic")
++        shift = np.linalg.norm(pose[:3, 3] - pose_true[:3, 3]) * 1000.0
++        # The alternation stops when its step falls below tolerance_rad, which for a
++        # prismatic joint is a length -- 1 nm at the default. A few times that is what
++        # remains, so asserting at the tolerance itself would be asserting that the
++        # loop overshoots its own stopping rule. 0.1 um is four orders below anything
++        # this pipeline can measure.
++        _check(f"d {truth:+7.3f} m recovered", abs(solved - truth) < 1e-7,
++               f"err {abs(solved - truth):.2e} m, {shift:.2e} mm, {rounds} rounds")
++
++
++def test_displacement_is_never_wrapped() -> None:
++    """The half-turn reporting window must not touch a displacement.
++
++    This is the test that would have caught the wrap being left in. Each value below
++    is one the revolute path deliberately folds: read as radians, -0.05 reports as
++    6.23 and 7.5 as 1.22. Read as a length they must come back exactly as given, and
++    the failure mode if they do not is a number in the right ballpark rather than an
++    exception -- 1.22 m of drawer travel is wrong but not obviously so.
++    """
++    print("\nno reporting window on a displacement")
++    rng = np.random.default_rng(2)
++    for truth in (-0.05, 7.5, 2 * np.pi + 0.4):
++        pose_true = _random_pose(rng)
++        source, parts = _anchors(rng)
++        target = _observe(source, parts, pose_true, truth)
++        # Started near the answer, the way tracking always calls this -- the previous
++        # frame's value. Whether a distant start converges is a separate question with
++        # its own test below; this one is only about how the answer is reported.
++        _, solved, _ = fit_articulated_transform_weighted(
++            source, target, np.ones(len(source)), parts, AXIS, BOGUS_ORIGIN,
++            joint_type="prismatic", theta_init=0.9 * truth)
++        folded = np.pi + np.arctan2(np.sin(truth - np.pi), np.cos(truth - np.pi))
++        _check(f"d {truth:+7.3f} kept, not folded to {folded:+.3f}",
++               abs(solved - truth) < 1e-6, f"got {solved:+.6f}")
++
++    # And the same value through the revolute path *is* folded, so the test above is
++    # measuring a real branch rather than a wrap that never fired.
++    source, parts = _anchors(rng)
++    pose_true = _random_pose(rng)
++    posed = source.copy()
++    transform = joint_transform(AXIS, BOGUS_ORIGIN, -0.05)
++    posed[parts == 1] = source[parts == 1] @ transform[:3, :3].T + transform[:3, 3]
++    target = posed @ pose_true[:3, :3].T + pose_true[:3, 3]
++    _, angle, _ = fit_articulated_transform_weighted(
++        source, target, np.ones(len(source)), parts, AXIS, BOGUS_ORIGIN)
++    _check("revolute still folds -0.05 rad into [0, 2pi)", angle > 6.0,
++           f"revolute reports {angle:+.4f} rad")
++
++
++def test_far_displacement_needs_a_nearby_start() -> None:
++    """How far the alternation reaches from a cold start, and that it fails loudly.
++
++    Starting at zero, the first Kabsch has to explain moving anchors that are already
++    displaced, so a large enough displacement drags the initial body pose somewhere
++    the alternation cannot climb back from. Measured here: reliable out to about ten
++    times the part's half-size, degrading past that. A drawer travels roughly its own
++    length, so nothing physical comes close -- this is recorded because it is the one
++    place the prismatic solve is worse behaved than the hinge, not because it is
++    expected to bind.
++
++    The useful half is that it does not fail quietly. The wrong minimum leaves a mean
++    residual around 0.1 m against 1e-7 m for the right one, so the existing inlier
++    threshold rejects it. That is the opposite of the angle runaway, which was
++    dangerous precisely because its residuals stayed healthy.
++    """
++    print("\ncold-start reach")
++    rng = np.random.default_rng(11)
++    for truth, expected in ((0.15, 20), (1.0, 20)):
++        recovered = 0
++        for _ in range(20):
++            pose_true = _random_pose(rng)
++            source, parts = _anchors(rng)
++            target = _observe(source, parts, pose_true, truth)
++            _, solved, _ = fit_articulated_transform_weighted(
++                source, target, np.ones(len(source)), parts, AXIS, BOGUS_ORIGIN,
++                joint_type="prismatic")
++            recovered += abs(solved - truth) < 1e-6
++        _check(f"d {truth:.2f} m ({truth / 0.1:.0f}x half-size) from a cold start",
++               recovered == expected, f"{recovered}/20")
++
++    # A displacement far outside any plausible travel, from a cold start: the point is
++    # not that it converges but that when it does not, the residual says so.
++    rng = np.random.default_rng(2)
++    for _ in range(2):
++        pose_true, (source, parts) = _random_pose(rng), _anchors(rng)
++    target = _observe(source, parts, pose_true, 2 * np.pi + 0.4)
++    pose, solved, _ = fit_articulated_transform_weighted(
++        source, target, np.ones(len(source)), parts, AXIS, BOGUS_ORIGIN,
++        joint_type="prismatic")
++    residuals = compute_articulated_fit_residuals(
++        pose, solved, source, target, parts, AXIS, BOGUS_ORIGIN, joint_type="prismatic")
++    missed = abs(solved - (2 * np.pi + 0.4)) > 1e-6
++    _check("a missed cold start is visible in the residual",
++           (not missed) or float(np.mean(residuals)) > 1e-3,
++           f"d {solved:+.4f}, mean residual {float(np.mean(residuals)):.3e} m")
++
++
++def test_noise() -> None:
++    """Gaussian anchor noise, at and above what triangulation delivers."""
++    print("\nnoisy anchors")
++    rng = np.random.default_rng(3)
++    for sigma_mm in (1.0, 3.0, 10.0):
++        errors = []
++        for _ in range(20):
++            pose_true = _random_pose(rng)
++            source, parts = _anchors(rng)
++            truth = float(rng.uniform(*TRAVEL))
++            target = _observe(source, parts, pose_true, truth)
++            target += rng.normal(scale=sigma_mm / 1000.0, size=target.shape)
++            _, solved, _ = fit_articulated_transform_weighted(
++                source, target, np.ones(len(source)), parts, AXIS, BOGUS_ORIGIN,
++                joint_type="prismatic")
++            errors.append(abs(solved - truth) * 1000.0)
++        median = float(np.median(errors))
++        # Averaging n anchors shrinks the noise, so the displacement should come back
++        # tighter than a single anchor's error rather than merely comparable to it.
++        _check(f"sigma {sigma_mm:4.1f} mm -> displacement error below it",
++               median < sigma_mm, f"median {median:.3f} mm, max {max(errors):.3f} mm")
++
++
++def test_limit_mixups_are_errors() -> None:
++    """Radians offered to a sliding joint must raise rather than be reinterpreted."""
++    print("\nlimit and unit guards")
++    rng = np.random.default_rng(4)
++    source, parts = _anchors(rng)
++    target = _observe(source, parts, np.eye(4), 0.05)
++    common = dict(inlier_threshold_mm=8.0, external_unit_scale_to_meter=1.0)
++
++    def _raises(name: str, **kwargs) -> None:
++        try:
++            robust_fit_articulated_pose_from_anchors(
++                source, target, np.ones(len(source)), parts, AXIS, BOGUS_ORIGIN,
++                **common, **kwargs)
++        except ValueError:
++            _check(name, True)
++        else:
++            _check(name, False, "no ValueError raised")
++
++    _raises("radian limits on a prismatic joint",
++            joint_type="prismatic", theta_limits_rad=(0.0, 0.15))
++    _raises("a reporting window on a prismatic joint",
++            joint_type="prismatic", theta_reference_rad=np.pi)
++    _raises("both limit arguments at once",
++            theta_limits_rad=(0.0, 1.0), joint_limits=(0.0, 1.0))
++    _raises("an unknown joint type", joint_type="helical")
++
++
++def test_record_omits_angle_keys() -> None:
++    """A prismatic result must not carry a number named as an angle."""
++    print("\nresult record")
++    rng = np.random.default_rng(5)
++    source, parts = _anchors(rng)
++    pose_true = _random_pose(rng)
++    target = _observe(source, parts, pose_true, 0.062)
++    result = robust_fit_articulated_pose_from_anchors(
++        source, target, np.ones(len(source)), parts, AXIS, BOGUS_ORIGIN,
++        inlier_threshold_mm=8.0, joint_type="prismatic")
++    _check("status ok", result["status"] == "ok", result["status"])
++    _check("joint_type reported", result.get("joint_type") == "prismatic")
++    _check("joint_value is the displacement", abs(result["joint_value"] - 0.062) < 1e-6,
++           f"{result['joint_value']:.6f} m")
++    _check("no theta_rad", "theta_rad" not in result)
++    _check("no theta_deg", "theta_deg" not in result)
++
++    # A revolute fit keeps both, so nothing that reads them today has to change.
++    posed = source.copy()
++    transform = joint_transform(AXIS, BOGUS_ORIGIN, 0.9)
++    posed[parts == 1] = source[parts == 1] @ transform[:3, :3].T + transform[:3, 3]
++    revolute = robust_fit_articulated_pose_from_anchors(
++        source, posed @ pose_true[:3, :3].T + pose_true[:3, 3],
++        np.ones(len(source)), parts, AXIS, BOGUS_ORIGIN, inlier_threshold_mm=8.0)
++    _check("revolute still reports theta_rad and theta_deg",
++           "theta_rad" in revolute and "theta_deg" in revolute)
++    _check("revolute joint_value agrees with theta_rad",
++           abs(revolute["joint_value"] - revolute["theta_rad"]) < 1e-12)
++    _check("revolute joint_type defaults", revolute.get("joint_type") == "revolute")
++
++
++def test_clamp_uses_joint_limits() -> None:
++    """The travel stop is a length, and clamping to it is flagged like the hinge's."""
++    print("\ntravel limits")
++    rng = np.random.default_rng(6)
++    source, parts = _anchors(rng)
++    pose_true = _random_pose(rng)
++    target = _observe(source, parts, pose_true, 0.30)
++    result = robust_fit_articulated_pose_from_anchors(
++        source, target, np.ones(len(source)), parts, AXIS, BOGUS_ORIGIN,
++        inlier_threshold_mm=8.0, joint_type="prismatic", joint_limits=TRAVEL)
++    _check("clamped to the travel stop", abs(result["joint_value"] - TRAVEL[1]) < 1e-9,
++           f"{result['joint_value']:.6f} m")
++    _check("and says so", bool(result["theta_clamped"]))
++
++
++def test_units_round_trip() -> None:
++    """The asymmetry that makes this port dangerous, pinned in both directions.
++
++    An angle is dimensionless and is stored once. A displacement is a length and is
++    stored twice, exactly like the joint origin. Getting this wrong does not raise --
++    it puts the travel stop a thousand times too far away -- so both halves are
++    asserted here rather than left to the caller to remember.
++    """
++    print("\nunit round trip")
++    with tempfile.TemporaryDirectory() as directory:
++        housing, drawer = _write_boxes(Path(directory))
++        bank = sample_articulated_mesh_anchors(
++            [housing, drawer], num_anchors=256,
++            joint_axis_o=AXIS, joint_origin_o=BOGUS_ORIGIN,
++            part_names=["housing", "drawer"],
++            joint_type="prismatic", joint_limits=TRAVEL, seed=0)
++        _check("joint type recorded", bank["metadata"]["joint_type"] == "prismatic")
++        _check("no radian limits invented",
++               bank["metadata"]["theta_limits_rad"] is None)
++
++        prepared = prepare_anchor_bank_for_gotrack(
++            bank, translation_scale_to_gotrack=1000.0)
++        external = articulation_from_anchor_bank(prepared, units="external")
++        gotrack = articulation_from_anchor_bank(prepared, units="gotrack")
++        _check("external travel unchanged",
++               np.allclose(external["joint_limits"], TRAVEL),
++               f"{external['joint_limits']}")
++        _check("gotrack travel scaled by 1000",
++               np.allclose(gotrack["joint_limits"], np.asarray(TRAVEL) * 1000.0),
++               f"{gotrack['joint_limits']}")
++        _check("axis is a direction and does not scale",
++               np.allclose(external["joint_axis_o"], gotrack["joint_axis_o"]))
++        _check("type survives both unit systems",
++               external["joint_type"] == gotrack["joint_type"] == "prismatic")
++
++        saved = Path(directory) / "bank.npz"
++        save_anchor_bank(saved, prepared)
++        reloaded = articulation_from_anchor_bank(load_anchor_bank(saved), units="gotrack")
++        _check("and survives a save/load round trip",
++               np.allclose(reloaded["joint_limits"], np.asarray(TRAVEL) * 1000.0)
++               and reloaded["joint_type"] == "prismatic")
++
++        # The other half of the asymmetry: a hinge's limits are radians, so the two
++        # unit systems must report the *same* numbers. A future edit that "fixes" the
++        # units by scaling all limits uniformly breaks here.
++        hinge = prepare_anchor_bank_for_gotrack(
++            sample_articulated_mesh_anchors(
++                [housing, drawer], num_anchors=256,
++                joint_axis_o=AXIS, joint_origin_o=BOGUS_ORIGIN,
++                part_names=["housing", "drawer"],
++                theta_limits_rad=(0.0, 3.6), seed=0),
++            translation_scale_to_gotrack=1000.0)
++        hinge_external = articulation_from_anchor_bank(hinge, units="external")
++        hinge_gotrack = articulation_from_anchor_bank(hinge, units="gotrack")
++        _check("radian limits are identical in both unit systems",
++               np.allclose(hinge_external["joint_limits"], hinge_gotrack["joint_limits"])
++               and np.allclose(hinge_gotrack["joint_limits"], (0.0, 3.6)),
++               f"{hinge_gotrack['joint_limits']}")
++        _check("but the hinge origin does scale",
++               np.allclose(hinge_gotrack["joint_origin_o"],
++                           hinge_external["joint_origin_o"] * 1000.0))
++
++
++def test_legacy_bank_reads_as_revolute() -> None:
++    """A bank written before joint types existed must keep working untouched."""
++    print("\nlegacy bank")
++    with tempfile.TemporaryDirectory() as directory:
++        housing, drawer = _write_boxes(Path(directory))
++        bank = sample_articulated_mesh_anchors(
++            [housing, drawer], num_anchors=256,
++            joint_axis_o=AXIS, joint_origin_o=BOGUS_ORIGIN,
++            part_names=["housing", "drawer"], theta_limits_rad=(0.0, 3.6), seed=0)
++        del bank["metadata"]["joint_type"]
++        articulation = articulation_from_anchor_bank(bank, units="external")
++        _check("defaults to revolute", articulation["joint_type"] == "revolute")
++        _check("radian limits still surface",
++               np.allclose(articulation["theta_limits_rad"], (0.0, 3.6)))
++        _check("and appear under the neutral name too",
++               np.allclose(articulation["joint_limits"], (0.0, 3.6)))
++
++
++def test_every_joint_call_declares_its_type() -> None:
++    """No production call to a joint-aware function may rely on the default.
++
++    The joint type reaches the geometry by being passed down by hand through every
++    call site, and a missed one does not raise -- it silently treats a slide as a
++    hinge, which was exactly the bug this file's own development produced: one of
++    four residual calls kept the default, the moving anchors then looked 66 mm out of
++    place, and the run reported a healthy-looking ``theta_rejected`` instead of an
++    error. A grep is the only thing that catches that class of omission, so it is a
++    test.
++
++    Tests are exempt: several of them call without the argument precisely to check
++    that the default is still revolute.
++    """
++    print("\njoint type threading")
++    import ast
++
++    names = {"joint_transform", "compute_articulated_fit_residuals",
++             "reject_wrong_surface_anchors", "robust_fit_articulated_pose_from_anchors",
++             "fit_articulated_transform_weighted", "pose_anchors_at_joint_angle",
++             "set_object_joint"}
++    root = Path(__file__).resolve().parents[1]
++    missing: list[str] = []
++    scanned = 0
++    for directory in ("utils", "archive", "evaluation"):
++        for path in sorted((root / directory).rglob("*.py")):
++            scanned += 1
++            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
++                if not isinstance(node, ast.Call):
++                    continue
++                function = node.func
++                name = (function.attr if isinstance(function, ast.Attribute)
++                        else getattr(function, "id", None))
++                if name in names and not any(
++                        keyword.arg == "joint_type" for keyword in node.keywords):
++                    missing.append(f"{path.relative_to(root)}:{node.lineno} {name}")
++    _check("every production call passes joint_type", not missing,
++           f"{scanned} files scanned" if not missing else "; ".join(missing))
++
++
++if __name__ == "__main__":
++    test_transform_is_a_pure_translation()
++    test_displacement_alone()
++    test_exact()
++    test_displacement_is_never_wrapped()
++    test_far_displacement_needs_a_nearby_start()
++    test_noise()
++    test_limit_mixups_are_errors()
++    test_record_omits_angle_keys()
++    test_clamp_uses_joint_limits()
++    test_units_round_trip()
++    test_legacy_bank_reads_as_revolute()
++    test_every_joint_call_declares_its_type()
++    print(f"\n{len(FAILURES)} failures" + (f": {FAILURES}" if FAILURES else ""))
++    raise SystemExit(1 if FAILURES else 0)
+--- a/utils/anchor_bank.py
++++ b/utils/anchor_bank.py
+@@ -1,12 +1,18 @@
  from __future__ import annotations
  
  import json
@@ -1516,7 +2119,18 @@ diff -ruN a/utils/anchor_bank.py pb/utils/anchor_bank.py
  from pathlib import Path
  from typing import Any
  
-@@ -251,6 +252,122 @@
+ import numpy as np
+ import trimesh
+ 
++# One definition of the joint vocabulary, shared with the module that interprets it.
++# Two copies would drift, and the failure would be a bank whose joint type the fit
++# does not recognise.
++from utils.multiview_geometry import validate_joint_type
++
+ 
+ def load_mesh(mesh_path: str | Path, mesh_scale: float = 1.0) -> trimesh.Trimesh:
+     mesh = trimesh.load(mesh_path, force="mesh")
+@@ -251,6 +257,145 @@
      }
  
  
@@ -1531,9 +2145,11 @@ diff -ruN a/utils/anchor_bank.py pb/utils/anchor_bank.py
 +    seed: int = 0,
 +    part_names: Sequence[str] | None = None,
 +    theta_limits_rad: Sequence[float] | None = None,
++    joint_type: str = "revolute",
++    joint_limits: Sequence[float] | None = None,
 +    **sample_kwargs: Any,
 +) -> dict[str, Any]:
-+    """An anchor bank over two or more rigid parts joined by one revolute joint.
++    """An anchor bank over two or more rigid parts joined by one joint.
 +
 +    Each part is sampled on its own and the banks are concatenated, so every anchor
 +    carries the ``part_ids`` label the articulated fit needs. Part 0 is the static
@@ -1549,7 +2165,22 @@ diff -ruN a/utils/anchor_bank.py pb/utils/anchor_bank.py
 +    ``face_indices`` and ``vertex_indices`` are offset by the running vertex and
 +    face counts, so they index the parts concatenated in this order -- the same mesh
 +    the renderer builds when it fuses the parts at an angle.
++
++    ``joint_type`` is ``revolute`` or ``prismatic``, and it decides which of the two
++    limit arguments applies. ``theta_limits_rad`` is radians, which are dimensionless
++    and therefore need only one copy no matter what unit system the anchors are read
++    in. ``joint_limits`` is in the joint's own unit and is what a prismatic joint
++    takes, because a displacement is a *length*: it scales with the anchors exactly
++    like ``joint_origin_o`` does, and ``prepare_anchor_bank_for_gotrack`` stores the
++    scaled copy alongside the original for the same reason it does for the origin.
 +    """
++    kind = validate_joint_type(joint_type)
++    if theta_limits_rad is not None and joint_limits is not None:
++        raise ValueError("Pass theta_limits_rad or joint_limits, not both")
++    if kind == "prismatic" and theta_limits_rad is not None:
++        raise ValueError(
++            "theta_limits_rad is radians and cannot describe a prismatic joint; "
++            "use joint_limits, in the same units as the meshes")
 +    paths = [Path(p).expanduser().resolve() for p in part_mesh_paths]
 +    if len(paths) < 2:
 +        raise ValueError("Articulated sampling needs at least two part meshes")
@@ -1625,6 +2256,7 @@ diff -ruN a/utils/anchor_bank.py pb/utils/anchor_bank.py
 +        "mesh_num_vertices": int(vertex_offset),
 +        "mesh_num_faces": int(sum(int(np.asarray(m.faces).shape[0]) for m in meshes)),
 +        "articulated": True,
++        "joint_type": kind,
 +        # External mesh units, matching positions_o. The axis is a direction and so
 +        # is unitless; the origin is a point and scales with the anchors.
 +        "joint_axis_o": axis.tolist(),
@@ -1633,13 +2265,18 @@ diff -ruN a/utils/anchor_bank.py pb/utils/anchor_bank.py
 +                             else [float(v) for v in theta_limits_rad]),
 +        "moving_part_id": 1,
 +    }
++    # A revolute range is already fully described by theta_limits_rad above, and
++    # duplicating it under a second name would leave two keys to keep in step. A
++    # prismatic range is a pair of lengths and gets the same treatment as the origin.
++    if kind == "prismatic" and joint_limits is not None:
++        merged["metadata"]["joint_limits_external"] = [float(v) for v in joint_limits]
 +    return merged
 +
 +
  def prepare_anchor_bank_for_gotrack(
      anchor_bank: dict[str, Any],
      *,
-@@ -274,10 +391,96 @@
+@@ -274,10 +419,119 @@
      metadata["gotrack_anchor_scale_factor"] = float(scale)
      metadata["positions_o_external_unit"] = metadata.get("anchor_unit_space", "external_mesh")
      metadata["positions_o_gotrack_unit"] = "gotrack_internal"
@@ -1653,6 +2290,15 @@ diff -ruN a/utils/anchor_bank.py pb/utils/anchor_bank.py
 +        metadata["joint_origin_o_external"] = origin.tolist()
 +        metadata["joint_origin_o_gotrack"] = (origin * scale).tolist()
 +        metadata["joint_axis_o_gotrack"] = list(metadata["joint_axis_o"])
++        # The joint coordinate itself may or may not be a length, and that is decided
++        # by the joint type rather than by anything visible in the number. An angle
++        # passes through every unit boundary untouched, which is why theta_limits_rad
++        # is stored once and never appears here. A displacement is a length and has to
++        # be scaled at every one of them, exactly like the origin above -- miss it and
++        # the joint travels a thousand times too far with nothing raised.
++        if "joint_limits_external" in metadata:
++            limits = np.asarray(metadata["joint_limits_external"], dtype=np.float64)
++            metadata["joint_limits_gotrack"] = (limits * scale).tolist()
      output["metadata"] = metadata
      return output
  
@@ -1717,11 +2363,25 @@ diff -ruN a/utils/anchor_bank.py pb/utils/anchor_bank.py
 +    if samples is not None and units == "gotrack":
 +        scale = float(metadata.get("translation_scale_to_gotrack", 1.0))
 +        samples = np.asarray(samples, dtype=np.float32) * scale
++    # A bank written before joint types existed is a hinge; that is what the code that
++    # wrote it could produce.
++    joint_type = validate_joint_type(metadata.get("joint_type", "revolute"))
++    if joint_type == "prismatic":
++        # Picked by unit system, like the origin just above, and for the same reason.
++        joint_limits = metadata.get(
++            "joint_limits_gotrack" if units == "gotrack" else "joint_limits_external")
++    else:
++        joint_limits = limits
 +    return {
 +        "part_ids": part_ids,
++        "joint_type": joint_type,
 +        "joint_axis_o": np.asarray(metadata["joint_axis_o"], dtype=np.float64),
 +        "joint_origin_o": np.asarray(origin, dtype=np.float64),
 +        "theta_limits_rad": None if limits is None else tuple(float(v) for v in limits),
++        # The limits in the joint's own unit, whatever that is -- the key to read when
++        # the joint type is not known in advance.
++        "joint_limits": (None if joint_limits is None
++                         else tuple(float(v) for v in joint_limits)),
 +        "moving_part_id": int(metadata.get("moving_part_id", 1)),
 +        "part_names": list(metadata.get("part_names", [])),
 +        # Same units as ``joint_origin_o`` above, for the same reason: these are
@@ -1736,7 +2396,7 @@ diff -ruN a/utils/anchor_bank.py pb/utils/anchor_bank.py
  def save_anchor_bank(path: str | Path, anchor_bank: dict[str, Any]) -> None:
      path = Path(path).expanduser().resolve()
      path.parent.mkdir(parents=True, exist_ok=True)
-@@ -292,10 +495,17 @@
+@@ -292,10 +546,17 @@
          "barycentric": np.asarray(anchor_bank["barycentric"], dtype=np.float32),
          "metadata_json": np.asarray(json.dumps(metadata, sort_keys=True)),
      }
@@ -1754,7 +2414,7 @@ diff -ruN a/utils/anchor_bank.py pb/utils/anchor_bank.py
      np.savez_compressed(path, **payload)
  
  
-@@ -310,6 +520,14 @@
+@@ -310,6 +571,14 @@
              "face_indices": np.asarray(payload["face_indices"], dtype=np.int64),
              "vertex_indices": np.asarray(payload["vertex_indices"], dtype=np.int64),
              "barycentric": np.asarray(payload["barycentric"], dtype=np.float32),
@@ -1769,7 +2429,7 @@ diff -ruN a/utils/anchor_bank.py pb/utils/anchor_bank.py
              "positions_o_external": np.asarray(
                  payload["positions_o_external"],
                  dtype=np.float32,
-@@ -318,6 +536,15 @@
+@@ -318,6 +587,15 @@
                  payload["positions_o_gotrack"],
                  dtype=np.float32,
              ) if "positions_o_gotrack" in payload else np.asarray(payload["positions_o"], dtype=np.float32),
@@ -1785,10 +2445,9 @@ diff -ruN a/utils/anchor_bank.py pb/utils/anchor_bank.py
              "metadata": metadata,
          }
  
-diff -ruN a/utils/anchor_tracking.py pb/utils/anchor_tracking.py
---- a/utils/anchor_tracking.py	2026-07-13 13:00:39.799232576 +0900
-+++ b/utils/anchor_tracking.py	2026-07-29 16:36:25.896837776 +0900
-@@ -34,6 +34,37 @@
+--- a/utils/anchor_tracking.py
++++ b/utils/anchor_tracking.py
+@@ -34,6 +34,39 @@
      return uv.astype(np.float32), depth.astype(np.float32)
  
  
@@ -1800,8 +2459,9 @@ diff -ruN a/utils/anchor_tracking.py pb/utils/anchor_tracking.py
 +    theta: float,
 +    *,
 +    moving_part_id: int = 1,
++    joint_type: str = "revolute",
 +) -> np.ndarray:
-+    """Canonical anchors with the moving part swung to ``theta``, still in object frame.
++    """Canonical anchors with the moving part carried to ``theta``, in object frame.
 +
 +    This is the whole of what articulation adds to the front half of the tracker.
 +    Once the anchors are posed, the object is rigid again for everything downstream:
@@ -1816,7 +2476,8 @@ diff -ruN a/utils/anchor_tracking.py pb/utils/anchor_tracking.py
 +    moving = np.asarray(part_ids).reshape(-1) == int(moving_part_id)
 +    if not moving.any():
 +        return anchors
-+    transform = joint_transform(joint_axis_o, joint_origin_o, float(theta))
++    transform = joint_transform(joint_axis_o, joint_origin_o, float(theta),
++                                joint_type=joint_type)
 +    posed = anchors.copy()
 +    posed[moving] = (anchors[moving].astype(np.float64) @ transform[:3, :3].T
 +                     + transform[:3, 3]).astype(np.float32)
@@ -1826,7 +2487,7 @@ diff -ruN a/utils/anchor_tracking.py pb/utils/anchor_tracking.py
  def project_anchors_to_view(
      anchors_o: np.ndarray,
      pose_world_from_object: np.ndarray,
-@@ -43,13 +74,26 @@
+@@ -43,13 +76,27 @@
      *,
      rendered_depth: np.ndarray | None = None,
      depth_tolerance: float = 0.01,
@@ -1835,6 +2496,7 @@ diff -ruN a/utils/anchor_tracking.py pb/utils/anchor_tracking.py
 +    joint_origin_o: np.ndarray | None = None,
 +    theta: float = 0.0,
 +    moving_part_id: int = 1,
++    joint_type: str = "revolute",
  ) -> dict[str, np.ndarray]:
      anchors_o = np.asarray(anchors_o, dtype=np.float32)
 +    # Swing before projecting. The returned ``anchors_o`` stays canonical -- callers
@@ -1844,7 +2506,7 @@ diff -ruN a/utils/anchor_tracking.py pb/utils/anchor_tracking.py
 +    if part_ids is not None and joint_axis_o is not None and joint_origin_o is not None:
 +        anchors_posed = pose_anchors_at_joint_angle(
 +            anchors_o, part_ids, joint_axis_o, joint_origin_o, theta,
-+            moving_part_id=moving_part_id)
++            moving_part_id=moving_part_id, joint_type=joint_type)
      pose_world_from_object = _coerce_pose_matrix(pose_world_from_object)
      extrinsic_cw = _coerce_pose_matrix(extrinsic_cw)
      image_width, image_height = int(image_size[0]), int(image_size[1])
@@ -1854,7 +2516,7 @@ diff -ruN a/utils/anchor_tracking.py pb/utils/anchor_tracking.py
      points_camera = transform_points(points_world, extrinsic_cw)
      uv, depth = project_points_camera(points_camera, intrinsic)
  
-@@ -77,6 +121,7 @@
+@@ -77,6 +124,7 @@
  
      return {
          "anchors_o": anchors_o,
@@ -1862,33 +2524,81 @@ diff -ruN a/utils/anchor_tracking.py pb/utils/anchor_tracking.py
          "points_world": points_world,
          "points_camera": points_camera,
          "uv": uv,
-diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
---- a/utils/multiview_geometry.py	2026-07-13 13:00:39.801232653 +0900
-+++ b/utils/multiview_geometry.py	2026-07-30 11:34:07.153196567 +0900
-@@ -685,6 +685,463 @@
+--- a/utils/multiview_geometry.py
++++ b/utils/multiview_geometry.py
+@@ -685,6 +685,623 @@
      }
  
  
-+def joint_transform(axis_o: np.ndarray, origin_o: np.ndarray, theta: float) -> np.ndarray:
-+    """Rotation of ``theta`` about the line through ``origin_o`` along ``axis_o``.
++JOINT_TYPES = ("revolute", "prismatic")
 +
-+    Object frame throughout, in whatever units the anchor bank uses -- the origin
-+    shares those units, the axis is dimensionless.
++
++def validate_joint_type(joint_type: str) -> str:
++    """Reject an unknown joint type here rather than silently treating it as a hinge.
++
++    Every joint-aware function funnels through this, so a typo in a config file
++    surfaces as an error naming the valid options instead of a plausible-looking
++    track of the wrong kind.
 +    """
++    name = str(joint_type)
++    if name not in JOINT_TYPES:
++        raise ValueError(f"joint_type must be one of {JOINT_TYPES}, got {joint_type!r}")
++    return name
++
++
++def joint_transform(
++    axis_o: np.ndarray,
++    origin_o: np.ndarray,
++    theta: float,
++    *,
++    joint_type: str = "revolute",
++) -> np.ndarray:
++    """The transform a joint coordinate applies to the part beyond the joint.
++
++    ``revolute`` -- rotation of ``theta`` about the line through ``origin_o`` along
++    ``axis_o``. ``prismatic`` -- translation of ``theta`` along ``axis_o``.
++
++    Object frame throughout, in whatever units the anchor bank uses. Which of the
++    three arguments carries those units differs by type, and that asymmetry is the
++    thing to get right:
++
++    ==============  ===============  ==============  ==================
++    argument        revolute         prismatic       scales with units?
++    ==============  ===============  ==============  ==================
++    ``axis_o``      direction        direction       no
++    ``origin_o``    a point          *unused*        yes (revolute only)
++    ``theta``       radians          a length        prismatic only
++    ==============  ===============  ==============  ==================
++
++    A revolute angle is dimensionless, so it survives a change of unit system
++    untouched. A prismatic displacement does not -- it is a length and has to be
++    scaled at every unit boundary exactly like the origin. ``origin_o`` is accepted
++    and ignored for a prismatic joint so that callers can pass a joint description
++    through without branching; a sliding part has no centre.
++
++    This is the single point where the joint type is interpreted. Anchor projection,
++    the renderer, the residuals and the wrong-surface test all reach the geometry
++    through here, so they are joint-type agnostic and need no changes of their own.
++    """
++    kind = validate_joint_type(joint_type)
 +    axis = np.asarray(axis_o, dtype=np.float64).reshape(3)
 +    norm = float(np.linalg.norm(axis))
 +    if norm < 1.0e-12:
 +        raise ValueError("Joint axis is degenerate")
 +    axis = axis / norm
-+    origin = np.asarray(origin_o, dtype=np.float64).reshape(3)
 +
++    pose = np.eye(4, dtype=np.float64)
++    if kind == "prismatic":
++        pose[:3, 3] = float(theta) * axis
++        return pose
++
++    origin = np.asarray(origin_o, dtype=np.float64).reshape(3)
 +    cross = np.array([[0.0, -axis[2], axis[1]],
 +                      [axis[2], 0.0, -axis[0]],
 +                      [-axis[1], axis[0], 0.0]], dtype=np.float64)
 +    rotation = (np.eye(3)
 +                + np.sin(theta) * cross
 +                + (1.0 - np.cos(theta)) * (cross @ cross))
-+    pose = np.eye(4, dtype=np.float64)
 +    pose[:3, :3] = rotation
 +    pose[:3, 3] = origin - rotation @ origin
 +    return pose
@@ -1935,6 +2645,50 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +    return float(np.arctan2(sine, cosine))
 +
 +
++def fit_joint_displacement_weighted(
++    source_points_o: np.ndarray,
++    target_points_o: np.ndarray,
++    weights: np.ndarray,
++    axis_o: np.ndarray,
++    origin_o: np.ndarray | None = None,
++) -> float:
++    """The slide along a *known* axis that best carries source onto target.
++
++    The prismatic counterpart of ``fit_joint_angle_weighted``, and the same contract:
++    both point sets are in the body frame, the caller has already undone the body
++    pose, and the answer is absolute -- measured from the zero-displacement pose the
++    anchors were sampled in, not a step.
++
++    Simpler than the revolute case, and unconditionally so. Each anchor moves by
++    ``d * a`` regardless of where it sits, so the residual is linear in ``d`` and the
++    weighted least-squares solution is a mean of per-anchor projections::
++
++        d* = sum_i w_i (y_i - x_i) . a / sum_i w_i
++
++    ``origin_o`` is accepted and ignored, to match the revolute signature.
++
++    Two properties follow from the linearity and are worth naming, because they are
++    where a prismatic joint differs from the hinge this code was built for. Every
++    anchor has the same sensitivity ``d r / d d = a``, so unlike a hinge there are no
++    anchors with a short lever arm that contribute nothing -- the conditioning is
++    uniform and does not depend on where the joint sits. That is the good half. The
++    bad half is that a part which is self-similar along its slide direction, which is
++    the usual shape for a drawer, produces almost the same image at displacements
++    that differ by that period. This solve will answer confidently either way; the
++    ambiguity is in the correspondences reaching it, not here.
++    """
++    axis = np.asarray(axis_o, dtype=np.float64).reshape(3)
++    axis = axis / float(np.linalg.norm(axis))
++    source = np.asarray(source_points_o, dtype=np.float64).reshape(-1, 3)
++    target = np.asarray(target_points_o, dtype=np.float64).reshape(-1, 3)
++    weight = np.asarray(weights, dtype=np.float64).reshape(-1)
++
++    total = float(np.sum(weight))
++    if not np.isfinite(total) or abs(total) < 1.0e-18:
++        return 0.0
++    return float(np.sum(weight * ((target - source) @ axis)) / total)
++
++
 +def fit_articulated_transform_weighted(
 +    source_points_o: np.ndarray,
 +    target_points_w: np.ndarray,
@@ -1947,8 +2701,9 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +    theta_reference_rad: float | None = None,
 +    iterations: int = 40,
 +    tolerance_rad: float = 1.0e-9,
++    joint_type: str = "revolute",
 +) -> tuple[np.ndarray, float, int]:
-+    """Body pose and joint angle together, by alternating two exact solves.
++    """Body pose and joint coordinate together, by alternating two exact solves.
 +
 +    The objective is the rigid one with the moving part carried through the joint::
 +
@@ -1972,18 +2727,29 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +    clamped there. ``theta_reference_rad`` names the half-turn window to report in --
 +    the previous frame's angle when tracking, which also keeps the series continuous.
 +    Default is pi, giving [0, 2*pi), the range a hinge measured from closed occupies.
++
++    None of that applies to a ``prismatic`` joint, where the whole notion is absent
++    rather than merely different: a displacement has no period, so there is no
++    representative to choose and nothing to unwrap. Both the per-round unwrapping and
++    the closing window are skipped for it. Folding a displacement into a half-turn
++    band would not raise -- it would quietly return a number near pi, which is why
++    this is a branch and not a parameter. ``tolerance_rad`` is then a length in the
++    anchors' own units; the default is far below any of them.
 +    """
++    kind = validate_joint_type(joint_type)
 +    source = np.asarray(source_points_o, dtype=np.float64).reshape(-1, 3)
 +    target = np.asarray(target_points_w, dtype=np.float64).reshape(-1, 3)
 +    weight = np.asarray(weights, dtype=np.float64).reshape(-1)
 +    moving = np.asarray(part_ids).reshape(-1) == 1
++    solve_joint = (fit_joint_displacement_weighted if kind == "prismatic"
++                   else fit_joint_angle_weighted)
 +
 +    def _pose_at(angle: float) -> np.ndarray:
-+        # Swinging the moving anchors by the angle makes the whole set rigid again,
-+        # so this is the untouched weighted Kabsch.
++        # Carrying the moving anchors through the joint makes the whole set rigid
++        # again, so this is the untouched weighted Kabsch.
 +        swung = source.copy()
 +        if moving.any():
-+            transform = joint_transform(axis_o, origin_o, angle)
++            transform = joint_transform(axis_o, origin_o, angle, joint_type=kind)
 +            swung[moving] = source[moving] @ transform[:3, :3].T + transform[:3, 3]
 +        return _coerce_pose_matrix(
 +            fit_rigid_transform_weighted(swung, target, weight)).astype(np.float64)
@@ -1999,9 +2765,11 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +            # value so the alternation cannot jump a turn mid-iteration.
 +            rotation, translation = pose[:3, :3], pose[:3, 3]
 +            target_in_object = (target[moving] - translation) @ rotation
-+            solved = fit_joint_angle_weighted(
++            solved = solve_joint(
 +                source[moving], target_in_object, weight[moving], axis_o, origin_o)
-+            delta = float(np.arctan2(np.sin(solved - theta), np.cos(solved - theta)))
++            delta = float(solved - theta)
++            if kind == "revolute":
++                delta = float(np.arctan2(np.sin(delta), np.cos(delta)))
 +            theta += delta
 +
 +            # Alternating exact solves converge linearly, and on some geometries the
@@ -2024,8 +2792,10 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +            if abs(delta) <= tolerance_rad:
 +                break
 +
-+    reference = np.pi if theta_reference_rad is None else float(theta_reference_rad)
-+    theta = reference + float(np.arctan2(np.sin(theta - reference), np.cos(theta - reference)))
++    if kind == "revolute":
++        reference = np.pi if theta_reference_rad is None else float(theta_reference_rad)
++        theta = reference + float(
++            np.arctan2(np.sin(theta - reference), np.cos(theta - reference)))
 +    return pose.astype(np.float32), float(theta), int(used)
 +
 +
@@ -2037,6 +2807,8 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +    part_ids: np.ndarray,
 +    axis_o: np.ndarray,
 +    origin_o: np.ndarray,
++    *,
++    joint_type: str = "revolute",
 +) -> np.ndarray:
 +    """Per-anchor distance, each part carried through its own transform."""
 +    pose = _coerce_pose_matrix(pose_world_from_object).astype(np.float64)
@@ -2046,7 +2818,7 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +
 +    posed = source.copy()
 +    if moving.any():
-+        transform = joint_transform(axis_o, origin_o, float(theta))
++        transform = joint_transform(axis_o, origin_o, float(theta), joint_type=joint_type)
 +        posed[moving] = source[moving] @ transform[:3, :3].T + transform[:3, 3]
 +    predicted = posed @ pose[:3, :3].T + pose[:3, 3]
 +    return np.linalg.norm(predicted - target, axis=1).astype(np.float32)
@@ -2064,6 +2836,7 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +    part_surface_samples_o: np.ndarray,
 +    part_surface_offsets: np.ndarray,
 +    margin_external: float,
++    joint_type: str = "revolute",
 +) -> dict[str, Any]:
 +    """Drop anchors whose triangulated target sits on the *other* part's surface.
 +
@@ -2076,6 +2849,13 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +    those anchors well, it just explains them with a wrong angle. Asking which
 +    surface a point is on is a different question, and it is the one that separates
 +    this failure from a healthy frame.
++
++    Nothing here reads the joint type except through ``joint_transform``, so it works
++    unchanged for a prismatic joint -- but expect it to abstain far more often. The
++    abstain condition asks whether the two surfaces are separated at all where the
++    anchor lives, and a part that slides inside its housing keeps them in contact
++    along its whole travel. Silence from this test on a sliding joint means it had no
++    information, not that the frame was healthy.
 +
 +    The two surfaces come from the current estimate, which is circular in principle.
 +    It is not in practice: the static part's anchors stay accurate (about 1 mm)
@@ -2111,7 +2891,7 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +    # two trees answer both questions below.
 +    from scipy.spatial import cKDTree
 +
-+    joint = joint_transform(axis_o, origin_o, float(theta))
++    joint = joint_transform(axis_o, origin_o, float(theta), joint_type=joint_type)
 +    inverse_pose = np.linalg.inv(pose)
 +    target_object = target @ inverse_pose[:3, :3].T + inverse_pose[:3, 3]
 +    moving = parts == 1
@@ -2172,6 +2952,8 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +    theta_reference_rad: float | None = None,
 +    theta_limits_rad: tuple[float, float] | None = None,
 +    theta_residual_ratio: float = 3.0,
++    joint_type: str = "revolute",
++    joint_limits: tuple[float, float] | None = None,
 +) -> dict[str, Any]:
 +    """Articulated counterpart of ``robust_fit_pose_from_anchors``.
 +
@@ -2205,12 +2987,40 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +    alone. Leaving the moving anchors in would let a broken angle drag the body pose
 +    with it through the shared Kabsch -- smoothly and with no jump, which is exactly
 +    how it hid on the capture that motivated this.
++
++    ``joint_type`` selects what the joint coordinate means, and the limits follow it
++    into separate arguments on purpose. ``theta_limits_rad`` is radians and belongs to
++    a revolute joint; ``joint_limits`` is in the joint's own unit -- radians for a
++    hinge, the anchors' external length unit for a slide -- and is the one to use for
++    anything prismatic. Passing radians to a sliding joint is the most damaging
++    mistake available here, because a displacement read as an angle raises nothing and
++    tracks a joint that is off by orders of magnitude, so the two are kept apart and
++    mixing them is an error rather than a coercion.
++
++    A prismatic result reports ``joint_value`` and omits ``theta_rad``/``theta_deg``
++    entirely. Emitting ``degrees(displacement)`` would be a number, and a consumer
++    plotting it would get a plausible curve of a quantity that does not exist; a
++    missing key stops that consumer instead.
 +    """
++    kind = validate_joint_type(joint_type)
 +    source = np.asarray(source_points_o, dtype=np.float64).reshape(-1, 3)
 +    target = np.asarray(target_points_w, dtype=np.float64).reshape(-1, 3)
 +    weight = np.asarray(weights, dtype=np.float64).reshape(-1)
 +    parts = np.asarray(part_ids).reshape(-1)
 +    unit_scale_to_meter = _validate_external_unit_scale_to_meter(external_unit_scale_to_meter)
++
++    if theta_limits_rad is not None and joint_limits is not None:
++        raise ValueError("Pass theta_limits_rad or joint_limits, not both")
++    if kind == "prismatic":
++        if theta_limits_rad is not None:
++            raise ValueError(
++                "theta_limits_rad is radians and cannot describe a prismatic joint; "
++                "use joint_limits, in the anchors' external length unit")
++        if theta_reference_rad is not None:
++            raise ValueError(
++                "theta_reference_rad names a half-turn reporting window, which a "
++                "prismatic displacement does not have")
++    limits = joint_limits if joint_limits is not None else theta_limits_rad
 +
 +    if source.shape[0] < max(int(min_anchors), 3):
 +        return {"status": "insufficient_anchors", "num_input_anchors": int(source.shape[0])}
@@ -2223,11 +3033,11 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +    # best answer when the caller supplies one -- a hinge that opens to 215 deg has
 +    # to report 215 and not the -145 an arctangent prefers, or a lower limit of zero
 +    # will clamp a perfectly good estimate to nothing. Falling back to pi gives
-+    # [0, 2*pi), which is where a hinge measured from closed lives.
++    # [0, 2*pi), which is where a hinge measured from closed lives. A displacement has
++    # no period and so no window; the fit skips the wrap and this stays None.
 +    reference = theta_reference_rad
-+    if reference is None:
-+        reference = (float(np.mean(theta_limits_rad)) if theta_limits_rad is not None
-+                     else np.pi)
++    if reference is None and kind == "revolute":
++        reference = float(np.mean(limits)) if limits is not None else np.pi
 +
 +    def _fit(mask: np.ndarray | None) -> tuple[np.ndarray, float, int]:
 +        if mask is None:
@@ -2238,13 +3048,13 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +            return fit_articulated_transform_weighted(
 +                source[selected], target[selected], weight[selected], parts[selected],
 +                axis_o, origin_o, theta_init=theta_init,
-+                theta_reference_rad=reference)
++                theta_reference_rad=reference, joint_type=kind)
 +        # The angle is not observable from this frame's anchors; hold it and fit the
 +        # body around it, which is the rigid problem with the moving part pre-swung.
 +        swung = source[selected].copy()
 +        moving_local = parts[selected] == 1
 +        if moving_local.any():
-+            transform = joint_transform(axis_o, origin_o, float(theta_init))
++            transform = joint_transform(axis_o, origin_o, float(theta_init), joint_type=kind)
 +            swung[moving_local] = (source[selected][moving_local] @ transform[:3, :3].T
 +                                   + transform[:3, 3])
 +        pose = fit_rigid_transform_weighted(swung, target[selected], weight[selected])
@@ -2252,7 +3062,8 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +
 +    pose_initial, theta_initial, rounds = _fit(None)
 +    residuals_initial = compute_articulated_fit_residuals(
-+        pose_initial, theta_initial, source, target, parts, axis_o, origin_o)
++        pose_initial, theta_initial, source, target, parts, axis_o, origin_o,
++        joint_type=kind)
 +
 +    # Does the fitted angle explain the moving anchors, or only the static ones?
 +    # Medians, so a few bad anchors on either part cannot decide it.
@@ -2272,7 +3083,8 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +            theta_observed = False
 +            pose_initial, theta_initial, rounds = _fit(None)
 +            residuals_initial = compute_articulated_fit_residuals(
-+                pose_initial, theta_initial, source, target, parts, axis_o, origin_o)
++                pose_initial, theta_initial, source, target, parts, axis_o, origin_o,
++                joint_type=kind)
 +    inlier_mask = residuals_initial <= inlier_threshold_external
 +
 +    enough_inliers = int(np.count_nonzero(inlier_mask)) >= max(int(min_anchors), 3)
@@ -2284,7 +3096,8 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +    if enough_inliers and keeps_joint:
 +        pose_final, theta_final, rounds = _fit(inlier_mask)
 +        residuals_final = compute_articulated_fit_residuals(
-+            pose_final, theta_final, source, target, parts, axis_o, origin_o)
++            pose_final, theta_final, source, target, parts, axis_o, origin_o,
++            joint_type=kind)
 +        status = ("ok" if theta_observed
 +                  else "theta_rejected" if theta_rejected else "theta_unobserved")
 +    else:
@@ -2294,21 +3107,25 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +                  else "theta_rejected" if theta_rejected else "theta_unobserved")
 +
 +    theta_clamped = False
-+    if theta_limits_rad is not None:
-+        lower, upper = (float(theta_limits_rad[0]), float(theta_limits_rad[1]))
++    if limits is not None:
++        lower, upper = (float(limits[0]), float(limits[1]))
 +        limited = float(np.clip(theta_final, lower, upper))
 +        theta_clamped = not np.isclose(limited, theta_final)
 +        if theta_clamped:
 +            theta_final = limited
 +            residuals_final = compute_articulated_fit_residuals(
-+                pose_final, theta_final, source, target, parts, axis_o, origin_o)
++                pose_final, theta_final, source, target, parts, axis_o, origin_o,
++                joint_type=kind)
 +
 +    residuals_m = residuals_final * unit_scale_to_meter
-+    return {
++    record = {
 +        "status": status,
 +        "pose_world_from_object": pose_final.astype(np.float32),
-+        "theta_rad": float(theta_final),
-+        "theta_deg": float(np.degrees(theta_final)),
++        # The joint coordinate under a type-neutral name, always present. For a
++        # revolute joint the two angle keys below carry the same number and stay for
++        # the readers that predate this; a prismatic joint has neither.
++        "joint_type": kind,
++        "joint_value": float(theta_final),
 +        "theta_observed": bool(theta_observed),
 +        "theta_clamped": bool(theta_clamped),
 +        "theta_rejected": bool(theta_rejected),
@@ -2324,14 +3141,17 @@ diff -ruN a/utils/multiview_geometry.py pb/utils/multiview_geometry.py
 +        "mean_residual_mm": float(np.mean(residuals_m) * 1000.0),
 +        "max_residual_mm": float(np.max(residuals_m) * 1000.0),
 +    }
++    if kind == "revolute":
++        record["theta_rad"] = float(theta_final)
++        record["theta_deg"] = float(np.degrees(theta_final))
++    return record
 +
 +
  def triangulate_anchor_observations(
      observations_by_anchor: dict[int, list[dict[str, Any]]],
      intrinsics_map: dict[str, np.ndarray],
-diff -ruN a/utils/renderer_nvdiffrast.py pb/utils/renderer_nvdiffrast.py
---- a/utils/renderer_nvdiffrast.py	2026-07-14 16:37:58.682452619 +0900
-+++ b/utils/renderer_nvdiffrast.py	2026-07-29 16:59:54.706623888 +0900
+--- a/utils/renderer_nvdiffrast.py
++++ b/utils/renderer_nvdiffrast.py
 @@ -46,6 +46,10 @@
          self.backend_name = "nvdiffrast_cuda"
          self.object_meshes: Dict[int, trimesh.Trimesh] = {}
@@ -2343,7 +3163,7 @@ diff -ruN a/utils/renderer_nvdiffrast.py pb/utils/renderer_nvdiffrast.py
          self._contexts: Dict[int, Any] = {}
  
          requested_device = torch.device(
-@@ -203,14 +207,94 @@
+@@ -203,14 +207,103 @@
                  )
              return buffers
  
@@ -2353,15 +3173,19 @@ diff -ruN a/utils/renderer_nvdiffrast.py pb/utils/renderer_nvdiffrast.py
 +        moving_vertex_mask: np.ndarray,
 +        axis_o: np.ndarray,
 +        origin_o: np.ndarray,
++        joint_type: str = "revolute",
 +    ) -> None:
-+        """Declare one revolute joint on an already-registered object.
++        """Declare one joint on an already-registered object.
 +
 +        ``moving_vertex_mask`` selects the vertices on the far side of the joint,
 +        indexed against the mesh as registered. ``origin_o`` must be in that mesh's
 +        units -- the renderer works in metres, and a mesh loaded from disk here is
 +        divided by 1000, so an origin taken from a millimetre asset will put the
 +        hinge a thousand times too far away and quietly bend the object around a
-+        point outside the room.
++        point outside the room. A ``prismatic`` joint ignores ``origin_o`` -- a
++        sliding part has no centre -- but the joint coordinate then carries the units
++        instead, so the same warning applies to the value passed to
++        ``set_object_joint_angle``.
 +
 +        The alternative was to rebuild the mesh every time the angle moved, which
 +        re-uploads vertices, faces and textures for a 326k-face model on every
@@ -2375,6 +3199,9 @@ diff -ruN a/utils/renderer_nvdiffrast.py pb/utils/renderer_nvdiffrast.py
 +                f"moving_vertex_mask has {mask.shape[0]} entries but object {obj_id} "
 +                f"has {int(buffers['vertices'].shape[0])} vertices"
 +            )
++        from utils.multiview_geometry import validate_joint_type
++
++        kind = validate_joint_type(joint_type)
 +        axis = np.asarray(axis_o, dtype=np.float64).reshape(3)
 +        norm = float(np.linalg.norm(axis))
 +        if norm < 1.0e-12:
@@ -2384,6 +3211,7 @@ diff -ruN a/utils/renderer_nvdiffrast.py pb/utils/renderer_nvdiffrast.py
 +                "mask": torch.as_tensor(mask, dtype=torch.bool, device=self.device),
 +                "axis": np.asarray(axis / norm, dtype=np.float64),
 +                "origin": np.asarray(origin_o, dtype=np.float64).reshape(3),
++                "type": kind,
 +            }
 +        self._object_joint_angles.pop(obj_id, None)
 +        self._posed_mesh_cache.pop(obj_id, None)
@@ -2413,7 +3241,8 @@ diff -ruN a/utils/renderer_nvdiffrast.py pb/utils/renderer_nvdiffrast.py
 +
 +        from utils.multiview_geometry import joint_transform
 +
-+        transform = joint_transform(joint["axis"], joint["origin"], theta)
++        transform = joint_transform(joint["axis"], joint["origin"], theta,
++                                    joint_type=joint.get("type", "revolute"))
 +        with torch.cuda.device(self.device):
 +            rotation = torch.as_tensor(
 +                transform[:3, :3], dtype=torch.float32, device=self.device)

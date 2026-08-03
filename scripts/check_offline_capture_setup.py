@@ -91,6 +91,11 @@ def _run_gotrack(args: argparse.Namespace, errors: list[str], checks: list[str])
         for marker, description in (
             ("--theta-extrapolate-max-deg", "joint-angle prediction"),
             ("--articulation-json", "articulation wiring"),
+            # Prismatic support ships in the same patch. An older articulated patch
+            # would accept a prismatic joint file and track the object as a hinge at
+            # a fixed angle -- the same silent-success failure the checks above guard
+            # against, one joint type down.
+            ("--joint-extrapolate-max", "prismatic joint support"),
         ):
             if runner_source and marker not in runner_source:
                 errors.append(
@@ -100,7 +105,8 @@ def _run_gotrack(args: argparse.Namespace, errors: list[str], checks: list[str])
         if geometry.is_file():
             geometry_source = geometry.read_text(encoding="utf-8")
             for symbol in ("robust_fit_articulated_pose_from_anchors",
-                           "reject_wrong_surface_anchors"):
+                           "reject_wrong_surface_anchors",
+                           "fit_joint_displacement_weighted"):
                 if symbol not in geometry_source:
                     errors.append(
                         f"MV-GoTrack articulated patch is incomplete: {symbol} missing "

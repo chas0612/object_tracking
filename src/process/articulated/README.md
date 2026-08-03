@@ -4,6 +4,14 @@ Six degrees of freedom for the body plus one revolute joint angle, per frame. Bu
 for `blue_plastic_box` (box + hinged lid) but nothing here is specific to it beyond
 the joint file.
 
+**Revolute only, in this directory.** The tracker itself also handles a prismatic
+joint (see `patches/MV-GoTrack-articulated.md`), but the seed stage here does not:
+`real_hybrid.py` sweeps a joint *angle*, ranks FoundationPose proposals by multi-view
+silhouette IoU at each, and writes `theta_deg`. Seeding a sliding joint means sweeping
+a displacement and writing `joint_value`, which is not implemented. A prismatic run
+therefore needs its initial joint value supplied by hand through
+`--init-joint-value`.
+
 These are scripts, invoked directly, not an importable package — there is no
 `__init__.py` and the intra-directory imports are flat, which works because Python
 puts a script's own directory on `sys.path`. Run them by path, from anywhere.
@@ -30,6 +38,19 @@ The two are deliberately not unified. See
 | `theta_trajectory.py` | angle trajectory across solved frames |
 | `render_overlay.py` | overlay sheets for a solved frame |
 | `run_all_captures.sh` | the whole chain over a list of captures |
+| `joint_from_particulate.py` | Particulate `pred.npz` → `joint.json` + part meshes |
+
+`joint_from_particulate.py` undoes the normalisation Particulate applies before
+inference (`up_dir` rotation, then a fit into `[-0.5, 0.5]^3`) and which it does not
+store. A revolute range is radians and survives that untouched — which is why nothing
+here ever had to think about it — but a **prismatic range is a length and must be
+multiplied by the mesh's largest bounding-box extent**. Skipping that raises nothing.
+`--self-test` round-trips the conversions on a synthetic box, which is the only check
+available until a sliding object exists.
+
+Note that `--up-dir` has to be carried across by hand and cannot be inferred: the
+up-direction rotations are axis permutations, so the largest extent is invariant under
+them and a wrong one changes the axis while leaving every other number intact.
 
 `common.py`, `fit_rc.py`, `probe_fpose.py`, `probe_fpose_theta.py`,
 `real_first_pose.py` and `make_synthetic.py` are shared internals.

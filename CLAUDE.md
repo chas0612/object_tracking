@@ -539,6 +539,18 @@ MV-GoTrack with `patches/MV-GoTrack-articulated.patch` applied.
 - Verify the patch is applied: `scripts/check_offline_capture_setup.py --component
   gotrack --require-articulated`. Without it an articulated run does not fail, it
   silently tracks rigidly at the seed angle.
+- **Prismatic joints are supported by the tracker, not the seed.** Declare
+  `"joint_type": "prismatic"` in the joint file, with `"range"` (lengths, mesh units)
+  instead of `"range_rad"`; `origin` is ignored. Use `--init-joint-value` and
+  `--joint-extrapolate-max` — the degree-denominated flags are refused rather than
+  reinterpreted. Untested on real data: no prismatic object or capture exists here,
+  and `src/process/articulated/` cannot seed one. `tests/test_prismatic_joint.py`
+  covers it synthetically.
+- **A displacement is a length; an angle is not.** That asymmetry is the whole risk
+  in the prismatic port — `theta_limits_rad` is stored once because radians survive a
+  change of unit system, while a travel range needs the same per-unit-system copies
+  the joint origin gets, including the value handed to the renderer. Nothing raises
+  when this is wrong.
 
 ## Ongoing Refactoring
 

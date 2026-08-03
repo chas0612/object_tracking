@@ -1,7 +1,12 @@
 # MV-GoTrack articulated-object patch
 
-Tracks an object made of two rigid parts joined by one revolute joint: six degrees
-of freedom for the body and one for the joint, recovered together, per frame.
+Tracks an object made of two rigid parts joined by one joint: six degrees of freedom
+for the body and one for the joint, recovered together, per frame. The joint is
+`revolute` (a hinge, the default) or `prismatic` (a slide).
+
+Everything below is measured on a revolute capture, because that is the only kind
+that exists here. The prismatic path is implemented and tested against synthetic
+data only — see *Prismatic joints* at the end for what that does and does not buy.
 
 Apply **on top of** `MV-GoTrack-offline-capture.patch`, from the root of the
 approved private MV-GoTrack checkout at commit
@@ -18,6 +23,7 @@ git apply       /path/to/autodex/patches/MV-GoTrack-articulated.patch
 python tests/test_articulated_fit.py
 python tests/test_articulated_anchor_bank.py       # needs the blue_plastic_box parts
 python tests/test_articulated_runtime_wiring.py    # needs the blue_plastic_box parts
+python tests/test_prismatic_joint.py               # self-contained, builds its own meshes
 ```
 
 Every change is inert for a rigid object. An anchor bank without a joint takes the
@@ -39,13 +45,13 @@ anchor from one that was always there — they are untouched.
 
 | File | Change |
 |---|---|
-| `utils/multiview_geometry.py` | `joint_transform`, `fit_joint_angle_weighted`, `fit_articulated_transform_weighted`, `compute_articulated_fit_residuals`, `robust_fit_articulated_pose_from_anchors`, `reject_wrong_surface_anchors` |
+| `utils/multiview_geometry.py` | `joint_transform`, `fit_joint_angle_weighted`, `fit_joint_displacement_weighted`, `fit_articulated_transform_weighted`, `compute_articulated_fit_residuals`, `robust_fit_articulated_pose_from_anchors`, `reject_wrong_surface_anchors`, `validate_joint_type` |
 | `utils/anchor_bank.py` | `sample_articulated_mesh_anchors`, `fuse_articulated_parts`, `articulation_from_anchor_bank`; `part_ids`, per-part surface samples and the joint carried through save/load and the GoTrack unit conversion |
 | `utils/anchor_tracking.py` | `pose_anchors_at_joint_angle`; `project_anchors_to_view` takes the joint and the current angle |
 | `utils/renderer_nvdiffrast.py` | `set_object_joint`, `set_object_joint_angle`; `_get_object_buffers` poses the moving vertices, cached per angle |
 | `archive/run_multiview_gotrack_anchor_online.py` | angle reaches the projection; `theta_*` fields on the world record |
-| `archive/…_multi_object.py` | `--articulation-json`, `--init-theta-deg`, `--anchor-fit-min-moving-anchors`, `--theta-extrapolate-max-deg`, `--anchor-wrong-surface-margin`, `--dump-anchor-target-frames`; joint registered on the renderer; angle predicted, carried and measured between frames |
-| `tests/` | three self-contained test scripts |
+| `archive/…_multi_object.py` | `--articulation-json`, `--init-theta-deg`, `--init-joint-value`, `--anchor-fit-min-moving-anchors`, `--theta-extrapolate-max-deg`, `--joint-extrapolate-max`, `--anchor-wrong-surface-margin`, `--dump-anchor-target-frames`; joint registered on the renderer; joint coordinate predicted, carried and measured between frames |
+| `tests/` | four self-contained test scripts |
 
 ## The fit
 
@@ -72,7 +78,11 @@ together, 3.3 % of a 0.36 s frame.**
 - **Units.** The joint origin is a point and scales into GoTrack units; the axis is
   a direction and must not. Neither mistake raises — the hinge simply moves a
   thousand times too far away. Both copies are stored explicitly and covered by a
-  test.
+  test. The joint *coordinate* joins that list only when the joint is prismatic: an
+  angle is dimensionless and crosses every unit boundary untouched, a displacement is
+  a length and crosses none of them untouched. That is why the limits live in two
+  differently named arguments and why passing the wrong one raises instead of being
+  coerced.
 - **Vertex order.** Anchor `vertex_indices` are offset onto the parts concatenated
   in bank order, so the renderer's mesh must be that same concatenation.
   `fuse_articulated_parts` builds it rather than trusting a pre-fused asset, whose
@@ -200,3 +210,81 @@ reports a range ending at 205.8 deg, which is how far the *open scan* was opened
 not how far the hinge goes. The lid reaches 213-215 deg, confirmed on two separate
 captures by two independent methods. Clipped at the scanned value, 77 of 203 frames
 pinned to the bound exactly and looked like measurements.
+
+## Prismatic joints
+
+A sliding joint is supported by declaring it in the joint file. It is opt-in in the
+strict sense: `joint_type` absent or `"revolute"` takes byte-for-byte the paths that
+existed before, a bank saved before joint types existed loads as a hinge, and every
+angle-named argument and output key keeps its meaning.
+
+```json
+{"joint_type": "prismatic", "parts": ["housing.obj", "drawer.obj"],
+ "axis": [0, 1, 0], "range": [0.0, 0.15]}
+```
+
+`origin` is ignored — a sliding part has no centre — and `range` is a pair of lengths
+in the mesh's own units, not `range_rad`. Use `--init-joint-value` and
+`--joint-extrapolate-max` in those same units; the degree-denominated flags are
+refused for a prismatic joint rather than reinterpreted.
+
+Almost nothing else changed, and that is a property of the original design rather
+than luck. Everything geometric reaches the joint through `joint_transform`, so
+anchor projection, the fused-mesh renderer, the residuals, the wrong-surface test,
+the alternation and the prediction step are all joint-type agnostic and were not
+touched. The solve is the one piece of real mathematics, and it gets *simpler*:
+each anchor moves by `d * axis` regardless of where it sits, so the residual is
+linear in `d` and the weighted least-squares answer is a mean of projections,
+
+```
+d* = sum_i w_i (y_i - x_i) . a / sum_i w_i
+```
+
+against the perpendicular-component arctangent the hinge needs. Conditioning improves
+with it — a hinge has anchors near the axis with no lever arm and nothing to say
+about the angle, while every anchor on a sliding part has identical sensitivity.
+
+### What was actually hard
+
+Not the objective. Two things, both of which fail without raising:
+
+- **The units contract inverts.** An angle is dimensionless, so `theta_limits_rad` is
+  stored once and passes through `prepare_anchor_bank_for_gotrack`, the runtime state
+  and the renderer untouched. A displacement is a length, so it needs the same
+  treatment the joint origin already gets at every one of those boundaries — including
+  one the hinge never exercised, the value handed to `set_object_joint_angle`, since
+  the renderer works in metres.
+- **The reporting window has to be removed, not adapted.** The half-turn wrap that
+  makes a 215 deg hinge report 215 instead of -145 ran unconditionally. A displacement
+  has no period; left in, the wrap folds it into a band around pi and returns a
+  plausible number.
+
+Both are covered by `tests/test_prismatic_joint.py`, which builds its own meshes and
+needs no capture. It also asserts the asymmetry directly — that a prismatic travel
+scales between unit systems and a revolute range does not — because a later edit
+"fixing" the units by scaling all limits uniformly would otherwise pass everything.
+
+One more test in that file is not about prismatic joints at all: the joint type
+reaches the geometry by being passed down by hand through every call site, and a
+missed one silently treats a slide as a hinge. That happened once during this work —
+one of four residual calls kept the default, and the run reported a healthy-looking
+`theta_rejected` rather than failing. The test walks the AST of `utils/`, `archive/`
+and `evaluation/` and requires every call to a joint-aware function to name its type.
+
+### What has not been established
+
+- **No real object and no capture.** Everything above is synthetic. Nothing here has
+  seen a rendered template of a sliding part, a real flow field, or triangulation
+  noise with actual outliers.
+- **A drawer is far weaker under the seed than a lid.** The seed ranks FoundationPose
+  proposals by multi-view silhouette IoU. A part that slides inside a housing is
+  usually self-similar along its travel and heavily self-occluded, so silhouette
+  ranking has much less to work with than a lid swinging through 215 deg. Expect the
+  seed to be the binding constraint, not the tracker.
+- **The wrong-surface test will mostly abstain.** It requires the two surfaces to be
+  separated where the anchor sits, and a part sliding inside its housing keeps them in
+  contact along the whole travel. Silence from it means no information, not health.
+- **Cold-start reach.** From `d = 0` the alternation recovers displacements out to
+  roughly ten times the part's half-size and degrades past that. No physical drawer
+  comes close, and unlike the angle runaway it fails loudly — the wrong minimum leaves
+  a mean residual around 0.1 m against 1e-7 m for the right one.
