@@ -16,6 +16,10 @@ Example (from the repository root, in the gotrack environment)::
 
 Open the printed URL.  Clicking a camera frustum moves the browser camera to
 that view; use the timeline slider or Play to inspect the object motion.
+
+Timestamp-less bimanual captures are supported with ``raw/arm_left``,
+``raw/arm_right``, ``raw/hand_left``, and ``raw/hand_right``.  Pass the video
+rate, robot-to-video start offset, and calibrated per-side C2R transforms.
 """
 from __future__ import annotations
 
@@ -122,32 +126,84 @@ def _transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     return (transform[:3, :3] @ points.T).T + transform[:3, 3]
 
 
-def _load_robot_qpos(capture_dir: Path, frame_count: int) -> np.ndarray:
-    """Interpolate Inspire arm/hand recordings at camera-frame timestamps."""
-    raw = capture_dir / "raw"
-    arm_time = np.asarray(np.load(raw / "arm" / "time.npy", allow_pickle=True), dtype=np.float64)
-    arm_qpos = np.asarray(np.load(raw / "arm" / "position.npy", allow_pickle=True), dtype=np.float64)
-    hand_time = np.asarray(np.load(raw / "hand" / "time.npy", allow_pickle=True), dtype=np.float64)
-    hand_raw = np.asarray(np.load(raw / "hand" / "position.npy", allow_pickle=True), dtype=np.float64)
-    frame_times = np.asarray(np.load(raw / "timestamps" / "timestamp.npy", allow_pickle=True), dtype=np.float64)
-    if arm_qpos.ndim != 2 or arm_qpos.shape[1] != 6 or hand_raw.ndim != 2 or hand_raw.shape[1] != 6:
-        raise ValueError(f"Expected 6-DoF arm and hand streams, got arm={arm_qpos.shape}, hand={hand_raw.shape}")
-    if len(arm_time) < 2 or len(hand_time) < 2 or len(frame_times) < 2:
-        raise ValueError("Robot and camera timestamp streams must have at least two entries")
-    # Controller order: little, ring, middle, index, thumb_2, thumb_1.
+def _inspire_hand_qpos(hand_raw: np.ndarray) -> np.ndarray:
+    """Convert the six Inspire controller values to URDF actuated joints."""
     hand = np.empty_like(hand_raw, dtype=np.float64)
+    # Controller order: little, ring, middle, index, thumb_2, thumb_1.
     hand[:, 0] = 1.15 * (1.0 - hand_raw[:, 5] / 1000.0)
     hand[:, 1] = 0.55 * (1.0 - hand_raw[:, 4] / 1000.0)
     hand[:, 2] = 1.60 * (1.0 - hand_raw[:, 3] / 1000.0)
     hand[:, 3] = 1.60 * (1.0 - hand_raw[:, 2] / 1000.0)
     hand[:, 4] = 1.60 * (1.0 - hand_raw[:, 1] / 1000.0)
     hand[:, 5] = 1.60 * (1.0 - hand_raw[:, 0] / 1000.0)
-    hand_at_arm = np.column_stack([np.interp(arm_time, hand_time, hand[:, i]) for i in range(6)])
-    qpos_at_arm = np.concatenate([arm_qpos, hand_at_arm], axis=1)
-    if len(frame_times) < frame_count:
-        dt = float(np.median(np.diff(frame_times)))
-        frame_times = np.concatenate([frame_times, frame_times[-1] + dt * np.arange(1, frame_count - len(frame_times) + 1)])
-    return np.column_stack([np.interp(frame_times[:frame_count], arm_time, qpos_at_arm[:, i]) for i in range(12)])
+    return hand
+
+
+def _strict_time_samples(times: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Sort timestamped samples and retain the final value at duplicate times."""
+    order = np.argsort(times, kind="stable")
+    times, values = times[order], values[order]
+    keep = np.r_[times[1:] != times[:-1], True]
+    return times[keep], values[keep]
+
+
+def _load_one_robot_qpos(
+    raw: Path, arm_name: str, hand_name: str, frame_times: np.ndarray,
+) -> np.ndarray:
+    arm_time = np.asarray(np.load(raw / arm_name / "time.npy", allow_pickle=True), dtype=np.float64)
+    arm_qpos = np.asarray(np.load(raw / arm_name / "position.npy", allow_pickle=True), dtype=np.float64)
+    hand_time = np.asarray(np.load(raw / hand_name / "time.npy", allow_pickle=True), dtype=np.float64)
+    hand_raw = np.asarray(np.load(raw / hand_name / "position.npy", allow_pickle=True), dtype=np.float64)
+    if arm_qpos.ndim != 2 or arm_qpos.shape[1] != 6 or hand_raw.ndim != 2 or hand_raw.shape[1] != 6:
+        raise ValueError(f"Expected 6-DoF arm and hand streams, got arm={arm_qpos.shape}, hand={hand_raw.shape}")
+    if len(arm_time) < 2 or len(hand_time) < 2:
+        raise ValueError("Robot streams must have at least two timestamped entries")
+    arm_time, arm_qpos = _strict_time_samples(arm_time, arm_qpos)
+    hand_time, hand_raw = _strict_time_samples(hand_time, hand_raw)
+    hand = _inspire_hand_qpos(hand_raw)
+    arm_at_frames = np.column_stack([
+        np.interp(frame_times, arm_time, arm_qpos[:, index]) for index in range(6)
+    ])
+    hand_at_frames = np.column_stack([
+        np.interp(frame_times, hand_time, hand[:, index]) for index in range(6)
+    ])
+    return np.concatenate([arm_at_frames, hand_at_frames], axis=1)
+
+
+def _load_robot_qpos(
+    capture_dir: Path, frame_count: int, *, video_fps: float,
+    robot_video_offset_sec: float,
+) -> dict[str, np.ndarray]:
+    """Interpolate unimanual or bimanual Inspire recordings onto video frames.
+
+    When camera timestamps exist, they remain the default timebase and the
+    optional offset is added to them.  Timestamp-less captures use the earliest
+    arm timestamp plus ``robot_video_offset_sec + frame_index / video_fps``.
+    """
+    raw = capture_dir / "raw"
+    if (raw / "arm_left").is_dir() and (raw / "arm_right").is_dir():
+        streams = {"left": ("arm_left", "hand_left"), "right": ("arm_right", "hand_right")}
+    else:
+        streams = {"right": ("arm", "hand")}
+    timestamp_path = raw / "timestamps" / "timestamp.npy"
+    if timestamp_path.is_file():
+        frame_times = np.asarray(np.load(timestamp_path, allow_pickle=True), dtype=np.float64).reshape(-1)
+        if len(frame_times) < 2:
+            raise ValueError("Camera timestamp stream must have at least two entries")
+        if len(frame_times) < frame_count:
+            dt = float(np.median(np.diff(frame_times)))
+            frame_times = np.r_[frame_times, frame_times[-1] + dt * np.arange(1, frame_count - len(frame_times) + 1)]
+        frame_times = frame_times[:frame_count] + float(robot_video_offset_sec)
+    else:
+        starts = [
+            float(np.asarray(np.load(raw / arm_name / "time.npy", allow_pickle=True), dtype=np.float64)[0])
+            for arm_name, _ in streams.values()
+        ]
+        frame_times = min(starts) + float(robot_video_offset_sec) + np.arange(frame_count) / float(video_fps)
+    return {
+        side: _load_one_robot_qpos(raw, arm_name, hand_name, frame_times)
+        for side, (arm_name, hand_name) in streams.items()
+    }
 
 
 class VideoFrames:
@@ -211,7 +267,21 @@ def parse_args() -> argparse.Namespace:
                         help="world_from_robot C2R.npy. Default: <capture-dir>/C2R.npy when using robot coordinates.")
     parser.add_argument("--no-robot", action="store_true", help="Do not load or animate the recorded Inspire robot.")
     parser.add_argument("--robot-urdf", default=str(Path.home() / "paradex/rsc/robot/xarm_inspire_DFTP.urdf"),
-                        help="Inspire arm+hand URDF used with raw/ arm and hand recordings.")
+                        help="Right/unimanual Inspire arm+hand URDF (backward-compatible option name).")
+    parser.add_argument("--left-robot-urdf", default=str(Path.home() / "paradex/rsc/robot/xarm_inspire_left_new.urdf"),
+                        help="Left Inspire arm+hand URDF for bimanual raw streams.")
+    parser.add_argument("--right-c2r", default=None,
+                        help="Optional world_from_right_robot transform; defaults to --c2r/C2R.npy.")
+    parser.add_argument("--left-c2r", default=None,
+                        help="world_from_left_robot transform. Required to display the left robot accurately.")
+    parser.add_argument("--left-wrist-joint-offset-deg", type=float, default=0.0,
+                        help=("Viewer-only offset added to the left xArm joint6, in degrees. "
+                              "Use 180 when a bimanual recording uses the opposite wrist-roll convention."))
+    parser.add_argument("--video-fps", type=float, default=30.0,
+                        help="Frame rate used when raw/timestamps is absent. Default: 30.")
+    parser.add_argument("--robot-video-offset-sec", type=float, default=0.0,
+                        help=("Robot elapsed time at video frame 0 when camera timestamps are absent. "
+                              "For example, 3.75 means the video starts 3.75 s after robot logging."))
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--dry-run", action="store_true")
@@ -220,7 +290,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.max_cameras < 0 or args.frame_step < 1 or args.camera_image_max_side < 32 or args.camera_image_stride < 1:
+    if (args.max_cameras < 0 or args.frame_step < 1 or args.camera_image_max_side < 32
+            or args.camera_image_stride < 1 or args.video_fps <= 0):
         raise ValueError("camera and timeline parameters must be positive")
     capture_dir = Path(args.capture_dir).expanduser().resolve()
     mesh_path = Path(args.object_mesh).expanduser().resolve()
@@ -232,13 +303,16 @@ def main() -> int:
     poses = _load_records(records_path)
     intrinsics, extrinsics = _load_calibration(capture_dir)
     c2r_path = Path(args.c2r).expanduser().resolve() if args.c2r else capture_dir / "C2R.npy"
+    right_c2r_path = Path(args.right_c2r).expanduser().resolve() if args.right_c2r else c2r_path
+    left_c2r_path = Path(args.left_c2r).expanduser().resolve() if args.left_c2r else None
+    world_from_view_robot = _as_4x4(np.load(c2r_path)) if c2r_path.is_file() else None
+    world_from_right = _as_4x4(np.load(right_c2r_path)) if right_c2r_path.is_file() else None
+    world_from_left = _as_4x4(np.load(left_c2r_path)) if left_c2r_path is not None and left_c2r_path.is_file() else None
     if args.coordinate_frame == "robot":
-        if not c2r_path.is_file():
+        if world_from_view_robot is None:
             raise FileNotFoundError(f"Robot-coordinate view requires C2R.npy: {c2r_path}")
-        world_from_robot = _as_4x4(np.load(c2r_path))
-        view_from_world = np.linalg.inv(world_from_robot)
+        view_from_world = np.linalg.inv(world_from_view_robot)
     else:
-        world_from_robot = _as_4x4(np.load(c2r_path)) if c2r_path.is_file() else None
         view_from_world = np.eye(4)
     all_serials = [serial for serial in sorted(intrinsics) if serial in extrinsics]
     if args.camera_ids is not None:
@@ -315,30 +389,49 @@ def main() -> int:
     except Exception:
         pass
 
-    robot_qpos = robot_vis = robot_base = None
+    robot_qpos: dict[str, np.ndarray] = {}
+    robot_visualizers: dict[str, Any] = {}
     if not args.no_robot:
-        urdf_path = Path(args.robot_urdf).expanduser().resolve()
-        if not urdf_path.is_file():
-            raise FileNotFoundError(f"Robot URDF is missing: {urdf_path}")
         try:
             paradex_root = Path.home() / "paradex"
             if str(paradex_root) not in sys.path:
                 sys.path.insert(0, str(paradex_root))
             from viser.extras import ViserUrdf
-            robot_qpos = _load_robot_qpos(capture_dir, last_frame + 1)
-            robot_base = server.scene.add_frame("/robot", show_axes=True, axes_length=0.12, axes_radius=0.003)
-            if args.coordinate_frame == "world":
-                if world_from_robot is None:
-                    raise FileNotFoundError("--coordinate-frame world with robot needs --c2r or <capture-dir>/C2R.npy")
-                robot_base.position = tuple(world_from_robot[:3, 3])
-                robot_base.wxyz = _wxyz(world_from_robot[:3, :3])
-            # ViserUrdf updates only the 12 joint transforms per frame.  Do
-            # not stream a freshly tessellated 260k-vertex robot mesh every
-            # frame: that was the source of the previous slow, static-looking
-            # playback.
-            robot_vis = ViserUrdf(server, urdf_path, root_node_name="/robot")
-            robot_vis.update_cfg(robot_qpos[first_frame])
-            print(f"[viewer] robot={urdf_path} qpos_frames={len(robot_qpos)}")
+            robot_qpos = _load_robot_qpos(
+                capture_dir, last_frame + 1, video_fps=args.video_fps,
+                robot_video_offset_sec=args.robot_video_offset_sec,
+            )
+            if "left" in robot_qpos and args.left_wrist_joint_offset_deg:
+                robot_qpos["left"] = robot_qpos["left"].copy()
+                robot_qpos["left"][:, 5] += np.deg2rad(args.left_wrist_joint_offset_deg)
+                print(
+                    "[viewer] applied left joint6 offset: "
+                    f"{args.left_wrist_joint_offset_deg:g} deg"
+                )
+            side_specs = {
+                "right": (Path(args.robot_urdf).expanduser().resolve(), world_from_right),
+                "left": (Path(args.left_robot_urdf).expanduser().resolve(), world_from_left),
+            }
+            for side, qpos in robot_qpos.items():
+                urdf_path, world_from_side = side_specs[side]
+                if not urdf_path.is_file():
+                    raise FileNotFoundError(f"{side} robot URDF is missing: {urdf_path}")
+                if world_from_side is None:
+                    print(f"[viewer] warning: omitting {side} robot because its C2R is unavailable")
+                    continue
+                view_from_side = view_from_world @ world_from_side
+                server.scene.add_frame(
+                    f"/robots/{side}", show_axes=True, axes_length=0.12, axes_radius=0.003,
+                    position=tuple(view_from_side[:3, 3]), wxyz=_wxyz(view_from_side[:3, :3]),
+                )
+                # ViserUrdf updates joint transforms only; the parent frame owns
+                # the per-side calibrated robot-base transform.
+                visualizer = ViserUrdf(server, urdf_path, root_node_name=f"/robots/{side}")
+                visualizer.update_cfg(qpos[first_frame])
+                robot_visualizers[side] = visualizer
+                print(f"[viewer] robot[{side}]={urdf_path} qpos_frames={len(qpos)}")
+            if not robot_visualizers:
+                raise ValueError("No robot could be placed; provide a valid right/left C2R")
         except Exception as exc:
             raise RuntimeError("Could not load the recorded Inspire arm/hand; use --no-robot to inspect object only") from exc
 
@@ -347,7 +440,7 @@ def main() -> int:
         play_gui = server.gui.add_checkbox("Play", initial_value=True)
         rate_gui = server.gui.add_slider("Playback FPS", min=1, max=90, step=1, initial_value=30)
         image_gui = server.gui.add_checkbox("Show camera frames", initial_value=readers is not None)
-        robot_gui = server.gui.add_checkbox("Show robot", initial_value=robot_vis is not None)
+        robot_gui = server.gui.add_checkbox("Show robot", initial_value=bool(robot_visualizers))
         text_gui = server.gui.add_text("Pose status", initial_value="", disabled=True)
 
     lock = threading.Lock()
@@ -366,8 +459,9 @@ def main() -> int:
             object_frame.position = tuple(float(value) for value in view_pose[:3, 3])
             object_frame.wxyz = _wxyz(view_pose[:3, :3])
             text_gui.value = f"frame={frame_index}; source pose={'exact' if frame_index in poses else 'held'}"
-            if robot_vis is not None and robot_qpos is not None:
-                robot_vis.update_cfg(robot_qpos[min(frame_index, len(robot_qpos) - 1)])
+            for side, robot_vis in robot_visualizers.items():
+                qpos = robot_qpos[side]
+                robot_vis.update_cfg(qpos[min(frame_index, len(qpos) - 1)])
                 robot_vis.show_visual = robot_gui.value
             if readers is not None:
                 refresh_images = (last_camera_image_frame is None or not image_gui.value
