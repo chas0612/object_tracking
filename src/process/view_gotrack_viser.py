@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Interactively inspect one GoTrack trajectory in Viser without rendering video.
+"""Interactively inspect one or more GoTrack trajectories in Viser.
 
-The viewer keeps one object mesh in the calibrated world frame and updates its
-pose from ``world_pose_records.json`` with a frame slider.  It also shows a
+The viewer keeps object meshes in the calibrated world frame and updates their
+poses from ``world_pose_records.json`` files with a frame slider.  It also shows a
 small, evenly-spaced subset of calibrated camera frustums.  Camera images are
 off by default for responsive playback; they can be enabled on demand without
 creating an overlay video, image sequence, or any new NAS output.
@@ -25,6 +25,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -32,6 +35,33 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+
+def _safe_scene_name(value: str) -> str:
+    """Return a stable single Viser path component."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+    if not safe:
+        raise ValueError(f"Object display name has no safe characters: {value!r}")
+    return safe
+
+
+def _working_ffmpeg(preferred: str | None) -> str:
+    """Resolve an ffmpeg binary that actually starts and provides libx264."""
+    candidates = [preferred] if preferred else ["/usr/bin/ffmpeg", shutil.which("ffmpeg")]
+    errors: list[str] = []
+    for candidate in dict.fromkeys(value for value in candidates if value):
+        path = str(Path(candidate).expanduser())
+        try:
+            result = subprocess.run(
+                [path, "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            errors.append(f"{path}: {exc}")
+            continue
+        if result.returncode == 0 and "libx264" in result.stdout:
+            return path
+        errors.append(f"{path}: exit={result.returncode}; {result.stderr.strip()}")
+    raise RuntimeError("No working ffmpeg with libx264 found; " + " | ".join(errors))
 
 
 def _as_4x4(value: object) -> np.ndarray:
@@ -246,6 +276,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture-dir", required=True)
     parser.add_argument("--object-mesh", required=True)
     parser.add_argument("--gotrack-records", required=True)
+    parser.add_argument("--object-name", default=None,
+                        help="Display name for the primary object; default: mesh filename stem.")
+    parser.add_argument(
+        "--additional-object", nargs=3, action="append", default=[],
+        metavar=("NAME", "MESH", "GOTRACK_RECORDS"),
+        help="Add another independently tracked object to the same scene. Repeatable.",
+    )
     parser.add_argument("--video-dir", default=None, help="Default: <capture-dir>/undistorted_video")
     parser.add_argument("--camera-ids", nargs="*", default=None, help="Optional calibrated camera serials to show.")
     parser.add_argument("--max-cameras", type=int, default=0,
@@ -255,6 +292,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-image-stride", type=int, default=10,
                         help="Refresh camera-frustum images every N playback frames (object/robot still update every frame).")
     parser.add_argument("--camera-scale", type=float, default=0.08)
+    parser.add_argument("--material-roughness", type=float, default=1.0,
+                        help="Viewer-only PBR roughness for textured object meshes, 0=glossy, 1=matte. Default: 1.")
     image_group = parser.add_mutually_exclusive_group()
     image_group.add_argument("--show-camera-images", dest="show_camera_images", action="store_true",
                              help="Attach selected camera frames to frustums (off by default for playback speed).")
@@ -282,6 +321,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robot-video-offset-sec", type=float, default=0.0,
                         help=("Robot elapsed time at video frame 0 when camera timestamps are absent. "
                               "For example, 3.75 means the video starts 3.75 s after robot logging."))
+    parser.add_argument("--export-output", default=None,
+                        help="Initial MP4 export path shown in the GUI. Default: <capture-dir>/gotrack_viser.mp4")
+    parser.add_argument("--export-width", type=int, default=1920)
+    parser.add_argument("--export-height", type=int, default=1080)
+    parser.add_argument("--export-fps", type=int, default=30)
+    parser.add_argument("--ffmpeg", default=None,
+                        help="Optional ffmpeg binary for MP4 export; an executable libx264 build is auto-detected by default.")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--dry-run", action="store_true")
@@ -291,16 +337,30 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     if (args.max_cameras < 0 or args.frame_step < 1 or args.camera_image_max_side < 32
-            or args.camera_image_stride < 1 or args.video_fps <= 0):
-        raise ValueError("camera and timeline parameters must be positive")
+            or args.camera_image_stride < 1 or args.video_fps <= 0
+            or not 0.0 <= args.material_roughness <= 1.0
+            or args.export_width < 2 or args.export_height < 2 or args.export_fps < 1):
+        raise ValueError("camera/timeline parameters must be positive and material roughness must be in [0, 1]")
     capture_dir = Path(args.capture_dir).expanduser().resolve()
-    mesh_path = Path(args.object_mesh).expanduser().resolve()
-    records_path = Path(args.gotrack_records).expanduser().resolve()
+    primary_mesh_path = Path(args.object_mesh).expanduser().resolve()
+    primary_records_path = Path(args.gotrack_records).expanduser().resolve()
+    object_inputs = [(args.object_name or primary_mesh_path.stem, primary_mesh_path, primary_records_path)]
+    object_inputs.extend(
+        (name, Path(mesh).expanduser().resolve(), Path(records).expanduser().resolve())
+        for name, mesh, records in args.additional_object
+    )
+    names = [name for name, _, _ in object_inputs]
+    if len(set(names)) != len(names):
+        raise ValueError(f"Object display names must be unique: {names}")
     video_dir = Path(args.video_dir).expanduser().resolve() if args.video_dir else capture_dir / "undistorted_video"
-    if not capture_dir.is_dir() or not mesh_path.is_file() or not records_path.is_file():
-        raise FileNotFoundError("--capture-dir, --object-mesh, and --gotrack-records must exist")
+    missing_inputs = [str(path) for _, mesh, records in object_inputs for path in (mesh, records) if not path.is_file()]
+    if not capture_dir.is_dir() or missing_inputs:
+        raise FileNotFoundError(
+            "--capture-dir and every object mesh/record file must exist; "
+            f"missing={missing_inputs}"
+        )
 
-    poses = _load_records(records_path)
+    poses_by_object = {name: _load_records(records) for name, _, records in object_inputs}
     intrinsics, extrinsics = _load_calibration(capture_dir)
     c2r_path = Path(args.c2r).expanduser().resolve() if args.c2r else capture_dir / "C2R.npy"
     right_c2r_path = Path(args.right_c2r).expanduser().resolve() if args.right_c2r else c2r_path
@@ -328,8 +388,10 @@ def main() -> int:
         serials = [serial for serial in serials if _video_shape(video_dir / f"{serial}.avi") is not None]
     if not serials:
         raise ValueError("None of the selected cameras has a readable video")
-    first_frame, last_frame = min(poses), max(poses)
-    print(f"[viewer] frame={args.coordinate_frame} poses={len(poses)} frames={first_frame}..{last_frame} cameras={serials}")
+    first_frame = min(min(poses) for poses in poses_by_object.values())
+    last_frame = max(max(poses) for poses in poses_by_object.values())
+    pose_counts = {name: len(poses) for name, poses in poses_by_object.items()}
+    print(f"[viewer] frame={args.coordinate_frame} poses={pose_counts} frames={first_frame}..{last_frame} cameras={serials}")
     if args.dry_run:
         return 0
 
@@ -341,11 +403,6 @@ def main() -> int:
             raise RuntimeError("Viser is not installed in this environment. Install it with: conda run -n gotrack pip install viser") from exc
         raise
 
-    mesh = trimesh.load(mesh_path, process=False)
-    if isinstance(mesh, trimesh.Scene):
-        mesh = trimesh.util.concatenate(tuple(mesh.geometry.values()))
-    if not isinstance(mesh, trimesh.Trimesh):
-        raise ValueError(f"Could not load a Trimesh from {mesh_path}")
     server = viser.ViserServer(host=args.host, port=args.port)
     server.scene.set_up_direction("+z")
     server.scene.add_frame("/world", show_axes=True, axes_length=0.12, axes_radius=0.003)
@@ -353,8 +410,31 @@ def main() -> int:
         server.scene.add_grid("/world/grid", width=2.0, height=2.0, cell_size=0.1, section_size=0.5)
     except Exception:
         pass
-    object_frame = server.scene.add_frame("/track/object", show_axes=True, axes_length=0.06, axes_radius=0.002)
-    server.scene.add_mesh_trimesh("/track/object/mesh", mesh=mesh)
+    object_frames: dict[str, Any] = {}
+    object_axis_frames: dict[str, Any] = {}
+    for name, mesh_path, _ in object_inputs:
+        mesh = trimesh.load(mesh_path, process=False)
+        if isinstance(mesh, trimesh.Scene):
+            mesh = trimesh.util.concatenate(tuple(mesh.geometry.values()))
+        if not isinstance(mesh, trimesh.Trimesh):
+            raise ValueError(f"Could not load a Trimesh from {mesh_path}")
+        material = getattr(mesh.visual, "material", None)
+        if material is not None:
+            try:
+                pbr_material = material.to_pbr() if hasattr(material, "to_pbr") else material
+                pbr_material.roughnessFactor = args.material_roughness
+                pbr_material.metallicFactor = 0.0
+                mesh.visual.material = pbr_material
+            except (AttributeError, TypeError, ValueError):
+                pass
+        node_name = _safe_scene_name(name)
+        object_frames[name] = server.scene.add_frame(
+            f"/track/{node_name}", show_axes=False,
+        )
+        object_axis_frames[name] = server.scene.add_frame(
+            f"/object_axes/{node_name}", show_axes=True, axes_length=0.06, axes_radius=0.002,
+        )
+        server.scene.add_mesh_trimesh(f"/track/{node_name}/mesh", mesh=mesh)
 
     readers = VideoFrames(video_dir, serials, args.camera_image_max_side) if args.show_camera_images else None
     camera_handles: dict[str, Any] = {}
@@ -383,11 +463,19 @@ def main() -> int:
                 client.camera.wxyz = wxyz
                 client.camera.position = position
 
-    trajectory = _transform_points(np.asarray([poses[index][:3, 3] for index in sorted(poses)]), view_from_world).astype(np.float32)
-    try:
-        server.scene.add_point_cloud("/track/trajectory", points=trajectory, colors=(255, 170, 0), point_size=0.004)
-    except Exception:
-        pass
+    trajectory_handles: dict[str, Any] = {}
+    trajectory_colors = [(255, 170, 0), (60, 190, 255), (220, 80, 220), (80, 220, 120)]
+    for object_index, (name, poses) in enumerate(poses_by_object.items()):
+        trajectory = _transform_points(
+            np.asarray([poses[index][:3, 3] for index in sorted(poses)]), view_from_world,
+        ).astype(np.float32)
+        try:
+            trajectory_handles[name] = server.scene.add_point_cloud(
+                f"/trajectories/{_safe_scene_name(name)}", points=trajectory,
+                colors=trajectory_colors[object_index % len(trajectory_colors)], point_size=0.004,
+            )
+        except Exception:
+            pass
 
     robot_qpos: dict[str, np.ndarray] = {}
     robot_visualizers: dict[str, Any] = {}
@@ -440,25 +528,46 @@ def main() -> int:
         play_gui = server.gui.add_checkbox("Play", initial_value=True)
         rate_gui = server.gui.add_slider("Playback FPS", min=1, max=90, step=1, initial_value=30)
         image_gui = server.gui.add_checkbox("Show camera frames", initial_value=readers is not None)
+        frustum_gui = server.gui.add_checkbox("Show camera frustums", initial_value=True)
+        trajectory_gui = server.gui.add_checkbox("Show trajectories", initial_value=True)
+        object_axes_gui = server.gui.add_checkbox("Show object axes", initial_value=True)
         robot_gui = server.gui.add_checkbox("Show robot", initial_value=bool(robot_visualizers))
         text_gui = server.gui.add_text("Pose status", initial_value="", disabled=True)
+    default_export_output = (
+        Path(args.export_output).expanduser().resolve()
+        if args.export_output else capture_dir / "gotrack_viser.mp4"
+    )
+    with server.gui.add_folder("MP4 export"):
+        export_output_gui = server.gui.add_text("Output", initial_value=str(default_export_output))
+        export_width_gui = server.gui.add_number("Width", initial_value=args.export_width, min=2, step=2)
+        export_height_gui = server.gui.add_number("Height", initial_value=args.export_height, min=2, step=2)
+        export_fps_gui = server.gui.add_number("FPS", initial_value=args.export_fps, min=1, max=120, step=1)
+        export_button = server.gui.add_button("Export current view to MP4", color="green")
+        export_status_gui = server.gui.add_text("Export status", initial_value="idle", disabled=True)
 
     lock = threading.Lock()
-    last_pose: np.ndarray | None = None
+    last_pose: dict[str, np.ndarray] = {}
     last_camera_image_frame: int | None = None
 
     def update(frame_index: int) -> None:
-        nonlocal last_pose, last_camera_image_frame
+        nonlocal last_camera_image_frame
         with lock:
-            pose = poses.get(frame_index, last_pose)
-            if pose is None:
-                earlier = [index for index in poses if index <= frame_index]
-                pose = poses[max(earlier)] if earlier else poses[min(poses)]
-            last_pose = pose
-            view_pose = view_from_world @ pose
-            object_frame.position = tuple(float(value) for value in view_pose[:3, 3])
-            object_frame.wxyz = _wxyz(view_pose[:3, :3])
-            text_gui.value = f"frame={frame_index}; source pose={'exact' if frame_index in poses else 'held'}"
+            pose_status = []
+            for name, poses in poses_by_object.items():
+                pose = poses.get(frame_index, last_pose.get(name))
+                if pose is None:
+                    earlier = [index for index in poses if index <= frame_index]
+                    pose = poses[max(earlier)] if earlier else poses[min(poses)]
+                last_pose[name] = pose
+                view_pose = view_from_world @ pose
+                object_frame = object_frames[name]
+                object_frame.position = tuple(float(value) for value in view_pose[:3, 3])
+                object_frame.wxyz = _wxyz(view_pose[:3, :3])
+                axis_frame = object_axis_frames[name]
+                axis_frame.position = object_frame.position
+                axis_frame.wxyz = object_frame.wxyz
+                pose_status.append(f"{name}={'exact' if frame_index in poses else 'held'}")
+            text_gui.value = f"frame={frame_index}; " + ", ".join(pose_status)
             for side, robot_vis in robot_visualizers.items():
                 qpos = robot_qpos[side]
                 robot_vis.update_cfg(qpos[min(frame_index, len(qpos) - 1)])
@@ -475,6 +584,145 @@ def main() -> int:
     @frame_gui.on_update
     def _(_event: Any) -> None:
         update(int(frame_gui.value))
+
+    @frustum_gui.on_update
+    def _(_event: Any) -> None:
+        for handle in camera_handles.values():
+            handle.visible = bool(frustum_gui.value)
+
+    @trajectory_gui.on_update
+    def _(_event: Any) -> None:
+        for handle in trajectory_handles.values():
+            handle.visible = bool(trajectory_gui.value)
+
+    @object_axes_gui.on_update
+    def _(_event: Any) -> None:
+        for handle in object_axis_frames.values():
+            handle.visible = bool(object_axes_gui.value)
+
+    export_guard = threading.Lock()
+
+    @export_button.on_click
+    def _(event: Any) -> None:
+        client = event.client
+        if client is None:
+            export_status_gui.value = "error: export must be started from a connected browser client"
+            return
+        if not export_guard.acquire(blocking=False):
+            export_status_gui.value = "an export is already running"
+            return
+
+        def export_mp4() -> None:
+            process: subprocess.Popen[bytes] | None = None
+            temporary: Path | None = None
+            original_frame = int(frame_gui.value)
+            original_play = bool(play_gui.value)
+            original_images = bool(image_gui.value)
+            original_frustums = bool(frustum_gui.value)
+            original_trajectories = bool(trajectory_gui.value)
+            original_axes = bool(object_axes_gui.value)
+            try:
+                width = int(export_width_gui.value)
+                height = int(export_height_gui.value)
+                fps = int(export_fps_gui.value)
+                if width < 2 or height < 2 or width % 2 or height % 2 or fps < 1:
+                    raise ValueError("width/height must be positive even numbers and FPS must be positive")
+                output = Path(export_output_gui.value).expanduser()
+                if not output.is_absolute():
+                    output = output.resolve()
+                if output.suffix.lower() != ".mp4":
+                    raise ValueError("output path must end in .mp4")
+                output.parent.mkdir(parents=True, exist_ok=True)
+                temporary = output.with_name(f".{output.stem}.partial.mp4")
+                temporary.unlink(missing_ok=True)
+                ffmpeg = _working_ffmpeg(args.ffmpeg)
+
+                camera_wxyz = np.asarray(client.camera.wxyz, dtype=np.float64).copy()
+                camera_position = np.asarray(client.camera.position, dtype=np.float64).copy()
+                camera_fov = float(client.camera.fov)
+
+                play_gui.value = False
+                frame_gui.disabled = True
+                play_gui.disabled = True
+                export_button.disabled = True
+                for gui in (export_output_gui, export_width_gui, export_height_gui, export_fps_gui):
+                    gui.disabled = True
+                image_gui.value = False
+                frustum_gui.value = False
+                trajectory_gui.value = False
+                object_axes_gui.value = False
+                for handle in camera_handles.values():
+                    handle.visible = False
+                    handle.image = None
+                for handle in trajectory_handles.values():
+                    handle.visible = False
+                for handle in object_axis_frames.values():
+                    handle.visible = False
+
+                command = [
+                    ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "rawvideo", "-pix_fmt", "rgb24",
+                    "-video_size", f"{width}x{height}", "-framerate", str(fps),
+                    "-i", "-", "-an", "-c:v", "libx264", "-preset", "medium",
+                    "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    str(temporary),
+                ]
+                process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                if process.stdin is None:
+                    raise RuntimeError("ffmpeg stdin pipe was not created")
+                total = last_frame - first_frame + 1
+                export_status_gui.value = f"rendering 0/{total}"
+                for ordinal, frame_index in enumerate(range(first_frame, last_frame + 1), start=1):
+                    update(frame_index)
+                    image = client.get_render(
+                        height, width, wxyz=camera_wxyz, position=camera_position,
+                        fov=camera_fov, transport_format="jpeg",
+                    )
+                    image = np.asarray(image)
+                    if image.shape[:2] != (height, width) or image.ndim != 3 or image.shape[2] < 3:
+                        raise RuntimeError(f"unexpected Viser render shape: {image.shape}")
+                    rgb = np.ascontiguousarray(image[:, :, :3], dtype=np.uint8)
+                    process.stdin.write(rgb.tobytes())
+                    if ordinal == 1 or ordinal == total or ordinal % 10 == 0:
+                        export_status_gui.value = f"rendering {ordinal}/{total}"
+                process.stdin.close()
+                return_code = process.wait()
+                stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
+                if return_code != 0:
+                    raise RuntimeError(f"ffmpeg exited with {return_code}: {stderr.strip()}")
+                temporary.replace(output)
+                export_status_gui.value = f"done: {output}"
+                process = None
+                temporary = None
+            except Exception as exc:
+                export_status_gui.value = f"error: {type(exc).__name__}: {exc}"
+            finally:
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait()
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+                image_gui.value = original_images
+                frustum_gui.value = original_frustums
+                trajectory_gui.value = original_trajectories
+                object_axes_gui.value = original_axes
+                for handle in camera_handles.values():
+                    handle.visible = original_frustums
+                for handle in trajectory_handles.values():
+                    handle.visible = original_trajectories
+                for handle in object_axis_frames.values():
+                    handle.visible = original_axes
+                update(original_frame)
+                frame_gui.value = original_frame
+                play_gui.value = original_play
+                frame_gui.disabled = False
+                play_gui.disabled = False
+                export_button.disabled = False
+                for gui in (export_output_gui, export_width_gui, export_height_gui, export_fps_gui):
+                    gui.disabled = False
+                export_guard.release()
+
+        threading.Thread(target=export_mp4, daemon=True).start()
 
     update(first_frame)
 
