@@ -2,10 +2,11 @@
 """Interactively inspect one or more GoTrack trajectories in Viser.
 
 The viewer keeps object meshes in the calibrated world frame and updates their
-poses from ``world_pose_records.json`` files with a frame slider.  It also shows a
-small, evenly-spaced subset of calibrated camera frustums.  Camera images are
-off by default for responsive playback; they can be enabled on demand without
-creating an overlay video, image sequence, or any new NAS output.
+poses from ``world_pose_records.json`` or ``object_6d_pose*.npz`` files with a
+frame slider.  It also shows a small, evenly-spaced subset of calibrated camera
+frustums.  Camera images are off by default for responsive playback; they can
+be enabled on demand without creating an overlay video, image sequence, or any
+new NAS output.
 
 Example (from the repository root, in the gotrack environment)::
 
@@ -102,6 +103,21 @@ def _wxyz(rotation: np.ndarray) -> tuple[float, float, float, float]:
 
 
 def _load_records(path: Path) -> dict[int, np.ndarray]:
+    if path.suffix.lower() == ".npz":
+        poses: dict[int, np.ndarray] = {}
+        with np.load(path, allow_pickle=False) as archive:
+            for key in archive.files:
+                if not key.startswith("frame_"):
+                    raise ValueError(f"Unexpected NPZ key {key!r} in {path}")
+                try:
+                    frame_index = int(key.removeprefix("frame_"))
+                except ValueError as exc:
+                    raise ValueError(f"Invalid NPZ frame key {key!r} in {path}") from exc
+                poses[frame_index] = _as_4x4(archive[key])
+        if not poses:
+            raise ValueError(f"No frame_* poses in {path}")
+        return poses
+
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, list):
         raise ValueError(f"Expected a list in {path}")
@@ -275,7 +291,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--capture-dir", required=True)
     parser.add_argument("--object-mesh", required=True)
-    parser.add_argument("--gotrack-records", required=True)
+    parser.add_argument(
+        "--gotrack-records",
+        required=True,
+        help="world_pose_records.json or object_6d_pose*.npz trajectory.",
+    )
     parser.add_argument("--object-name", default=None,
                         help="Display name for the primary object; default: mesh filename stem.")
     parser.add_argument(

@@ -262,6 +262,81 @@ def process_episode_sam3_frame(
     return done + skipped, failed, len(all_serials)
 
 
+def process_static_images_sam3(
+    seg, capture_dir, image_dir, prompt, output_dir, serials=None,
+):
+    """Undistort and segment one already-decoded PNG per camera.
+
+    Both RGB inputs and masks are written below ``output_dir``.  The source
+    capture is read-only, which is important for final/static datasets.
+    """
+    capture_dir = Path(capture_dir)
+    image_dir = Path(image_dir)
+    output_dir = Path(output_dir)
+    images_dir = output_dir / "images"
+    masks_dir = output_dir / "masks"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    masks_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(capture_dir / "cam_param" / "intrinsics.json", encoding="utf-8") as f:
+        calibration = json.load(f)
+    all_paths = sorted(image_dir.glob("*.png"))
+    if serials:
+        wanted = set(serials)
+        all_paths = [path for path in all_paths if path.stem in wanted]
+
+    done = failed = skipped = 0
+    for cam_idx, source_path in enumerate(all_paths):
+        serial = source_path.stem
+        image_path = images_dir / source_path.name
+        mask_path = masks_dir / source_path.name
+        if image_path.is_file() and mask_path.is_file() and mask_path.stat().st_size > 0:
+            skipped += 1
+            continue
+        bgr = cv2.imread(str(source_path), cv2.IMREAD_COLOR)
+        entry = calibration.get(serial)
+        if bgr is None or not isinstance(entry, dict):
+            print(f"  cam [{cam_idx+1}/{len(all_paths)}] {serial}: missing image/calibration", flush=True)
+            failed += 1
+            continue
+        try:
+            import numpy as np
+            source_k = np.asarray(entry["original_intrinsics"], dtype=np.float64).reshape(3, 3)
+            target_k = np.asarray(entry["intrinsics_undistort"], dtype=np.float64).reshape(3, 3)
+            distortion = np.asarray(entry.get("dist_params", []), dtype=np.float64).reshape(-1)
+            bgr = cv2.undistort(bgr, source_k, distortion, None, target_k)
+        except (KeyError, TypeError, ValueError) as exc:
+            print(f"  cam [{cam_idx+1}/{len(all_paths)}] {serial}: bad calibration ({exc})", flush=True)
+            failed += 1
+            continue
+        cv2.imwrite(str(image_path), bgr)
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        t0 = time.perf_counter()
+        mask = seg.segment(rgb, prompt)
+        dt = time.perf_counter() - t0
+        if mask is None or not mask.any():
+            print(f"  cam [{cam_idx+1}/{len(all_paths)}] {serial}: no mask ({dt:.2f}s)", flush=True)
+            failed += 1
+            continue
+        cv2.imwrite(str(mask_path), mask)
+        done += 1
+        print(f"  cam [{cam_idx+1}/{len(all_paths)}] {serial}: {int((mask > 0).sum())} px ({dt:.2f}s)", flush=True)
+
+    metadata = {
+        "source_capture_dir": str(capture_dir.resolve()),
+        "source_image_dir": str(image_dir.resolve()),
+        "prompt": prompt,
+        "method": "sam3_static_image",
+        "serials_requested": [path.stem for path in all_paths],
+        "masks_written": done,
+        "masks_skipped": skipped,
+        "masks_failed": failed,
+    }
+    with open(output_dir / "metadata.json", "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+    return done + skipped, failed, len(all_paths)
+
+
 # ── Format time ──────────────────────────────────────────────────────────────
 
 def _format_time(seconds):
@@ -317,6 +392,12 @@ examples:
         help=("Video directory for --frame-index. Default: <capture_dir>/videos. "
               "Use <capture_dir>/undistorted_video for calibration-consistent FoundPose inputs."),
     )
+    parser.add_argument(
+        "--static-image-dir", type=str, default=None,
+        help=("Read one PNG per camera from this directory, undistort it using "
+              "<capture_dir>/cam_param/intrinsics.json, and write images/masks "
+              "under --frame-output-dir."),
+    )
 
     # Batch-mode options
     parser.add_argument("--objects", nargs="*", default=None,
@@ -333,6 +414,11 @@ examples:
                         help="YOLOE frame skip (default: 3)")
     args = parser.parse_args()
 
+    if args.static_image_dir is not None:
+        if args.capture_dir is None or args.frame_output_dir is None:
+            parser.error("--static-image-dir requires --capture_dir and --frame-output-dir")
+        if args.method != "sam3":
+            parser.error("--static-image-dir currently supports only --method sam3")
     if args.frame_index is not None:
         if args.capture_dir is None:
             parser.error("--frame-index requires --capture_dir (batch mode is not supported)")
@@ -343,7 +429,7 @@ examples:
 
     # Load segmentor
     if args.method == "sam3":
-        if args.frame_index is None:
+        if args.frame_index is None and args.static_image_dir is None:
             from autodex.perception import Sam3Segmentor
             print(f"Loading SAM3 video model on GPU {args.gpu}...", flush=True)
             seg = Sam3Segmentor(gpu=args.gpu)
@@ -358,6 +444,11 @@ examples:
     print("Segmentor ready.", flush=True)
 
     def _run_episode(capture_dir):
+        if args.static_image_dir is not None:
+            return process_static_images_sam3(
+                seg, capture_dir, args.static_image_dir, args.prompt,
+                args.frame_output_dir, args.serials,
+            )
         if args.method == "sam3":
             return process_episode_sam3(seg, capture_dir, args.prompt, serials=args.serials)
         else:

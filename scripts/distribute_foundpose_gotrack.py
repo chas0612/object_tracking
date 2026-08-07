@@ -41,6 +41,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -159,6 +161,19 @@ def _load_object_episode_map(path_value: str | None) -> dict[str, set[str]]:
     return result
 
 
+def _load_object_aliases(path_value: str | None) -> dict[str, str]:
+    if not path_value:
+        return {}
+    path = Path(path_value).expanduser()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) and value
+        for key, value in payload.items()
+    ):
+        raise ValueError(f"Object alias map must be a string-to-string JSON object: {path}")
+    return payload
+
+
 def _prompt_candidates(object_name: str, args: argparse.Namespace) -> list[str]:
     """Prefer curated SAM3 text, then broad original text, then object name."""
     candidates = [
@@ -205,23 +220,31 @@ def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[st
                     and episode_dir.name not in generated_dirs):
                 episode_dirs.append(episode_dir)
     for episode_dir in episode_dirs:
-        _assert_episode_write_isolated(
-            shared_root, episode_dir, args.protected_root_rel
-        )
+        if not args.static_images:
+            _assert_episode_write_isolated(
+                shared_root, episode_dir, args.protected_root_rel
+            )
         try:
             rel = episode_dir.relative_to(target_root)
         except ValueError:
             continue
         if len(rel.parts) < 2:
             continue
-        object_name, episode = rel.parts[-2:]
+        source_object, episode = rel.parts[-2:]
+        object_name = args.object_aliases.get(source_object, source_object)
         robot_path = args.robot_label or args.target_root_rel
         if episodes and episode not in episodes:
             continue
-        if object_episode_map and episode not in object_episode_map[object_name]:
+        if object_episode_map and episode not in object_episode_map[source_object]:
             continue
-        if not (episode_dir / "cam_param" / "extrinsics.json").is_file() or not (episode_dir / "videos").is_dir():
-            skipped.append(f"{rel}: missing videos/ or cam_param/extrinsics.json")
+        input_dir = episode_dir / ("raw/images" if args.static_images else "videos")
+        input_glob = "*.png" if args.static_images else "*.avi"
+        if (not (episode_dir / "cam_param" / "extrinsics.json").is_file()
+                or not input_dir.is_dir() or not any(input_dir.glob(input_glob))):
+            skipped.append(
+                f"{rel}: missing {'raw/images/*.png' if args.static_images else 'videos/*.avi'} "
+                "or cam_param/extrinsics.json"
+            )
             continue
         mesh = _mesh_for_roots(mesh_roots, object_name)
         if mesh is None:
@@ -234,12 +257,14 @@ def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[st
             continue
         task_id = _safe_id(rel.as_posix())
         tasks.append({
-            "task_id": task_id, "robot": robot_path, "object_name": object_name, "episode": episode,
+            "task_id": task_id, "robot": robot_path, "object_name": object_name,
+            "source_object": source_object, "episode": episode,
             "episode_rel": str(episode_dir.relative_to(shared_root)),
             "mesh_rel": str(mesh.relative_to(shared_root)),
             "assets_rel": str(repre.parents[4].relative_to(shared_root)),
             "cache_repre_rel": str(repre.relative_to(shared_root)),
-            "sam3_prompts": _prompt_candidates(object_name, args),
+            "sam3_prompts": _prompt_candidates(source_object, args),
+            "static_images": bool(args.static_images),
         })
     return tasks, skipped
 
@@ -581,11 +606,17 @@ def _attempt_tail_recovery(
 def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     shared = Path.home() / args.shared_root_rel
     episode = shared / task["episode_rel"]
-    _assert_episode_write_isolated(shared, episode, args.protected_root_rel)
+    static_images = bool(task.get("static_images", False))
+    if not static_images:
+        _assert_episode_write_isolated(shared, episode, args.protected_root_rel)
     mesh = shared / task["mesh_rel"]
     assets = shared / task["assets_rel"]
     attempt = int(task["attempts"])
-    attempt_dir = episode / "object_tracking_foundpose_gotrack" / schedule_dir.name / f"attempt_{attempt:02d}"
+    attempt_dir = (
+        schedule_dir / "outputs" / task["task_id"] / f"attempt_{attempt:02d}"
+        if static_images else
+        episode / "object_tracking_foundpose_gotrack" / schedule_dir.name / f"attempt_{attempt:02d}"
+    )
     init_frame_index = int(args.init_frame_index)
     frame_dir, init_dir, track_dir = (
         attempt_dir / f"foundpose_frame_{init_frame_index:06d}",
@@ -605,7 +636,8 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
     try:
         with log_path.open("w", encoding="utf-8") as log:
             log.write(f"task={task['task_id']} worker={task['worker_id']} started_utc={_now()}\n")
-            _run_command(gotrack + ["src/process/undistort_capture_videos.py", "--capture-dir", str(episode)], log, REPO_ROOT)
+            if not static_images:
+                _run_command(gotrack + ["src/process/undistort_capture_videos.py", "--capture-dir", str(episode)], log, REPO_ROOT)
             task["phase"] = "mask"
             _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
             prompts = task.get("sam3_prompts") or _prompt_candidates(task["object_name"], args)
@@ -615,19 +647,30 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                 task["sam3_prompt_current"] = prompt
                 task["sam3_attempted_prompts"].append(prompt)
                 _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
-                _run_command(sam3 + ["src/process/mask.py", "--capture_dir", str(episode), "--frame-index", str(init_frame_index),
-                                     "--prompt", prompt, "--video-dir", str(episode / "undistorted_video"),
-                                     "--frame-output-dir", str(frame_dir)], log, REPO_ROOT)
+                mask_command = sam3 + [
+                    "src/process/mask.py", "--capture_dir", str(episode),
+                    "--prompt", prompt, "--frame-output-dir", str(frame_dir),
+                ]
+                if static_images:
+                    mask_command += ["--static-image-dir", str(episode / "raw/images")]
+                else:
+                    mask_command += ["--frame-index", str(init_frame_index),
+                                     "--video-dir", str(episode / "undistorted_video")]
+                _run_command(mask_command, log, REPO_ROOT)
                 metadata_path = frame_dir / "metadata.json"
                 metadata = _read_json(metadata_path) if metadata_path.is_file() else {}
-                masks_available = int(metadata.get("masks_written", 0)) + int(metadata.get("masks_skipped", 0)) > 0
+                mask_count = int(metadata.get("masks_written", 0)) + int(metadata.get("masks_skipped", 0))
+                masks_available = mask_count >= args.min_sam3_mask_views
                 if masks_available:
                     task["sam3_prompt_used"] = prompt
                     break
                 log.write(f"[sam3] no masks with prompt={prompt!r}; trying fallback\n")
                 log.flush()
             if not masks_available:
-                raise RuntimeError(f"SAM3 produced no masks with prompts: {prompts}")
+                raise RuntimeError(
+                    f"SAM3 produced fewer than {args.min_sam3_mask_views} mask views "
+                    f"with prompts: {prompts}"
+                )
             task["phase"] = "foundpose"
             _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
             _run_command(_foundpose_command(
@@ -649,6 +692,11 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                     "global_asymmetry_detected": result.get("global_asymmetry_detected"),
                     "global_asymmetry_applied": result.get("global_asymmetry_applied"),
                 }
+                if static_images:
+                    pose = np.load(init_dir / "init_pose_world.npy").astype(np.float32)
+                    pose_path = attempt_dir / "object_6d_pose.npz"
+                    np.savez_compressed(pose_path, frame_0=pose)
+                    task["static_pose_rel"] = str(pose_path.relative_to(shared))
                 task.update({"status": "completed", "reason": None})
                 log.write("[init-only] FoundPose candidate generation completed; skipping GoTrack.\n")
                 log.flush()
@@ -740,6 +788,7 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
                                                 "cache_root_rel": args.cache_root_rel, "mesh_root_rel": args.mesh_root_rel,
                                                 "object_episode_map": {name: sorted(episodes) for name, episodes in args.object_episode_map.items()},
                                                 "num_cameras": args.num_cameras, "max_frames": args.max_frames,
+                                                "min_sam3_mask_views": args.min_sam3_mask_views,
                                                 "camera_micro_batch_size": args.camera_micro_batch_size,
                                                 "max_video_duration_skew_sec": args.max_video_duration_skew_sec,
                                                 "init_frame_index": args.init_frame_index,
@@ -760,6 +809,8 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
                                                 "foundpose_global_dino_score_margin": args.foundpose_global_dino_score_margin,
                                                 "foundpose_global_dino_inlier_threshold_px": args.foundpose_global_dino_inlier_threshold_px,
                                                 "foundpose_init_only": args.foundpose_init_only,
+                                                "static_images": args.static_images,
+                                                "object_aliases": args.object_aliases,
                                                 "debug_sheets": args.debug_sheets,
                                                 "debug_sheet_max_cameras": args.debug_sheet_max_cameras,
                                                 "debug_sheet_output_root_rel": args.debug_sheet_output_root_rel,
@@ -810,6 +861,7 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
     # The queue's processing knobs belong to the immutable init manifest, not
     # to whichever controller later launches/relaunches the workers.
     args.num_cameras = int(manifest["num_cameras"])
+    args.min_sam3_mask_views = int(manifest.get("min_sam3_mask_views", args.min_sam3_mask_views))
     args.max_frames = int(manifest["max_frames"])
     args.camera_micro_batch_size = int(manifest["camera_micro_batch_size"])
     args.max_video_duration_skew_sec = float(manifest["max_video_duration_skew_sec"])
@@ -831,6 +883,7 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
     args.foundpose_global_dino_score_margin = float(manifest.get("foundpose_global_dino_score_margin", args.foundpose_global_dino_score_margin))
     args.foundpose_global_dino_inlier_threshold_px = float(manifest.get("foundpose_global_dino_inlier_threshold_px", args.foundpose_global_dino_inlier_threshold_px))
     args.foundpose_init_only = bool(manifest.get("foundpose_init_only", args.foundpose_init_only))
+    args.static_images = bool(manifest.get("static_images", args.static_images))
     args.debug_sheets = bool(manifest.get("debug_sheets", args.debug_sheets))
     args.debug_sheet_max_cameras = int(manifest.get("debug_sheet_max_cameras", args.debug_sheet_max_cameras))
     args.debug_sheet_output_root_rel = str(manifest.get("debug_sheet_output_root_rel", args.debug_sheet_output_root_rel))
@@ -860,6 +913,7 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
                    "--shared-root-rel", args.shared_root_rel,
                    "--runs-root-rel", args.runs_root_rel,
                    "--num-cameras", str(args.num_cameras),
+                   "--min-sam3-mask-views", str(args.min_sam3_mask_views),
                    "--camera-micro-batch-size", str(args.camera_micro_batch_size),
                    "--max-video-duration-skew-sec", str(args.max_video_duration_skew_sec),
                    "--init-frame-index", str(args.init_frame_index),
@@ -901,6 +955,8 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
             command.append("--foundpose-global-asymmetry-force")
         if args.foundpose_init_only:
             command.append("--foundpose-init-only")
+        if args.static_images:
+            command.append("--static-images")
         if args.retry_failed:
             command.append("--retry-failed")
         rendered = " ".join(part if part.startswith("$HOME/") else shlex.quote(part) for part in command)
@@ -978,6 +1034,10 @@ def main() -> int:
     p.add_argument("--objects", nargs="*", default=None); p.add_argument("--episodes", nargs="*", default=None)
     p.add_argument("--object-episodes-json", default=None,
                    help="JSON object mapping each object to its exact episode list; avoids --objects/--episodes cross products.")
+    p.add_argument("--object-alias-json", default=None,
+                   help="Optional JSON mapping capture object names to mesh/cache object names.")
+    p.add_argument("--static-images", action="store_true",
+                   help="Process raw/images/*.png as one static multiview frame and store all outputs inside the schedule.")
     p.add_argument("--workers", nargs="+", default=None); p.add_argument("--worker-id", default=None)
     p.add_argument("--remote-repo-rel", default="object_tracking"); p.add_argument("--connect-timeout", type=int, default=10)
     p.add_argument("--gotrack-env", default="gotrack"); p.add_argument("--sam3-env", default="sam3")
@@ -986,6 +1046,8 @@ def main() -> int:
     p.add_argument("--object-prompts-original-json", default=str(Path.home() / "sam3/object_prompts_original.json"),
                    help="Broader fallback object-to-SAM3-prompt JSON. Missing file is allowed.")
     p.add_argument("--num-cameras", type=int, default=22)
+    p.add_argument("--min-sam3-mask-views", type=int, default=1,
+                   help="Try fallback prompts until at least this many camera masks exist.")
     p.add_argument("--camera-micro-batch-size", type=int, default=0,
                    help="0 (default) refines all selected cameras together; set lower only to reduce GPU memory.")
     p.add_argument("--max-video-duration-skew-sec", type=float, default=1.0)
@@ -1058,7 +1120,8 @@ def main() -> int:
     args.protected_root_rel = (
         args.protected_root_rel or ["capture/eccv2026/v0"]
     )
-    if (args.connect_timeout < 1 or args.num_cameras < 1 or args.camera_micro_batch_size < 0
+    if (args.connect_timeout < 1 or args.num_cameras < 1 or args.min_sam3_mask_views < 1
+            or args.camera_micro_batch_size < 0
             or args.max_video_duration_skew_sec < 0 or args.max_frames == 0 or args.max_attempts < 1
             or args.init_frame_index < 0 or args.foundpose_candidate_rank < 0
             or not 0 <= args.reverse_stop_frame_index <= args.init_frame_index
@@ -1093,6 +1156,7 @@ def main() -> int:
     args.object_prompts = _load_prompt_map(args.object_prompts_json)
     args.object_prompts_original = _load_prompt_map(args.object_prompts_original_json)
     args.object_episode_map = _load_object_episode_map(args.object_episodes_json)
+    args.object_aliases = _load_object_aliases(args.object_alias_json)
     args.local_worker = args.mode == "worker" and (args.worker_id or socket.gethostname()).startswith("local")
     if args.mode == "init":
         if not args.target_root_rel: raise ValueError("--target-root-rel is required for --mode init")
