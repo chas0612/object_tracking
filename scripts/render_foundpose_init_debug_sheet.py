@@ -66,6 +66,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--camera-ids", nargs="*", default=None)
     parser.add_argument("--max-cameras", type=int, default=8)
+    parser.add_argument(
+        "--include-unmasked", action="store_true",
+        help="Render calibrated RGB views even when SAM3 produced no mask for them.",
+    )
     parser.add_argument("--columns", type=int, default=4)
     parser.add_argument("--cell-width", type=int, default=480)
     parser.add_argument("--alpha", type=float, default=0.5)
@@ -102,7 +106,7 @@ def main() -> int:
     usable = [serial for serial in image_ids if serial in intrinsics and serial in extrinsics]
     mask_ids = {path.stem for path in mask_dir.glob("*.png")} if mask_dir.is_dir() else set()
     evidence_ids = [serial for serial in usable if serial in mask_ids]
-    candidates = evidence_ids or usable
+    candidates = usable if args.include_unmasked else (evidence_ids or usable)
     serials = (
         list(args.camera_ids)
         if args.camera_ids is not None
