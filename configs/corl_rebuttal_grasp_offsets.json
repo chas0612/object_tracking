@@ -1,0 +1,13 @@
+{
+  "default_offset_sec": -1.0,
+  "overrides": {
+    "kanghyun__plastic_elephant_jug__human_2": -2.0,
+    "kanghyun__plastic_elephant_jug__human_4": -2.0,
+    "seongho__organizer_beige__human_3": 0.0,
+    "taeyoon__knife_sharpener__human_3": -2.0
+  },
+  "time_sec_overrides": {
+    "kanghyun__mug_holder__human_0": 24.0,
+    "taeyoon__knife_sharpener__human_4": 39.0
+  }
+}
