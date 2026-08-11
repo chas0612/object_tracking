@@ -178,6 +178,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--shared-root-rel", default="shared_data")
     parser.add_argument("--target-root-rel", default="capture/corl_rebuttal")
+    parser.add_argument(
+        "--objects", nargs="*", default=[],
+        help="Optional canonical mesh object names to promote.",
+    )
     parser.add_argument("--rank-overrides-json", default=None)
     parser.add_argument("--output-name", default="object_6d_pose_v2.npz")
     parser.add_argument(
@@ -211,6 +215,13 @@ def main() -> int:
         raw_overrides = {}
 
     latest = _latest_completed(schedules)
+    if args.objects:
+        selected_objects = set(args.objects)
+        latest = {
+            episode_rel: entry
+            for episode_rel, entry in latest.items()
+            if str(entry[1].get("object_name")) in selected_objects
+        }
     if args.expected_tasks is not None and len(latest) != args.expected_tasks:
         raise RuntimeError(f"Expected {args.expected_tasks} tasks, found {len(latest)}")
     overrides = _resolve_overrides(latest, raw_overrides)
