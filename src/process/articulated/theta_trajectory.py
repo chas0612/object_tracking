@@ -102,7 +102,8 @@ def main() -> int:
         print(f"only {len(rows)} solved frames under {probe_root}; nothing to trace", flush=True)
         return 1
 
-    theta_max = np.degrees(load_articulation(args.object).theta_max)
+    articulation = load_articulation(args.object)
+    theta_min, theta_max = np.degrees([articulation.theta_min, articulation.theta_max])
     frame = np.array([row["frame"] for row in rows], dtype=float)
     theta = np.array([row["theta"] for row in rows])
     centre = np.stack([row["centre"] for row in rows])
@@ -111,7 +112,8 @@ def main() -> int:
     drift = _second_difference(frame, centre) * 1000.0
     drift = np.linalg.norm(drift, axis=1)
 
-    print(f"{len(rows)} independently solved frames, joint range 0 - {theta_max:.1f} deg\n")
+    print(f"{len(rows)} independently solved frames, joint range "
+          f"{theta_min:.1f} - {theta_max:.1f} deg\n")
     print("  frame   coarse grid       theta  spread     IoU  pairs  curvature   body")
     for i, row in enumerate(rows):
         grid = ",".join(f"{t:.0f}" for t in row["coarse"])

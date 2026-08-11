@@ -1,0 +1,30 @@
+{
+  "note": "Runtime diagnostic override for test_0810 red_bowl episode 0; preserves the measured axis/origin and expands only the revolute guard to -140..140 degrees.",
+  "joint_type": "revolute",
+  "parts": [
+    "/home/capture16/shared_data/mesh_new/red_bowl/articulation_particulate/parts/body/body.obj",
+    "/home/capture16/shared_data/mesh_new/red_bowl/articulation_particulate/parts/handle/handle.obj"
+  ],
+  "part_names": [
+    "body",
+    "handle"
+  ],
+  "axis": [
+    -0.75648819,
+    0.2569125,
+    0.60143294
+  ],
+  "origin": [
+    -0.00279039,
+    0.05054165,
+    -0.03548177
+  ],
+  "range_rad": [
+    -2.443460952792061,
+    2.443460952792061
+  ],
+  "range_deg": [
+    -140.0,
+    140.0
+  ]
+}

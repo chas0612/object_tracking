@@ -57,7 +57,7 @@ FP_ROOT = Path(os.environ.get(
     "FOUNDATIONPOSE_ROOT",
     REPO_ROOT / "autodex/perception/thirdparty/FoundationPose"))
 
-from common import BODY, LID, Articulation, load_articulation, load_cameras  # noqa: E402
+from common import BODY, LID, Articulation, load_articulation, load_cameras, theta_grid  # noqa: E402
 from fit_rc import SilhouetteObjective  # noqa: E402
 from probe_fpose import _decimate  # noqa: E402
 
@@ -103,8 +103,8 @@ def main() -> int:
     camera_id = truth["depth_camera_ids"][0]
     camera = cameras[camera_id]
 
-    thetas = np.radians(np.arange(0.0, np.degrees(articulation.theta_max) + 1e-6,
-                                  args.theta_step_deg))
+    thetas = theta_grid(articulation.theta_min, articulation.theta_max,
+                        args.theta_step_deg)
     scorer, refiner, glctx = ScorePredictor(), PoseRefinePredictor(), dr.RasterizeCudaContext()
 
     print(f"camera={camera_id} {camera.width}x{camera.height}  "

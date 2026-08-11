@@ -4,11 +4,9 @@ Nothing here writes to ``~/object_tracking`` or to ``capture/eccv2026/v0``. The
 probe reads the promoted articulation result, the object meshes, and one
 episode's calibration, and writes only under this directory.
 
-The articulation model is the *measured* joint from
-``articulation_particulate/joint.json`` -- the one recovered by registering the
-closed scan against the open scan. Particulate's own ``predicted`` joint is
-recorded there too and is deliberately not used: its origin sits 7.9 mm off and
-its range says 107 deg against a true 206 deg.
+The articulation model comes from ``articulation_particulate/joint.json``. Both the
+legacy blue-box ``measured`` record and the promoted single-joint ``joints[]`` schema
+are normalised by :mod:`joint_schema` before meshes or limits are consumed.
 """
 
 from __future__ import annotations
@@ -19,6 +17,8 @@ from pathlib import Path
 
 import numpy as np
 import trimesh
+
+from joint_schema import load_single_joint_spec
 
 SHARED = Path.home() / "shared_data"
 MESH_ROOT = SHARED / "mesh_new"
@@ -38,7 +38,9 @@ class Articulation:
     lid: trimesh.Trimesh
     axis: np.ndarray          # (3,) unit direction
     origin: np.ndarray        # (3,) a point on the axis
+    theta_min: float          # radians; lower joint limit
     theta_max: float          # radians; the scanned open state
+    part_names: tuple[str, str] = ("body", "lid")
 
     def posed(self, pose_body: np.ndarray, theta: float) -> tuple[np.ndarray, np.ndarray]:
         """Vertices of (body, lid) in world, with the lid swung by ``theta``."""
@@ -55,17 +57,18 @@ class Articulation:
 
 def load_articulation(object_name: str = DEFAULT_OBJECT) -> Articulation:
     root = MESH_ROOT / object_name / "articulation_particulate"
-    joint = json.loads((root / "joint.json").read_text(encoding="utf-8"))["measured"]
-    axis = np.asarray(joint["axis"], dtype=np.float64)
-    norm = np.linalg.norm(axis)
-    if not np.isclose(norm, 1.0, atol=1e-6):
-        raise ValueError(f"Joint axis is not unit length: |axis| = {norm}")
+    spec = load_single_joint_spec(root / "joint.json")
+    if spec.joint_type != "revolute":
+        raise ValueError(
+            f"The FoundationPose seed supports a revolute joint, got {spec.joint_type}")
     return Articulation(
-        body=trimesh.load(root / "parts/body.obj", force="mesh"),
-        lid=trimesh.load(root / "parts/lid.obj", force="mesh"),
-        axis=axis,
-        origin=np.asarray(joint["origin"], dtype=np.float64),
-        theta_max=float(joint["range_rad"][1]),
+        body=trimesh.load(spec.part_paths[0], force="mesh"),
+        lid=trimesh.load(spec.part_paths[1], force="mesh"),
+        axis=spec.axis,
+        origin=spec.origin,
+        theta_min=spec.theta_min,
+        theta_max=spec.theta_max,
+        part_names=spec.part_names,
     )
 
 
@@ -140,6 +143,15 @@ def reference_pose(episode: Path = DEFAULT_EPISODE, frame: int | None = None) ->
         return np.asarray(data[keys[frame]], dtype=np.float64)
 
 
-def theta_grid(theta_max: float, step_deg: float = 2.0) -> np.ndarray:
-    """The sweep the tracker's constrained fit will search over."""
-    return np.radians(np.arange(0.0, np.degrees(theta_max) + step_deg * 0.5, step_deg))
+def theta_grid(theta_min: float, theta_max: float, step_deg: float = 2.0) -> np.ndarray:
+    """A bounded sweep which keeps the published zero pose when it is in range."""
+    lower, upper = np.degrees([theta_min, theta_max])
+    if lower > upper or step_deg <= 0:
+        raise ValueError("theta_min <= theta_max and a positive step are required")
+    if lower <= 0.0 <= upper:
+        negative = -np.arange(step_deg, abs(lower) + 1.0e-6, step_deg)[::-1]
+        positive = np.arange(0.0, upper + 1.0e-6, step_deg)
+        degrees = np.concatenate([negative, positive])
+    else:
+        degrees = np.arange(lower, upper + 1.0e-6, step_deg)
+    return np.radians(degrees)

@@ -43,7 +43,7 @@ The silhouette does not know the hinge exists, so the joint's range has to be
 imposed on it from outside. Left free, the refinement took the lid to -15 deg at
 frame 72 and won a tie-break on the IoU that bought -- the same failure that
 discredited the depth objective, arrived at from the other direction. Any search
-over the angle is clipped to [0, theta_max].
+over the angle is bounded by the joint's [theta_min, theta_max] range.
 
 ``--frames`` solves a series in one process. Every frame is solved from scratch --
 no pose, angle or seed carries over -- because the series exists to test the
@@ -79,7 +79,7 @@ FP_ROOT = Path(os.environ.get(
     "FOUNDATIONPOSE_ROOT",
     REPO_ROOT / "autodex/perception/thirdparty/FoundationPose"))
 
-from common import load_articulation, load_cameras  # noqa: E402
+from common import load_articulation, load_cameras, theta_grid  # noqa: E402
 from fit_rc import SilhouetteObjective, _from_pose, _to_pose  # noqa: E402
 from probe_fpose_theta import _fused  # noqa: E402
 from real_first_pose import DEFAULT_CAPTURE, _load_masks, _overlay_sheet  # noqa: E402
@@ -161,7 +161,8 @@ BODY_ROTATION_SLACK = 0.025     # radians per rotation-vector component, about 1
 BODY_TRANSLATION_SLACK = 0.004  # metres
 
 
-def _polish(fine, pose: np.ndarray, theta: float, theta_max: float):
+def _polish(fine, pose: np.ndarray, theta: float,
+            theta_min: float, theta_max: float):
     """Optimise the six pose parameters and the lid angle as one seven-vector.
 
     Genuinely together, which the earlier version of this only claimed. It fitted
@@ -200,7 +201,7 @@ def _polish(fine, pose: np.ndarray, theta: float, theta_max: float):
                for value in start[:3]]
               + [(value - BODY_TRANSLATION_SLACK, value + BODY_TRANSLATION_SLACK)
                  for value in start[3:6]]
-              + [(0.0, float(theta_max))])
+              + [(float(theta_min), float(theta_max))])
     # Powell, restarted until it stops finding anything. Its stopping rule is
     # relative to the function value, so at an IoU near 0.55 "converged" means an
     # improvement under about 5e-5, which one sweep of the direction set reaches on
@@ -260,8 +261,13 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
     # measured. ``--theta-max-deg`` raises the ceiling, and it has to reach the
     # refinement and not only the coarse grid, or the sweep explores angles the
     # polish is still forbidden to keep.
+    theta_min = (np.radians(args.theta_min_deg) if args.theta_min_deg is not None
+                 else articulation.theta_min)
     theta_max = (np.radians(args.theta_max_deg) if args.theta_max_deg is not None
                  else articulation.theta_max)
+    if theta_min > theta_max:
+        raise ValueError(f"Invalid theta range {np.degrees(theta_min):.1f} .. "
+                         f"{np.degrees(theta_max):.1f} deg")
     frame_dir = args.capture_dir / f"foundpose_frame_{frame_index:06d}"
     probe_dir = args.capture_dir / "articulated_probe" / f"frame_{frame_index:06d}"
     manifest_path = probe_dir / "depth" / "depth_manifest.json"
@@ -440,7 +446,7 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
             if row is None:
                 continue
             _, theta, iou = _polish(fine, np.asarray(row["pose_body"]),
-                                    np.radians(theta_deg), theta_max)
+                                    np.radians(theta_deg), theta_min, theta_max)
             tie_break[theta_deg] = {"landed_deg": float(np.degrees(theta)), "iou": iou,
                                     "pair": reference_pair}
             print(f"    from {theta_deg:6.1f} deg -> {np.degrees(theta):6.1f} deg, "
@@ -503,7 +509,7 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
         baseline_iou = fine.iou(pose, theta)
         iou = baseline_iou
         if args.refine_scale > 0:
-            pose, theta, iou = _polish(fine, pose, theta, theta_max)
+            pose, theta, iou = _polish(fine, pose, theta, theta_min, theta_max)
             moved_rot, moved_mm = _pose_delta(coarse_pose, pose)
             print(f"\n  {pair}: theta {theta_star_deg:.0f} -> {np.degrees(theta):.1f} deg, "
                   f"pose moved {moved_rot:.2f} deg / {moved_mm:.1f} mm, "
@@ -617,6 +623,9 @@ def main() -> int:
                              "fixed cost.")
     parser.add_argument("--object", default="blue_plastic_box")
     parser.add_argument("--theta-step-deg", type=float, default=15.0)
+    parser.add_argument("--theta-min-deg", type=float, default=None,
+                        help="Override the sweep's lower bound. Defaults to the joint file; "
+                             "negative values are valid when zero lies between two stops.")
     parser.add_argument("--theta-max-deg", type=float, default=None,
                         help="Override the sweep's upper bound. The joint was measured at "
                              "205.8 deg from the two-state scans, but the first real run "
@@ -677,13 +686,17 @@ def main() -> int:
     articulation = load_articulation(args.object)
     full_cameras = load_cameras(args.capture_dir)
 
+    theta_min_deg = (args.theta_min_deg if args.theta_min_deg is not None
+                     else np.degrees(articulation.theta_min))
     theta_max_deg = (args.theta_max_deg if args.theta_max_deg is not None
                      else np.degrees(articulation.theta_max))
-    thetas = np.radians(np.arange(0.0, theta_max_deg + 1e-6, args.theta_step_deg))
+    thetas = theta_grid(np.radians(theta_min_deg), np.radians(theta_max_deg),
+                        args.theta_step_deg)
     scorer, refiner, glctx = ScorePredictor(), PoseRefinePredictor(), dr.RasterizeCudaContext()
     part_body, part_lid = _prepare_parts(articulation, args.decimate_faces)
-    print(f"parts decimated once: body {len(part_body.faces)}, lid {len(part_lid.faces)} faces",
-          flush=True)
+    parent_name, child_name = articulation.part_names
+    print(f"parts decimated once: {parent_name} {len(part_body.faces)}, "
+          f"{child_name} {len(part_lid.faces)} faces", flush=True)
     estimators = []
     for theta in thetas:
         mesh = _fuse_prepared(part_body, part_lid, articulation, float(theta))
@@ -735,7 +748,8 @@ def main() -> int:
         args.summary.parent.mkdir(parents=True, exist_ok=True)
         args.summary.write_text(json.dumps(
             {"capture_dir": str(args.capture_dir), "object": args.object,
-             "theta_max_deg": theta_max_deg, "frames": summary}, indent=2) + "\n",
+             "theta_min_deg": theta_min_deg, "theta_max_deg": theta_max_deg,
+             "frames": summary}, indent=2) + "\n",
             encoding="utf-8")
         print(f"wrote {args.summary}", flush=True)
     return 0

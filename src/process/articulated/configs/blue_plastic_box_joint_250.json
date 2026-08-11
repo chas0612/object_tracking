@@ -1,0 +1,30 @@
+{
+  "note": "Runtime override for test_0810 blue_plastic_box episode 2; preserves the measured axis/origin and extends only the revolute upper limit to 250 degrees.",
+  "joint_type": "revolute",
+  "parts": [
+    "/home/capture16/shared_data/mesh_new/blue_plastic_box/articulation_particulate/parts/body.obj",
+    "/home/capture16/shared_data/mesh_new/blue_plastic_box/articulation_particulate/parts/lid.obj"
+  ],
+  "part_names": [
+    "body",
+    "lid"
+  ],
+  "axis": [
+    0.1602546464844158,
+    -0.9422634287886419,
+    -0.29403754700314527
+  ],
+  "origin": [
+    0.03822347605470165,
+    0.02382062740839731,
+    -0.02007172674434681
+  ],
+  "range_rad": [
+    0.0,
+    4.363323129985824
+  ],
+  "range_deg": [
+    0.0,
+    250.0
+  ]
+}

@@ -1,8 +1,9 @@
 # Articulated (7-DoF) tracking pipeline
 
-Six degrees of freedom for the body plus one revolute joint angle, per frame. Built
-for `blue_plastic_box` (box + hinged lid) but nothing here is specific to it beyond
-the joint file.
+Six degrees of freedom for the static parent plus one revolute joint angle, per frame.
+The seed accepts both the legacy blue-box `measured` joint file and the promoted
+`parts` + `joints[]` mesh schema. Exactly one parent-child joint is required; a
+multi-joint file is rejected rather than partially tracked.
 
 **Revolute only, in this directory.** The tracker itself also handles a prismatic
 joint (see `patches/MV-GoTrack-articulated.md`), but the seed stage here does not:
@@ -72,6 +73,11 @@ conda run -n object_6d python src/process/articulated/real_hybrid.py \
     --capture-dir "$CAPTURE" --frames 40 --refine-pairs 2 --budget-gib 6 \
     --theta-max-deg 260
 ```
+
+The sweep defaults to the full `[min, max]` range in `joint.json`. A signed range
+such as red_bowl's `[-79.8, 88.7]` is searched in both directions and always includes
+the published zero pose. `--theta-min-deg` and `--theta-max-deg` independently
+override those guards when capture evidence shows that a recorded limit is too tight.
 
 Environment is `object_6d` for every stage here, and `gotrack` for the tracker that
 `run_all_captures.sh` calls at the end.

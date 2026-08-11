@@ -32,7 +32,7 @@ import numpy as np
 import trimesh
 from scipy.spatial.transform import Rotation
 
-from common import Camera, load_articulation, load_cameras
+from common import Camera, load_articulation, load_cameras, theta_grid
 from fit_rc import SilhouetteObjective, _from_pose, _refine, _to_pose
 
 DEFAULT_CAPTURE = (Path.home() /
@@ -77,12 +77,13 @@ def _triangulate_centroids(masks: dict[str, np.ndarray], cameras: dict[str, Came
     return np.linalg.solve(A, b)
 
 
-def _global_search(objective: SilhouetteObjective, centre: np.ndarray, theta_max: float,
+def _global_search(objective: SilhouetteObjective, centre: np.ndarray,
+                   theta_min: float, theta_max: float,
                    rotations: int, theta_step_deg: float, seed: int,
                    mesh_centroid: np.ndarray) -> list[tuple[float, np.ndarray, float]]:
     """Score a rotation x theta sweep, coarsest possible, and rank the results."""
     orientations = Rotation.random(rotations, random_state=seed).as_matrix()
-    thetas = np.radians(np.arange(0.0, np.degrees(theta_max) + 1e-6, theta_step_deg))
+    thetas = theta_grid(theta_min, theta_max, theta_step_deg)
     scored = []
     for rotation in orientations:
         pose = np.eye(4)
@@ -148,7 +149,8 @@ def main() -> int:
 
     objective = SilhouetteObjective(articulation, cameras, masks, args.samples, args.seed)
     started = time.perf_counter()
-    scored = _global_search(objective, centre, articulation.theta_max, args.rotations,
+    scored = _global_search(objective, centre, articulation.theta_min,
+                            articulation.theta_max, args.rotations,
                             args.theta_step_deg, args.seed, articulation.body.centroid)
     print(f"coarse: {len(scored)} candidates in {time.perf_counter() - started:.1f}s   "
           f"best IoU {scored[0][0]:.3f}, {args.top_k}th {scored[args.top_k - 1][0]:.3f}",
@@ -157,7 +159,9 @@ def main() -> int:
     best = (-1.0, None, 0.0)
     for rank, (_, pose, theta) in enumerate(scored[: args.top_k]):
         vector, score = _refine(objective, _from_pose(pose), theta, iterations=20)
-        for candidate in np.radians(np.arange(max(0.0, np.degrees(theta) - args.theta_step_deg),
+        for candidate in np.radians(np.arange(
+                                              max(np.degrees(articulation.theta_min),
+                                                  np.degrees(theta) - args.theta_step_deg),
                                               min(np.degrees(articulation.theta_max),
                                                   np.degrees(theta) + args.theta_step_deg) + 1e-6,
                                               2.0)):

@@ -32,7 +32,7 @@ import trimesh
 from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation
 
-from common import Articulation, Camera, load_articulation, load_cameras
+from common import Articulation, Camera, load_articulation, load_cameras, theta_grid
 
 
 def _subsample(mesh: trimesh.Trimesh, count: int, rng: np.random.Generator) -> np.ndarray:
@@ -122,13 +122,14 @@ def _refine(objective: SilhouetteObjective, vector: np.ndarray, theta: float,
     return result.x, -result.fun
 
 
-def fit(objective: SilhouetteObjective, seed_pose: np.ndarray, theta_max: float,
+def fit(objective: SilhouetteObjective, seed_pose: np.ndarray,
+        theta_min: float, theta_max: float,
         coarse_step_deg: float = 15.0, fine_step_deg: float = 2.0,
         refine_iterations: int = 8) -> dict:
     """Sweep theta, refine the body pose at each, then polish theta."""
     vector = _from_pose(seed_pose)
 
-    coarse = np.radians(np.arange(0.0, np.degrees(theta_max) + 1e-6, coarse_step_deg))
+    coarse = theta_grid(theta_min, theta_max, coarse_step_deg)
     best = (-1.0, vector, 0.0)
     for theta in coarse:
         candidate, score = _refine(objective, vector, float(theta), refine_iterations)
@@ -137,7 +138,7 @@ def fit(objective: SilhouetteObjective, seed_pose: np.ndarray, theta_max: float,
     score, vector, theta = best
 
     fine = np.radians(np.arange(
-        max(0.0, np.degrees(theta) - coarse_step_deg),
+        max(np.degrees(theta_min), np.degrees(theta) - coarse_step_deg),
         min(np.degrees(theta_max), np.degrees(theta) + coarse_step_deg) + 1e-6,
         fine_step_deg))
     for candidate_theta in fine:
@@ -193,7 +194,7 @@ def main() -> int:
             seed_pose = _perturb(pose_true, rot_deg, trans_mm, rng)
             objective.evaluations = 0
             started = time.perf_counter()
-            out = fit(objective, seed_pose, articulation.theta_max)
+            out = fit(objective, seed_pose, articulation.theta_min, articulation.theta_max)
             elapsed = time.perf_counter() - started
 
             theta_err = abs(np.degrees(out["theta"] - frame["theta_rad"]))

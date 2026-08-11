@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Split one articulated seed into two independent rigid seeds, body and lid.
+"""Split one articulated seed into independent parent and moving-part rigid seeds.
 
 Diagnostic only.  The articulated tracker fits both parts in one Kabsch solve, so a
 failure cannot be attributed to a part from its output alone.  Tracking each part as
 an ordinary rigid object from the same frame, the same cameras and the same answer
-isolates that: the body seed is the fitted pose as-is, and the lid seed is that pose
-composed with the joint at the fitted angle, which is exactly the transform the
-articulated renderer applies to the lid's vertices.
+isolates that: the parent seed is the fitted pose as-is, and the moving-part seed is
+that pose composed with the joint at the fitted angle, exactly as in the articulated
+renderer.
 
 The two runs share no state, so whatever they disagree about is the coupling.
 """
@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 
 from common import load_cameras
+from joint_schema import load_single_joint_spec
 
 SCORE_KEYS = (
     "certainty_count_above_threshold",
@@ -61,12 +62,14 @@ def main() -> int:
     pose_body = np.asarray(answer["pose_body"], dtype=np.float64)
     theta = float(np.radians(answer["theta_deg"]))
 
-    joint = json.loads(args.joint_json.read_text(encoding="utf-8"))
-    pose_lid = pose_body @ joint_transform(joint["axis"], joint["origin"], theta)
+    joint = load_single_joint_spec(args.joint_json)
+    if joint.joint_type != "revolute":
+        raise ValueError("make_part_init currently expects a revolute joint")
+    pose_lid = pose_body @ joint_transform(joint.axis, joint.origin, theta)
 
     cameras = load_cameras(args.capture_dir)
     frames = sorted({args.frame_index, *range(max(0, int(args.repeat_frames)))})
-    for name, pose in (("body", pose_body), ("lid", pose_lid)):
+    for name, pose in zip(joint.part_names, (pose_body, pose_lid)):
         out_dir = args.capture_dir / f"gotrack_init_{name}" / f"frame_{args.frame_index:06d}"
         out_dir.mkdir(parents=True, exist_ok=True)
         # No ``theta_deg`` here on purpose: these are rigid seeds, and a leftover angle

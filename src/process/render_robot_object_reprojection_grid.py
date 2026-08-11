@@ -22,6 +22,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+from articulated.joint_schema import load_single_joint_spec
 import trimesh
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -266,10 +268,12 @@ def main() -> int:
         if len(joint_files) != len(moving_meshes):
             raise ValueError("Repeat --articulation-json once per --moving-mesh")
         for index, (moving_path, joint_path) in enumerate(zip(moving_meshes, joint_files)):
-            joint = json.loads(Path(joint_path).expanduser().read_text(encoding="utf-8"))
-            joint = joint.get("measured", joint)
-            axis = np.asarray(joint["axis"], dtype=np.float64)
-            origin = np.asarray(joint["origin"], dtype=np.float64)
+            joint = load_single_joint_spec(joint_path)
+            if joint.joint_type != "revolute":
+                raise ValueError(
+                    "The reprojection renderer currently poses a moving mesh by angle")
+            axis = joint.axis
+            origin = joint.origin
             angles = _load_joint_angles(records_paths[index])
             if not angles:
                 raise ValueError(

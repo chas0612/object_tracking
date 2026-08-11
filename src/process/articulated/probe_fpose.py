@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """FoundationPose control: per-part rigid pose from the one RGB-D view we have.
 
-Runs FoundationPose twice per frame -- once on ``body.obj``, once on ``lid.obj``
--- then recovers the lid angle by projecting the measured body-to-lid transform
+Runs FoundationPose twice per frame -- once on the parent, once on the moving part
+-- then recovers the joint angle by projecting the measured parent-to-child transform
 onto the joint's one-parameter family. This is the alternative to
 ``fit_rc.py`` for supplying the tracker's initial 7-DoF pose, so the two are
 scored on identical frames.
