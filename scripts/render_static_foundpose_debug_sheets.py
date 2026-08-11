@@ -2,8 +2,9 @@
 """Render latest successful static-FoundPose tasks into one QA directory.
 
 Schedules are supplied oldest-to-newest.  When the same task appears more than
-once, the newest completed result wins.  This makes a first run plus targeted
-retry render as one 40-image inspection folder without copying pipeline data.
+once for the same capture episode, the newest completed result wins.  Capture
+episode paths, rather than task IDs, are the identity because task IDs can be
+reused by independent operators.
 """
 from __future__ import annotations
 
@@ -30,8 +31,19 @@ def _completed_tasks(schedule: Path) -> dict[str, dict[str, Any]]:
             continue
         required = ("task_id", "episode_rel", "mesh_rel", "attempt_dir")
         if all(task.get(key) for key in required):
-            selected[str(task["task_id"])] = task
+            selected[str(task["episode_rel"])] = task
     return selected
+
+
+def _safe_component(value: str) -> str:
+    rendered = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
+    return rendered.strip("._") or "unknown"
+
+
+def _output_relative(task: dict[str, Any]) -> Path:
+    parts = Path(str(task["episode_rel"])).parts
+    operator = parts[-3] if len(parts) >= 3 else "unknown"
+    return Path(_safe_component(operator)) / f"{_safe_component(str(task['task_id']))}.jpg"
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,16 +84,17 @@ def main() -> int:
     )
     if args.dry_run:
         print(f"selected_completed_tasks={len(latest)}")
-        for task_id in sorted(latest):
-            print(task_id)
+        for episode_rel, task in sorted(latest.items()):
+            print(f"{episode_rel} -> {_output_relative(task)}")
         print(f"output={output_dir}")
         return 0
     output_dir.mkdir(parents=True, exist_ok=True)
 
     rendered = skipped = failed = 0
     failures: dict[str, str] = {}
-    for index, (task_id, task) in enumerate(sorted(latest.items()), start=1):
-        output = output_dir / f"{task_id}.jpg"
+    for index, (episode_rel, task) in enumerate(sorted(latest.items()), start=1):
+        task_id = str(task["task_id"])
+        output = output_dir / _output_relative(task)
         if output.exists() and not args.overwrite:
             skipped += 1
             continue
@@ -90,7 +103,7 @@ def main() -> int:
         attempt = shared / task["attempt_dir"]
         frame_dirs = sorted(attempt.glob("foundpose_frame_*"))
         if len(frame_dirs) != 1:
-            failures[task_id] = f"expected one foundpose_frame_* directory, got {len(frame_dirs)}"
+            failures[episode_rel] = f"expected one foundpose_frame_* directory, got {len(frame_dirs)}"
             failed += 1
             continue
         command = [
@@ -105,13 +118,13 @@ def main() -> int:
             "--cell-width", str(args.cell_width),
             "--include-unmasked",
         ]
-        print(f"[{index}/{len(latest)}] {task_id}", flush=True)
+        print(f"[{index}/{len(latest)}] {episode_rel}", flush=True)
         result = subprocess.run(command, cwd=REPO_ROOT)
         if result.returncode == 0:
             rendered += 1
         else:
             failed += 1
-            failures[task_id] = f"renderer_returncode={result.returncode}"
+            failures[episode_rel] = f"renderer_returncode={result.returncode}"
 
     summary = {
         "schedule_ids": args.schedule_id,

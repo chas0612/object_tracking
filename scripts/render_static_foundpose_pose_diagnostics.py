@@ -40,9 +40,36 @@ def _latest_completed(schedules: list[Path]) -> dict[str, dict[str, Any]]:
     for schedule in schedules:
         for path in sorted((schedule / "tasks").glob("*.json")):
             task = _read_json(path)
-            if task.get("status") == "completed" and task.get("attempt_dir"):
-                latest[str(task["task_id"])] = task
+            if (
+                task.get("status") == "completed"
+                and task.get("attempt_dir")
+                and task.get("episode_rel")
+            ):
+                latest[str(task["episode_rel"])] = task
     return latest
+
+
+def _safe_component(value: str) -> str:
+    rendered = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
+    return rendered.strip("._") or "unknown"
+
+
+def _output_relative(task: dict[str, Any], suffix: str) -> Path:
+    parts = Path(str(task["episode_rel"])).parts
+    operator = parts[-3] if len(parts) >= 3 else "unknown"
+    return Path(_safe_component(operator)) / f"{_safe_component(str(task['task_id']))}_{suffix}.jpg"
+
+
+def _resolve_task(latest: dict[str, dict[str, Any]], selector: str) -> dict[str, Any]:
+    if selector in latest:
+        return latest[selector]
+    matches = [task for task in latest.values() if str(task.get("task_id")) == selector]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        episodes = sorted(str(task["episode_rel"]) for task in matches)
+        raise KeyError(f"Ambiguous task {selector!r}; use one of these episode paths: {episodes}")
+    raise KeyError(f"No completed task matching {selector!r}")
 
 
 def _frame_dir(shared: Path, task: dict[str, Any]) -> Path:
@@ -202,8 +229,7 @@ def main() -> int:
         or task.get("object_name") in set(args.objects)
     ]
     selected.sort(key=lambda task: str(task["task_id"]))
-    if args.candidate_task and args.candidate_task not in latest:
-        raise KeyError(f"No completed task named {args.candidate_task}")
+    candidate_task = _resolve_task(latest, args.candidate_task) if args.candidate_task else None
     print(f"tasks={len(selected)} candidate_task={args.candidate_task}")
     for task in selected:
         print(f"  {task['task_id']} mesh={task['mesh_rel']}")
@@ -220,7 +246,7 @@ def main() -> int:
         return renderers[mesh_rel]
 
     for task in selected:
-        output = output_dir / f"{task['task_id']}_cam_{args.camera_suffix}.jpg"
+        output = output_dir / _output_relative(task, f"cam_{args.camera_suffix}")
         if output.exists() and not args.overwrite:
             print(f"[skip] {output}")
             continue
@@ -230,9 +256,11 @@ def main() -> int:
         )
         print(f"[wrote] {output}")
 
-    if args.candidate_task:
-        task = latest[args.candidate_task]
-        output = output_dir / f"{args.candidate_task}_{Path(args.candidate_bank).stem}_cam_{args.camera_suffix}.jpg"
+    if candidate_task is not None:
+        task = candidate_task
+        output = output_dir / _output_relative(
+            task, f"{Path(args.candidate_bank).stem}_cam_{args.camera_suffix}",
+        )
         if output.exists() and not args.overwrite:
             print(f"[skip] {output}")
         else:

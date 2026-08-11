@@ -73,9 +73,77 @@ def _latest_completed(schedules: list[Path]) -> dict[str, tuple[str, dict[str, A
     for schedule in schedules:
         for path in sorted((schedule / "tasks").glob("*.json")):
             task = _read_json(path)
-            if task.get("status") == "completed" and task.get("attempt_dir"):
-                latest[str(task["task_id"])] = (schedule.name, task)
+            if (
+                task.get("status") == "completed"
+                and task.get("attempt_dir")
+                and task.get("episode_rel")
+            ):
+                latest[str(task["episode_rel"])] = (schedule.name, task)
     return latest
+
+
+def _resolve_overrides(
+    latest: dict[str, tuple[str, dict[str, Any]]], raw: dict[str, int],
+) -> dict[str, int]:
+    """Resolve overrides by episode path, or by an unambiguous legacy task ID."""
+    by_task_id: dict[str, list[str]] = {}
+    for episode_rel, (_, task) in latest.items():
+        by_task_id.setdefault(str(task["task_id"]), []).append(episode_rel)
+    resolved: dict[str, int] = {}
+    unknown: list[str] = []
+    for selector, rank in raw.items():
+        if selector in latest:
+            resolved[selector] = rank
+            continue
+        matches = by_task_id.get(selector, [])
+        if len(matches) == 1:
+            resolved[matches[0]] = rank
+        elif len(matches) > 1:
+            raise KeyError(
+                f"Ambiguous rank override {selector!r}; use one of these episode paths: {matches}"
+            )
+        else:
+            unknown.append(selector)
+    if unknown:
+        raise KeyError(f"Rank overrides do not match completed tasks: {sorted(unknown)}")
+    return resolved
+
+
+def _snapshot_provenance(shared: Path, episode: Path) -> dict[str, Any] | None:
+    snapshot_dir = episode / "grasp_snapshot"
+    selection_path = snapshot_dir / "selection.json"
+    robot_state_path = snapshot_dir / "robot_state/robot_state.npz"
+    robot_metadata_path = snapshot_dir / "robot_state/metadata.json"
+    if not any(path.is_file() for path in (selection_path, robot_state_path, robot_metadata_path)):
+        return None
+    result: dict[str, Any] = {}
+    if selection_path.is_file():
+        selection = _read_json(selection_path)
+        result.update({
+            "selection_rel": str(selection_path.relative_to(shared)),
+            "selection_sha256": _sha256(selection_path),
+            "selected_frame": selection.get("selected_frame"),
+            "selected_timestamp": selection.get("selected_timestamp"),
+            "human_episode": selection.get("human_episode"),
+            "robot_episode": selection.get("robot_episode"),
+        })
+    if robot_state_path.is_file():
+        result.update({
+            "robot_state_rel": str(robot_state_path.relative_to(shared)),
+            "robot_state_sha256": _sha256(robot_state_path),
+        })
+    if robot_metadata_path.is_file():
+        metadata = _read_json(robot_metadata_path)
+        result.update({
+            "robot_metadata_rel": str(robot_metadata_path.relative_to(shared)),
+            "robot_metadata_sha256": _sha256(robot_metadata_path),
+            "arm_available": metadata.get("arm_available"),
+        })
+    images_dir = episode / "raw/images"
+    if images_dir.is_dir():
+        result["images_rel"] = str(images_dir.relative_to(shared))
+        result["image_count"] = len(list(images_dir.glob("*.png")))
+    return result
 
 
 def _pose_for(shared: Path, task: dict[str, Any], rank: int) -> tuple[np.ndarray, Path, str]:
@@ -136,29 +204,31 @@ def main() -> int:
         payload = _read_json(Path(args.rank_overrides_json).expanduser().resolve())
         if not isinstance(payload, dict):
             raise ValueError("Rank overrides must be a JSON object")
-        overrides = {str(key): int(value) for key, value in payload.items()}
-        if any(rank < 0 for rank in overrides.values()):
+        raw_overrides = {str(key): int(value) for key, value in payload.items()}
+        if any(rank < 0 for rank in raw_overrides.values()):
             raise ValueError("Candidate ranks must be non-negative")
+    else:
+        raw_overrides = {}
 
     latest = _latest_completed(schedules)
     if args.expected_tasks is not None and len(latest) != args.expected_tasks:
         raise RuntimeError(f"Expected {args.expected_tasks} tasks, found {len(latest)}")
-    unknown = sorted(set(overrides) - set(latest))
-    if unknown:
-        raise KeyError(f"Rank overrides do not match completed tasks: {unknown}")
+    overrides = _resolve_overrides(latest, raw_overrides)
 
     records: list[dict[str, Any]] = []
     existing: list[str] = []
-    for task_id, (schedule_id, task) in sorted(latest.items()):
+    for episode_rel, (schedule_id, task) in sorted(latest.items()):
+        task_id = str(task["task_id"])
         episode = (shared / task["episode_rel"]).resolve()
         if episode != target_root and target_root not in episode.parents:
             raise ValueError(f"Task target is outside protected promotion root: {episode}")
         target = episode / args.output_name
         if target.exists() and not args.overwrite:
             existing.append(str(target))
-        rank = overrides.get(task_id, 0)
+        rank = overrides.get(episode_rel, 0)
         pose, source, source_label = _pose_for(shared, task, rank)
-        records.append({
+        record = {
+            "episode_rel": episode_rel,
             "task_id": task_id,
             "object": task.get("source_object", task.get("object_name")),
             "mesh_object": task.get("object_name"),
@@ -171,12 +241,23 @@ def main() -> int:
             "source_sha256": _sha256(source),
             "target_rel": str(target.relative_to(shared)),
             "pose": pose,
-        })
+        }
+        snapshot = _snapshot_provenance(shared, episode)
+        if snapshot is not None:
+            record["grasp_snapshot"] = snapshot
+        records.append(record)
 
-    counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    mesh_counts: dict[str, int] = {}
     for record in records:
-        counts[record["object"]] = counts.get(record["object"], 0) + 1
-    print(f"tasks={len(records)} by_object={counts} overrides={overrides}")
+        source = str(record["object"])
+        mesh_object = str(record["mesh_object"])
+        source_counts[source] = source_counts.get(source, 0) + 1
+        mesh_counts[mesh_object] = mesh_counts.get(mesh_object, 0) + 1
+    print(
+        f"tasks={len(records)} by_object={mesh_counts} "
+        f"by_source_object={source_counts} overrides={overrides}"
+    )
     if existing:
         raise FileExistsError(
             f"{len(existing)} targets already exist; pass --overwrite only after review. "
@@ -207,7 +288,8 @@ def main() -> int:
         "output_name": args.output_name,
         "rank_overrides": overrides,
         "tasks": len(manifest_records),
-        "by_object": counts,
+        "by_object": mesh_counts,
+        "by_source_object": source_counts,
         "records": manifest_records,
     }
     _atomic_json(manifest_path, manifest)
