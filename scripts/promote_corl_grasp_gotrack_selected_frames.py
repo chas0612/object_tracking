@@ -119,6 +119,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-name", default="object_6d_pose_v2.npz")
     parser.add_argument(
+        "--pose-corrections-json",
+        default=None,
+        help=(
+            "Optional JSON mapping episode_rel to a 4x4 local correction. "
+            "The promoted pose is T_world_object @ T_object_correction."
+        ),
+    )
+    parser.add_argument(
         "--manifest-rel",
         default="capture/corl_rebuttal/object_6d_pose_dynamic_manifest.json",
     )
@@ -138,6 +146,19 @@ def main() -> int:
     if missing:
         raise FileNotFoundError(f"Missing schedules: {missing}")
     selected_objects = set(args.objects)
+    corrections: dict[str, np.ndarray] = {}
+    if args.pose_corrections_json:
+        corrections_path = Path(args.pose_corrections_json).expanduser().resolve()
+        raw_corrections = _read_json(corrections_path)
+        if not isinstance(raw_corrections, dict):
+            raise ValueError(f"Expected correction mapping: {corrections_path}")
+        for episode_rel, value in raw_corrections.items():
+            correction = np.asarray(value, dtype=np.float64)
+            if correction.shape != (4, 4) or not np.isfinite(correction).all():
+                raise ValueError(f"Invalid correction for {episode_rel}: {correction.shape}")
+            if not np.allclose(correction[3], [0.0, 0.0, 0.0, 1.0], atol=1e-8):
+                raise ValueError(f"Invalid correction homogeneous row for {episode_rel}")
+            corrections[str(episode_rel)] = correction
     latest = {
         episode_rel: entry
         for episode_rel, entry in _latest_completed(schedules).items()
@@ -163,6 +184,9 @@ def main() -> int:
             / str(task["object_name"]) / "world_pose_records.json"
         )
         pose = _pose_at(records_path, selected_frame)
+        correction = corrections.get(episode_rel)
+        if correction is not None:
+            pose = pose @ correction
         target = episode / args.output_name
         if target.exists() and not args.overwrite:
             existing.append(target)
@@ -185,7 +209,12 @@ def main() -> int:
             "records_rel": str(records_path.relative_to(shared)),
             "records_sha256": _sha256(records_path),
             "target_rel": str(target.relative_to(shared)),
+            "local_pose_correction": correction.tolist() if correction is not None else None,
         })
+
+    unused_corrections = sorted(set(corrections) - set(poses))
+    if unused_corrections:
+        raise ValueError(f"Corrections do not match promoted episodes: {unused_corrections}")
 
     counts: dict[str, int] = {}
     for record in records:
