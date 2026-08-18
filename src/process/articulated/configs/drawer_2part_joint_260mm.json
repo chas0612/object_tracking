@@ -1,0 +1,15 @@
+{
+  "joint_type": "prismatic",
+  "axis": [0.0, 0.0, 1.0],
+  "origin": [0.0, 0.0, 0.0],
+  "range": [0.0, 0.26],
+  "parts": [
+    "/home/capture16/shared_data/mesh_new/drawer_2part/articulation_particulate/parts/body_1F/body_1F.obj",
+    "/home/capture16/shared_data/mesh_new/drawer_2part/articulation_particulate/parts/drawer_2F/drawer_2F.obj"
+  ],
+  "part_names": ["body_1F", "drawer_2F"],
+  "zero": "the mesh as published: the drawer shut",
+  "sign": "positive slides the drawer out",
+  "axis_source": "copied from mesh_new/drawer_2part/articulation_particulate/joint.json",
+  "range_source": "case-study override: the source 207.9 mm limit was a convention, not a measured stop; episode 0730_test/5 visibly continues opening after the tracker reaches that bound at frame 696"
+}

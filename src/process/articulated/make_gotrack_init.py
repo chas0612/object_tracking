@@ -36,6 +36,11 @@ def main() -> int:
                              "are the safest: they are the ones whose answer is known "
                              "independently, and 12 came back at 0.7 deg against a true 0.")
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument(
+        "--hybrid-result", type=Path, default=None,
+        help=("Explicit hybrid_result.json to consume. Defaults to the legacy "
+              "<capture-dir>/articulated_probe/frame_<index>/hybrid path."),
+    )
     parser.add_argument("--repeat-frames", type=int, default=0,
                         help="Also write the same pose at frames 0..N-1. GoTrack looks the "
                              "init up by frame index and needs one at the frame it starts "
@@ -43,12 +48,26 @@ def main() -> int:
     args = parser.parse_args()
 
     probe = args.capture_dir / "articulated_probe" / f"frame_{args.frame_index:06d}"
-    record = json.loads((probe / "hybrid/hybrid_result.json").read_text(encoding="utf-8"))
+    hybrid_result = args.hybrid_result or (probe / "hybrid/hybrid_result.json")
+    record = json.loads(hybrid_result.read_text(encoding="utf-8"))
     answer = record.get("answer") or max(
         (record.get("starts") or record["results"]).values(),
         key=lambda r: r["silhouette_iou"])
     pose_world = np.asarray(answer["pose_body"], dtype=np.float64)
-    theta_deg = float(answer["theta_deg"])
+    # The seed writes the joint coordinate twice: `joint_value` in the joint's own
+    # units, which is what the tracker reads for either joint type, and `theta_deg`
+    # only when it is genuinely an angle. Preferring the neutral key means a
+    # prismatic seed cannot arrive here as a number of degrees.
+    joint_type = str(record.get("joint_type", "revolute"))
+    if "joint_value" in record:
+        joint_value = float(record["joint_value"])
+    elif joint_type == "revolute":
+        joint_value = float(np.radians(answer["theta_deg"]))
+    else:
+        raise ValueError(f"{hybrid_result}: a {joint_type} seed needs 'joint_value'")
+    joint_unit = str(record.get("joint_unit", "deg"))
+    joint_display = (float(np.degrees(joint_value)) if joint_type == "revolute"
+                     else joint_value * 1000.0)
 
     out_dir = args.out or (args.capture_dir / "gotrack_init"
                            / f"frame_{args.frame_index:06d}")
@@ -60,8 +79,10 @@ def main() -> int:
         records = [{
             "frame_index": int(frame),
             "pose_world": pose_world.tolist(),
-            "theta_deg": theta_deg,
-            "theta_rad": float(np.radians(theta_deg)),
+            "joint_type": joint_type,
+            "joint_value": joint_value,
+            **({"theta_deg": joint_display, "theta_rad": joint_value}
+               if joint_type == "revolute" else {}),
             "source": f"articulated_probe frame {args.frame_index}",
             "silhouette_iou": float(answer["silhouette_iou"]),
             # GoTrack's init fusion scores each view's candidate and drops the ones
@@ -83,7 +104,7 @@ def main() -> int:
         (out_dir / f"{camera_id}.json").write_text(
             json.dumps(records, indent=2) + "\n", encoding="utf-8")
 
-    print(f"frame {args.frame_index}: theta {theta_deg:.2f} deg, "
+    print(f"frame {args.frame_index}: {joint_type} {joint_display:.2f} {joint_unit}, "
           f"IoU {answer['silhouette_iou']:.4f}", flush=True)
     print(f"wrote {len(cameras)} camera files to {out_dir}", flush=True)
     return 0

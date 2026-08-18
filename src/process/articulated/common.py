@@ -32,43 +32,98 @@ BODY, LID = 0, 1
 
 @dataclass(frozen=True)
 class Articulation:
-    """Two rigid parts joined by one revolute DoF, in the object's mesh frame."""
+    """Two rigid parts joined by one degree of freedom, in the object's mesh frame.
+
+    The joint coordinate is stored under a name that does not claim a unit, because
+    it does not have one fixed unit: a revolute joint's is an angle in radians and a
+    prismatic joint's is a length in the mesh's own units. ``theta_min``/``theta_max``
+    remain available for the revolute case and refuse to answer for the other, which
+    is the point -- a length read as radians is off by a factor of the object's size
+    and nothing downstream would raise.
+    """
 
     body: trimesh.Trimesh
     lid: trimesh.Trimesh
     axis: np.ndarray          # (3,) unit direction
-    origin: np.ndarray        # (3,) a point on the axis
-    theta_min: float          # radians; lower joint limit
-    theta_max: float          # radians; the scanned open state
+    origin: np.ndarray        # (3,) a point on the axis; a prismatic joint ignores it
+    joint_min: float          # radians, or mesh length units for a prismatic joint
+    joint_max: float
     part_names: tuple[str, str] = ("body", "lid")
+    joint_type: str = "revolute"
 
-    def posed(self, pose_body: np.ndarray, theta: float) -> tuple[np.ndarray, np.ndarray]:
-        """Vertices of (body, lid) in world, with the lid swung by ``theta``."""
-        lid_world = pose_body @ self.joint_transform(theta)
+    @property
+    def theta_min(self) -> float:
+        return self._as_angle(self.joint_min)
+
+    @property
+    def theta_max(self) -> float:
+        return self._as_angle(self.joint_max)
+
+    def _as_angle(self, value: float) -> float:
+        if self.joint_type != "revolute":
+            raise ValueError(
+                f"theta_min/theta_max are angles and this joint is {self.joint_type}, "
+                "whose coordinate is a length; read joint_min/joint_max instead")
+        return value
+
+    @property
+    def joint_unit(self) -> str:
+        """The unit this joint's coordinate is *printed* in."""
+        return "deg" if self.joint_type == "revolute" else "mm"
+
+    def display(self, value: float) -> float:
+        """The joint coordinate converted for printing. Degrees, or millimetres.
+
+        Only for logs and for the flags that quote them. Everything stored or passed
+        around stays in the joint's own units -- radians, or the mesh's length unit --
+        so there is exactly one place a length can be scaled, and it is this one.
+        """
+        return self._scalar_or_array(
+            np.degrees(value) if self.joint_type == "revolute"
+            else np.asarray(value, dtype=np.float64) * 1000.0)
+
+    def from_display(self, value: float) -> float:
+        """The inverse of :meth:`display`. The only other place a length is scaled."""
+        return self._scalar_or_array(
+            np.radians(value) if self.joint_type == "revolute"
+            else np.asarray(value, dtype=np.float64) / 1000.0)
+
+    @staticmethod
+    def _scalar_or_array(value):
+        """A plain float for a scalar, so it survives ``json.dumps``; the array
+        otherwise, so a whole sweep can be converted in one call."""
+        array = np.asarray(value)
+        return array if array.ndim else float(array)
+
+    def posed(self, pose_body: np.ndarray, value: float) -> tuple[np.ndarray, np.ndarray]:
+        """Vertices of (body, moving part) in world, with the joint at ``value``."""
+        lid_world = pose_body @ self.joint_transform(value)
         return (
             trimesh.transform_points(self.body.vertices, pose_body),
             trimesh.transform_points(self.lid.vertices, lid_world),
         )
 
-    def joint_transform(self, theta: float) -> np.ndarray:
-        """Lid-relative-to-body transform at angle ``theta``, in the mesh frame."""
-        return trimesh.transformations.rotation_matrix(theta, self.axis, self.origin)
+    def joint_transform(self, value: float) -> np.ndarray:
+        """Moving-part-relative-to-body transform at joint coordinate ``value``."""
+        if self.joint_type == "prismatic":
+            pose = np.eye(4)
+            pose[:3, 3] = float(value) * self.axis
+            return pose
+        return trimesh.transformations.rotation_matrix(value, self.axis, self.origin)
 
 
 def load_articulation(object_name: str = DEFAULT_OBJECT) -> Articulation:
     root = MESH_ROOT / object_name / "articulation_particulate"
     spec = load_single_joint_spec(root / "joint.json")
-    if spec.joint_type != "revolute":
-        raise ValueError(
-            f"The FoundationPose seed supports a revolute joint, got {spec.joint_type}")
     return Articulation(
         body=trimesh.load(spec.part_paths[0], force="mesh"),
         lid=trimesh.load(spec.part_paths[1], force="mesh"),
         axis=spec.axis,
         origin=spec.origin,
-        theta_min=spec.theta_min,
-        theta_max=spec.theta_max,
+        joint_min=spec.limits[0],
+        joint_max=spec.limits[1],
         part_names=spec.part_names,
+        joint_type=spec.joint_type,
     )
 
 
@@ -143,15 +198,23 @@ def reference_pose(episode: Path = DEFAULT_EPISODE, frame: int | None = None) ->
         return np.asarray(data[keys[frame]], dtype=np.float64)
 
 
-def theta_grid(theta_min: float, theta_max: float, step_deg: float = 2.0) -> np.ndarray:
-    """A bounded sweep which keeps the published zero pose when it is in range."""
-    lower, upper = np.degrees([theta_min, theta_max])
-    if lower > upper or step_deg <= 0:
-        raise ValueError("theta_min <= theta_max and a positive step are required")
+def joint_grid(lower: float, upper: float, step: float) -> np.ndarray:
+    """A bounded sweep which keeps the published zero pose when it is in range.
+
+    Unit-agnostic: the three arguments and the result are all in whatever unit the
+    caller is working in. ``theta_grid`` supplies degrees, a prismatic sweep supplies
+    the mesh's length unit, and neither converts anything here.
+    """
+    if lower > upper or step <= 0:
+        raise ValueError("lower <= upper and a positive step are required")
     if lower <= 0.0 <= upper:
-        negative = -np.arange(step_deg, abs(lower) + 1.0e-6, step_deg)[::-1]
-        positive = np.arange(0.0, upper + 1.0e-6, step_deg)
-        degrees = np.concatenate([negative, positive])
-    else:
-        degrees = np.arange(lower, upper + 1.0e-6, step_deg)
-    return np.radians(degrees)
+        negative = -np.arange(step, abs(lower) + 1.0e-6, step)[::-1]
+        positive = np.arange(0.0, upper + 1.0e-6, step)
+        return np.concatenate([negative, positive])
+    return np.arange(lower, upper + 1.0e-6, step)
+
+
+def theta_grid(theta_min: float, theta_max: float, step_deg: float = 2.0) -> np.ndarray:
+    """The revolute sweep: radians in, radians out, stepped in degrees."""
+    lower, upper = np.degrees([theta_min, theta_max])
+    return np.radians(joint_grid(lower, upper, step_deg))

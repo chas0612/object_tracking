@@ -79,7 +79,9 @@ FP_ROOT = Path(os.environ.get(
     "FOUNDATIONPOSE_ROOT",
     REPO_ROOT / "autodex/perception/thirdparty/FoundationPose"))
 
-from common import load_articulation, load_cameras, theta_grid  # noqa: E402
+from common import (joint_grid, load_articulation, load_cameras,  # noqa: E402
+                    theta_grid)
+from depth_joint import DepthJointObjective  # noqa: E402
 from fit_rc import SilhouetteObjective, _from_pose, _to_pose  # noqa: E402
 from probe_fpose_theta import _fused  # noqa: E402
 from real_first_pose import DEFAULT_CAPTURE, _load_masks, _overlay_sheet  # noqa: E402
@@ -149,6 +151,69 @@ def _block_reduce_depth(depth: np.ndarray, factor: int) -> np.ndarray:
               .reshape(height // factor, width // factor, factor * factor))
     nearest = np.where(blocks > 0, blocks, np.inf).min(axis=-1)
     return np.where(np.isfinite(nearest), nearest, 0.0).astype(np.float32)
+
+
+def _joint_bounds(articulation, args) -> tuple[float, float]:
+    """The sweep's bounds, in the joint's own units, with the CLI override applied.
+
+    Two pairs of flags, one per unit, and each refuses the joint it does not describe
+    rather than being reinterpreted. An angle read as a length -- or the reverse -- is
+    wrong by a factor of the object's size, produces a plausible-looking sweep, and
+    raises nowhere. ``--joint-min``/``--joint-max`` are in the mesh's own units, the
+    same ones ``joint.json`` states its range in and the tracker takes
+    ``--init-joint-value`` in. Only the printing is in millimetres.
+    """
+    revolute = articulation.joint_type == "revolute"
+    if revolute and (args.joint_min is not None or args.joint_max is not None):
+        raise ValueError("--joint-min/--joint-max are lengths and this joint is "
+                         "revolute; use --theta-min-deg/--theta-max-deg")
+    if not revolute and (args.theta_min_deg is not None or args.theta_max_deg is not None):
+        raise ValueError("--theta-min-deg/--theta-max-deg are angles and this joint is "
+                         f"{articulation.joint_type}; use --joint-min/--joint-max, in "
+                         "the same units as the mesh")
+    if revolute:
+        lower = (articulation.joint_min if args.theta_min_deg is None
+                 else float(np.radians(args.theta_min_deg)))
+        upper = (articulation.joint_max if args.theta_max_deg is None
+                 else float(np.radians(args.theta_max_deg)))
+    else:
+        lower = articulation.joint_min if args.joint_min is None else float(args.joint_min)
+        upper = articulation.joint_max if args.joint_max is None else float(args.joint_max)
+    if lower > upper:
+        raise ValueError(
+            f"Invalid joint range {articulation.display(lower):.1f} .. "
+            f"{articulation.display(upper):.1f} {articulation.joint_unit}")
+    return lower, upper
+
+
+def _joint_sweep(articulation, lower: float, upper: float, args) -> np.ndarray:
+    """The coarse grid, in the joint's own units.
+
+    A revolute sweep steps in degrees and keeps the arithmetic it always had. A
+    prismatic one has no step it can inherit -- 15 degrees means nothing about a
+    drawer -- so absent ``--joint-step`` it takes a twelfth of the joint's own range,
+    which lands near the number of samples the hinge uses and cannot be wrong by a
+    change of unit system.
+    """
+    if articulation.joint_type == "revolute":
+        return theta_grid(lower, upper, args.theta_step_deg)
+    step = (float(args.joint_step) if args.joint_step is not None
+            else (upper - lower) / 12.0)
+    if step <= 0:
+        raise ValueError("--joint-step must be positive")
+    return joint_grid(lower, upper, step)
+
+
+def _scan_step(articulation, lower: float, upper: float, args) -> float:
+    """Step of the tie-break scan, in the joint's own units. 0 disables it."""
+    if articulation.joint_type == "revolute":
+        return float(np.radians(args.theta_scan_deg))
+    if args.joint_scan is not None:
+        return float(args.joint_scan)
+    # The hinge scans its whole range at 1 degree, a few hundred samples. Matching
+    # the sample count rather than the number keeps the cost the same and the unit
+    # out of it.
+    return (upper - lower) / 250.0
 
 
 # How far the silhouette may drag the body away from the pose depth gave it.
@@ -222,6 +287,34 @@ def _polish(fine, pose: np.ndarray, theta: float,
     return _to_pose(vector[:6]), float(vector[6]), -value
 
 
+def _polish_body(fine, pose: np.ndarray, theta: float):
+    """The six body parameters only, with the joint coordinate held where it is.
+
+    The counterpart to :func:`_polish` for a joint whose coordinate the silhouette is
+    not entitled to decide. Handing the seven-vector to Powell when the mask omits the
+    moving part does not merely fail to improve the joint -- it actively walks it back,
+    because hiding the unmasked part inside the body is what raises the outline score.
+    Freezing it keeps the two objectives on the axes each can actually measure.
+
+    The body's bounds are the same as in :func:`_polish` and for the same reason: the
+    pose is a depth measurement and the silhouette only refines it.
+    """
+    start = _from_pose(pose)
+    bounds = ([(value - BODY_ROTATION_SLACK, value + BODY_ROTATION_SLACK)
+               for value in start[:3]]
+              + [(value - BODY_TRANSLATION_SLACK, value + BODY_TRANSLATION_SLACK)
+                 for value in start[3:6]])
+    vector = start
+    value = fine.cost(start, float(theta))
+    for _ in range(4):
+        result = minimize(lambda x: fine.cost(x, float(theta)), vector, method="Powell",
+                          bounds=bounds, options={"maxiter": 65, "xtol": 1e-3, "ftol": 1e-4})
+        if result.fun >= value - 1e-5:
+            break
+        vector, value = np.asarray(result.x), float(result.fun)
+    return _to_pose(vector), float(theta), -value
+
+
 def _pose_delta(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     delta = np.linalg.inv(a) @ b
     angle = np.degrees(np.arccos(np.clip((np.trace(delta[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)))
@@ -261,13 +354,8 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
     # measured. ``--theta-max-deg`` raises the ceiling, and it has to reach the
     # refinement and not only the coarse grid, or the sweep explores angles the
     # polish is still forbidden to keep.
-    theta_min = (np.radians(args.theta_min_deg) if args.theta_min_deg is not None
-                 else articulation.theta_min)
-    theta_max = (np.radians(args.theta_max_deg) if args.theta_max_deg is not None
-                 else articulation.theta_max)
-    if theta_min > theta_max:
-        raise ValueError(f"Invalid theta range {np.degrees(theta_min):.1f} .. "
-                         f"{np.degrees(theta_max):.1f} deg")
+    theta_min, theta_max = _joint_bounds(articulation, args)
+    unit = articulation.joint_unit
     frame_dir = args.capture_dir / f"foundpose_frame_{frame_index:06d}"
     probe_dir = args.capture_dir / "articulated_probe" / f"frame_{frame_index:06d}"
     manifest_path = probe_dir / "depth" / "depth_manifest.json"
@@ -275,14 +363,42 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
         print(f"[skip] frame {frame_index}: no depth manifest at {manifest_path}", flush=True)
         return None
     depth_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    out_dir = probe_dir / "hybrid"
+    output_root = (args.output_root if args.output_root is not None
+                   else args.capture_dir / "articulated_probe")
+    out_dir = output_root / f"frame_{frame_index:06d}" / "hybrid"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     masks, score_cameras = _load_masks(frame_dir / "masks", full_cameras, args.scale)
-    objective = SilhouetteObjective(articulation, score_cameras, masks, args.samples)
+    objective = SilhouetteObjective(articulation, score_cameras, masks, args.samples,
+                                    backend=args.objective_backend)
     reference = next(iter(score_cameras.values()))
     print(f"\n{'=' * 78}\nframe {frame_index}: silhouette yardstick {len(masks)} views @ "
           f"{reference.width}x{reference.height}", flush=True)
+
+    # A sliding joint gets its coordinate from depth instead of from the silhouette.
+    # The reason is measured, not stylistic: on drawer/2 the mask held the cabinet
+    # without the extended drawer, so the outline was best explained by a shut drawer
+    # and the seed returned 0.6 mm against a truth near 220. Depth is computed over
+    # the whole image and does not care what was segmented. See depth_joint.py.
+    #
+    # Revolute is deliberately left alone. Its masks have been complete on every
+    # object run so far and its silhouette ranking is what those results rest on.
+    depth_joint = None
+    if articulation.joint_type == "prismatic" and not args.no_joint_depth:
+        depth_joint = DepthJointObjective(
+            articulation, manifest_path,
+            json.loads((args.capture_dir / "cam_param/intrinsics.json").read_text(
+                encoding="utf-8")),
+            json.loads((args.capture_dir / "cam_param/extrinsics.json").read_text(
+                encoding="utf-8")),
+            scale=args.joint_depth_scale, tolerance_m=args.joint_depth_tolerance / 1000.0)
+        print(f"frame {frame_index}: joint ranked on depth agreement over "
+              f"{len(depth_joint.views)} pairs, tolerance "
+              f"{args.joint_depth_tolerance:.0f} mm (mask not used)", flush=True)
+
+    def rank(pose: np.ndarray, joint_value: float, iou: float) -> float:
+        """What decides the joint coordinate. The silhouette, unless depth is on."""
+        return iou if depth_joint is None else depth_joint.agreement(pose, joint_value)
 
     video_dir = args.capture_dir / "undistorted_video"
     factor = int(round(1.0 / args.fpose_scale))
@@ -296,6 +412,14 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
         depth = _block_reduce_depth(np.load(entry["depth_npy"]).astype(np.float32), factor)
         mask_full = cv2.imread(str(frame_dir / "masks" / f"{camera_id}.png"),
                                cv2.IMREAD_GRAYSCALE)
+        if mask_full is None:
+            # Stereo depth itself does not need a mask, so real_depth keeps pairs
+            # whose SAM view failed.  FoundationPose registration does need one;
+            # omit only that pair from the pose-proposal sweep while retaining its
+            # depth in DepthJointObjective's global joint score.
+            print(f"\npair {pair}  reference={camera_id}: no SAM mask; "
+                  "skipping FoundationPose proposals for this pair", flush=True)
+            continue
         mask = cv2.resize(mask_full, (camera.width, camera.height),
                           interpolation=cv2.INTER_AREA) > 127
         rgb = cv2.cvtColor(cv2.resize(
@@ -318,15 +442,15 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
                                              iteration=args.refine_iterations)
             if getattr(estimator, "scores", None) is None:
                 # register() returned early -- not enough usable depth for this view.
-                print(f"    theta={np.degrees(theta):6.1f}  registration bailed out",
+                print(f"    theta={articulation.display(theta):6.1f}  registration bailed out",
                       flush=True)
                 continue
             pose_world = np.linalg.inv(camera.extrinsic) @ np.asarray(pose_camera)
             iou = objective.iou(pose_world, theta)
             native = float(estimator.scores[0].detach().cpu())
-            rows.append({"theta_deg": float(np.degrees(theta)), "silhouette_iou": iou,
+            rows.append({"joint_disp": float(articulation.display(theta)), "silhouette_iou": iou,
                          "foundationpose_score": native, "pose_body": pose_world.tolist()})
-            print(f"    theta={np.degrees(theta):6.1f}  IoU={iou:.4f}  fp_score={native:8.2f}",
+            print(f"    theta={articulation.display(theta):6.1f}  IoU={iou:.4f}  fp_score={native:8.2f}",
                   flush=True)
 
         if not rows:
@@ -336,13 +460,13 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
         best_row = max(rows, key=lambda row: row["silhouette_iou"])
         meta[pair] = {"reference_camera": camera_id,
                       "depth_valid_px": entry["valid_in_mask_px"],
-                      "coarse_theta_deg": best_row["theta_deg"],
+                      "coarse_joint_disp": best_row["joint_disp"],
                       "coarse_iou_own_scale": best_row["silhouette_iou"],
-                      "fp_score_theta_deg": max(
-                          rows, key=lambda row: row["foundationpose_score"])["theta_deg"],
+                      "fp_score_joint_disp": max(
+                          rows, key=lambda row: row["foundationpose_score"])["joint_disp"],
                       "sweep_seconds": time.perf_counter() - started}
         print(f"  swept in {time.perf_counter() - started:.0f}s, "
-              f"coarse best {best_row['theta_deg']:.0f}deg", flush=True)
+              f"coarse best {best_row['joint_disp']:.0f}{unit}", flush=True)
 
     if not sweeps:
         print(f"frame {frame_index}: no pair registered at any angle", flush=True)
@@ -358,33 +482,41 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
     # global argmax over (pair, angle) -- the same yardstick for every candidate.
     fine_masks, fine_cameras = _load_masks(frame_dir / "masks", full_cameras,
                                            args.refine_scale or args.scale)
-    fine = SilhouetteObjective(articulation, fine_cameras, fine_masks, args.refine_samples)
+    fine = SilhouetteObjective(articulation, fine_cameras, fine_masks, args.refine_samples,
+                               backend=args.objective_backend)
     fine_camera = fine_cameras[next(iter(fine_cameras))]
 
-    shortlist = sorted({row["theta_deg"] for rows in sweeps.values()
+    shortlist = sorted({row["joint_disp"] for rows in sweeps.values()
                         for row in sorted(rows, key=lambda r: -r["silhouette_iou"])[
                             :args.shortlist]})
-    by_theta = {pair: {row["theta_deg"]: row for row in rows} for pair, rows in sweeps.items()}
-    print(f"\nglobal angle selection at {fine_camera.width}x{fine_camera.height}, "
-          f"shortlist {[f'{t:.0f}' for t in shortlist]}", flush=True)
+    by_theta = {pair: {row["joint_disp"]: row for row in rows} for pair, rows in sweeps.items()}
+    scored_by = "depth" if depth_joint is not None else "IoU"
+    print(f"\nglobal angle selection at {fine_camera.width}x{fine_camera.height} "
+          f"(ranked on {scored_by}), shortlist {[f'{t:.0f}' for t in shortlist]}", flush=True)
     print("   theta  " + " ".join(f"{p.split(':')[0][-4:]:>8}" for p in sweeps)
           + "   agree", flush=True)
-    grid, consensus = {}, {}
-    for theta_deg in shortlist:
+    # ``grid`` stays the silhouette, because that is what phase 4 refines on and what
+    # the record reports. ``ranked_grid`` is what chooses the joint coordinate, and
+    # the two are the same object unless depth is on.
+    grid, ranked_grid, consensus = {}, {}, {}
+    for joint_disp in shortlist:
         cells = []
         for pair in sweeps:
-            row = by_theta[pair].get(theta_deg)
+            row = by_theta[pair].get(joint_disp)
             if row is None:
                 cells.append("       -")
                 continue
-            value = fine.iou(np.asarray(row["pose_body"]), np.radians(theta_deg))
-            grid[(pair, theta_deg)] = value
-            cells.append(f"{value:8.4f}")
-        consensus[theta_deg] = _inliers(
-            {pair: np.asarray(by_theta[pair][theta_deg]["pose_body"])
-             for pair in sweeps if theta_deg in by_theta[pair]}, args.reject_deg)
-        print(f"  {theta_deg:6.1f}  " + " ".join(cells)
-              + f"   {len(consensus[theta_deg])}/{len(sweeps)}", flush=True)
+            pose = np.asarray(row["pose_body"])
+            value = fine.iou(pose, articulation.from_display(joint_disp))
+            grid[(pair, joint_disp)] = value
+            ranked_grid[(pair, joint_disp)] = rank(
+                pose, articulation.from_display(joint_disp), value)
+            cells.append(f"{ranked_grid[(pair, joint_disp)]:8.4f}")
+        consensus[joint_disp] = _inliers(
+            {pair: np.asarray(by_theta[pair][joint_disp]["pose_body"])
+             for pair in sweeps if joint_disp in by_theta[pair]}, args.reject_deg)
+        print(f"  {joint_disp:6.1f}  " + " ".join(cells)
+              + f"   {len(consensus[joint_disp])}/{len(sweeps)}", flush=True)
 
     # An angle is credible only if a majority of the pairs, each registering from
     # its own depth view, agree on *where the object is* at that angle.
@@ -397,8 +529,8 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
     # four independent views concur on. Agreement is the part that cannot be had
     # by accident, so it gates the angle rather than commenting on it afterwards.
     quorum = len(sweeps) // 2 + 1
-    credible = [theta_deg for theta_deg in shortlist
-                if len(consensus.get(theta_deg, [])) >= quorum]
+    credible = [joint_disp for joint_disp in shortlist
+                if len(consensus.get(joint_disp, [])) >= quorum]
     if not credible:
         print(f"  ** no angle reaches {quorum}/{len(sweeps)} pose agreement; "
               f"falling back to the unfiltered score", flush=True)
@@ -407,12 +539,13 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
         print(f"  angles reaching {quorum}/{len(sweeps)} agreement: "
               f"{[f'{t:.0f}' for t in credible]}", flush=True)
 
-    ranked = {key: value for key, value in grid.items()
+    ranked = {key: value for key, value in ranked_grid.items()
               if key[1] in credible and key[0] in consensus[key[1]]}
-    best_pair, theta_star_deg = max(ranked, key=ranked.get)
-    coarse_picks = {meta[p]["coarse_theta_deg"] for p in sweeps}
-    print(f"  -> leading angle {theta_star_deg:.1f} deg on {best_pair.split(':')[0]}, "
-          f"IoU {ranked[(best_pair, theta_star_deg)]:.4f}; per-pair coarse would have "
+    best_pair, joint_star_disp = max(ranked, key=ranked.get)
+    coarse_picks = {meta[p]["coarse_joint_disp"] for p in sweeps}
+    print(f"  -> leading value {joint_star_disp:.1f} {unit} on {best_pair.split(':')[0]}, "
+          f"{scored_by} {ranked[(best_pair, joint_star_disp)]:.4f} "
+          f"(IoU {grid[(best_pair, joint_star_disp)]:.4f}); per-pair coarse would have "
           f"picked {sorted(coarse_picks)}", flush=True)
 
     # A thin lead is not a decision either. At frame 108 the leader is 0.0022 ahead
@@ -421,49 +554,93 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
     # that, so when the shortlist is close, refine each contender on the leading
     # pair and let the finished fits decide.
     leaders = {}
-    for (pair, theta_deg), value in ranked.items():
-        leaders[theta_deg] = max(leaders.get(theta_deg, -np.inf), value)
-    contenders = [theta_deg for theta_deg in sorted(leaders, key=leaders.get, reverse=True)
-                  if leaders[theta_deg] >= leaders[theta_star_deg] - args.tie_margin
+    for (pair, joint_disp), value in ranked.items():
+        leaders[joint_disp] = max(leaders.get(joint_disp, -np.inf), value)
+    contenders = [joint_disp for joint_disp in sorted(leaders, key=leaders.get, reverse=True)
+                  if leaders[joint_disp] >= leaders[joint_star_disp] - args.tie_margin
                   ][:args.max_contenders]
     tie_break = {}
-    if args.refine_scale > 0 and len(contenders) > 1:
-        # Every contender is refined from the *same* pair's registration, and that
+    # With depth deciding the joint the scan is not a tie-break, it is the answer:
+    # the shortlist is a 13-point grid over a 200 mm travel and the peak sits between
+    # its points. So it runs whether or not the leaders are close.
+    scan_always = depth_joint is not None
+    if _scan_step(articulation, theta_min, theta_max, args) > 0 and (
+            scan_always or len(contenders) > 1):
+        # Every contender is scanned from the *same* pair's registration, and that
         # pair must be one that agrees with the others at every contending angle.
         # Taking each angle's own best pair instead is the other half of what broke
         # frame 72: 0 deg was refined from 22645021 and 45 deg from 25452066, so
         # the comparison was partly between two pairs' registration quality rather
         # than between the two angles.
+        #
+        # The scan replaces a bounded 7-DoF Powell polish per contender. Those cost
+        # ~600 evaluations each and produced, between them, exactly one number: which
+        # of the contending grid angles to keep. Sweeping theta with the body frozen
+        # answers that from ~275 evaluations for the whole range and shows the shape
+        # of the curve rather than three samples of it -- which matters here, because
+        # the runners-up are not isolated peaks but a broad band on the other side of
+        # the joint, and a polish that walks into one reports a number that hides it.
+        # The body is not touched: it is what depth measured, and phase 4 is where it
+        # is allowed to move.
         eligible = [p for p in sweeps
-                    if all(p in consensus.get(theta_deg, []) for theta_deg in contenders)]
+                    if all(p in consensus.get(joint_disp, []) for joint_disp in contenders)]
         reference_pair = max(eligible or list(sweeps),
                              key=lambda p: sum(grid.get((p, t), 0.0) for t in contenders))
+        scan_step = _scan_step(articulation, theta_min, theta_max, args)
+        scan = articulation.display(
+            np.arange(theta_min, theta_max + 1.0e-12, scan_step))
         print(f"  contenders within {args.tie_margin} of the lead: "
-              f"{sorted(f'{t:.0f}' for t in contenders)} -- refining each from "
-              f"{reference_pair.split(':')[0]} to break the tie", flush=True)
-        for theta_deg in sorted(contenders):
-            row = by_theta[reference_pair].get(theta_deg)
+              f"{sorted(f'{t:.0f}' for t in contenders)} -- scanning the joint from "
+              f"{reference_pair.split(':')[0]} at "
+              f"{articulation.display(scan_step):.3g} {unit} "
+              f"({scan.size} values each) on {scored_by}", flush=True)
+        for joint_disp in sorted(contenders):
+            row = by_theta[reference_pair].get(joint_disp)
             if row is None:
                 continue
-            _, theta, iou = _polish(fine, np.asarray(row["pose_body"]),
-                                    np.radians(theta_deg), theta_min, theta_max)
-            tie_break[theta_deg] = {"landed_deg": float(np.degrees(theta)), "iou": iou,
-                                    "pair": reference_pair}
-            print(f"    from {theta_deg:6.1f} deg -> {np.degrees(theta):6.1f} deg, "
-                  f"refined IoU {iou:.4f}", flush=True)
+            pose = np.asarray(row["pose_body"])
+            values = np.array([
+                rank(pose, articulation.from_display(t),
+                     fine.iou(pose, articulation.from_display(t)) if depth_joint is None
+                     else 0.0)
+                for t in scan])
+            top = int(np.argmax(values))
+            tie_break[joint_disp] = {"landed_disp": float(scan[top]), "iou": float(values[top]),
+                                    "pair": reference_pair, "scored_by": scored_by,
+                                    "scan_step": articulation.display(scan_step),
+                                    "iou_at_start": float(
+                                        values[int(np.argmin(np.abs(scan - joint_disp)))])}
+            print(f"    from {joint_disp:6.1f} {unit} -> {scan[top]:6.1f} {unit}, "
+                  f"scanned {scored_by} {values[top]:.4f}", flush=True)
         if tie_break:
-            theta_star_deg = max(tie_break, key=lambda t: tie_break[t]["iou"])
-            print(f"  -> theta {theta_star_deg:.1f} deg after refinement", flush=True)
-    theta_star = np.radians(theta_star_deg)
+            joint_star_disp = max(tie_break, key=lambda t: tie_break[t]["iou"])
+            print(f"  -> joint {joint_star_disp:.1f} {unit} after the scan "
+                  f"(peak at {tie_break[joint_star_disp]['landed_disp']:.1f} {unit})", flush=True)
+    # The grid angle stays the key -- the registered poses are stored under it --
+    # but phase 4 starts from where the scan actually peaked. Handing it the grid
+    # point instead throws away the one thing the scan measured: on red_bowl/1 the
+    # peak sat 3.8 deg off the grid and 0.0018 IoU above it, and phase 4's Powell
+    # stopped without recovering the difference. The optimiser's stopping rule is
+    # relative to the function value, so it cannot be relied on to walk back to a
+    # maximum that is already known.
+    theta_star = articulation.from_display(
+        joint_star_disp if not tie_break else tie_break[joint_star_disp]["landed_disp"])
+
+    # The values phase 4 re-scans the joint over, in the joint's own units. Same grid
+    # the tie-break used, so the refinement cannot land somewhere the scan never
+    # looked; unused when the silhouette owns the joint.
+    sweep_step = _scan_step(articulation, theta_min, theta_max, args)
+    sweep_values = (np.arange(theta_min, theta_max + 1.0e-12, sweep_step)
+                    if sweep_step > 0 else np.array([theta_star]))
 
     # Phase 3: keep the pairs that agree at the chosen angle. This is the same
     # agreement already measured for every shortlisted angle above, so it is only
     # read back here -- at frame 108 it is what discards the one pair of four that
     # flipped 178 deg while the other three agreed to 12.
-    available = [pair for pair in sweeps if theta_star_deg in by_theta[pair]]
-    poses = {pair: np.asarray(by_theta[pair][theta_star_deg]["pose_body"])
+    available = [pair for pair in sweeps if joint_star_disp in by_theta[pair]]
+    poses = {pair: np.asarray(by_theta[pair][joint_star_disp]["pose_body"])
              for pair in available}
-    keep = [pair for pair in available if pair in consensus.get(theta_star_deg, available)]
+    keep = [pair for pair in available if pair in consensus.get(joint_star_disp, available)]
     rejected = [pair for pair in available if pair not in keep]
     agreeing = len(keep)
     if rejected:
@@ -476,12 +653,13 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
     # is a suspect angle, not a confident pose.
     if len(rejected) > agreeing:
         print(f"  ** {len(rejected)} of {len(available)} pairs disagree at "
-              f"{theta_star_deg:.1f} deg -- suspect the angle, not the pairs", flush=True)
+              f"{joint_star_disp:.1f} {unit} -- suspect the angle, not the pairs",
+              flush=True)
     # Each polish costs about as much as the sweep that fed it, so on a frame
     # series the cheapest honest thing is to start from the best-scoring survivors
     # rather than all of them.
     if args.refine_pairs:
-        keep = sorted(keep, key=lambda pair: -grid.get((pair, theta_star_deg), 0.0)
+        keep = sorted(keep, key=lambda pair: -grid.get((pair, joint_star_disp), 0.0)
                       )[:args.refine_pairs]
 
     # Phase 4: one answer, from as many starts as there are agreeing pairs.
@@ -509,17 +687,39 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
         baseline_iou = fine.iou(pose, theta)
         iou = baseline_iou
         if args.refine_scale > 0:
-            pose, theta, iou = _polish(fine, pose, theta, theta_min, theta_max)
+            if depth_joint is None:
+                pose, theta, iou = _polish(fine, pose, theta, theta_min, theta_max)
+            else:
+                # Alternate rather than optimise jointly, because the two axes are
+                # answered by two different measurements. Twice is enough: the body
+                # moves by a millimetre or two here, and the joint's optimum is not
+                # sensitive to that at the scale a slide covers.
+                for _ in range(2):
+                    pose, theta, iou = _polish_body(fine, pose, theta)
+                    values = np.array([depth_joint.agreement(pose, t) for t in sweep_values])
+                    theta = float(sweep_values[int(np.argmax(values))])
+                iou = fine.iou(pose, theta)
             moved_rot, moved_mm = _pose_delta(coarse_pose, pose)
-            print(f"\n  {pair}: theta {theta_star_deg:.0f} -> {np.degrees(theta):.1f} deg, "
+            print(f"\n  {pair}: joint {articulation.display(theta_star):.1f} -> "
+                  f"{articulation.display(theta):.1f} {unit} (grid {joint_star_disp:.0f}), "
                   f"pose moved {moved_rot:.2f} deg / {moved_mm:.1f} mm, "
                   f"IoU {baseline_iou:.4f} -> {iou:.4f} "
                   f"({time.perf_counter() - started:.0f}s)", flush=True)
 
         candidates[pair] = dict(meta[pair], pose_body=pose.tolist(),
-                                theta_deg=float(np.degrees(theta)), silhouette_iou=iou,
+                                joint_disp=float(articulation.display(theta)), silhouette_iou=iou,
                                 iou_before_refine_same_scale=baseline_iou,
-                                selected_theta_deg=theta_star_deg, sweep=sweeps[pair])
+                                selected_joint_disp=joint_star_disp, sweep=sweeps[pair],
+                                # Recorded whenever depth decided the joint, because
+                                # then the reported IoU is no longer the number the
+                                # answer was chosen by and reading it as one would
+                                # mislead: on drawer/2 the right answer scores *worse*
+                                # on IoU than the wrong one.
+                                **({"joint_depth_agreement":
+                                    float(depth_joint.agreement(pose, theta)),
+                                    "joint_depth_pixels":
+                                    int(depth_joint.visible_pixels(pose, theta))}
+                                   if depth_joint is not None else {}))
 
     if not candidates:
         print(f"frame {frame_index}: no pair survived to refinement", flush=True)
@@ -531,25 +731,34 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
     seed_pair = max(candidates, key=lambda pair: candidates[pair]["silhouette_iou"])
     answer = candidates[seed_pair]
     if len(candidates) > 1:
-        angles = [c["theta_deg"] for c in candidates.values()]
+        angles = [c["joint_disp"] for c in candidates.values()]
         starts = sorted(candidates, key=lambda p: -candidates[p]["silhouette_iou"])
         print(f"\n  {len(candidates)} starts -> "
-              + ", ".join(f"{candidates[p]['theta_deg']:.1f} deg @ "
+              + ", ".join(f"{candidates[p]['joint_disp']:.1f} {unit} @ "
                           f"{candidates[p]['silhouette_iou']:.4f}" for p in starts), flush=True)
-        print(f"  answer: theta {answer['theta_deg']:.1f} deg from "
+        print(f"  answer: joint {answer['joint_disp']:.1f} {unit} from "
               f"{seed_pair.split(':')[0]}, IoU {answer['silhouette_iou']:.4f}; "
-              f"starts spread {max(angles) - min(angles):.1f} deg", flush=True)
+              f"starts spread {max(angles) - min(angles):.1f} {unit}", flush=True)
     else:
-        print(f"\n  answer: theta {answer['theta_deg']:.1f} deg, "
+        print(f"\n  answer: joint {answer['joint_disp']:.1f} {unit}, "
               f"IoU {answer['silhouette_iou']:.4f}", flush=True)
 
     _overlay_sheet(out_dir / "overlay.png", frame_dir / "images", masks, score_cameras,
                    articulation, np.asarray(answer["pose_body"]),
-                   np.radians(answer["theta_deg"]))
+                   articulation.from_display(answer["joint_disp"]))
 
+    # `joint_disp` throughout this record is the joint coordinate in the unit named
+    # by `joint_unit` -- degrees for a hinge, millimetres for a slide. `joint_value`
+    # is the same quantity in the joint's own units, which is what the tracker takes,
+    # and it is the one to read. `theta_deg` is kept only where it is true.
     record = {"capture_dir": str(args.capture_dir), "frame_index": frame_index,
-              "object": args.object, "theta_step_deg": args.theta_step_deg,
-              "selected_theta_deg": theta_star_deg, "tie_break": tie_break,
+              "object": args.object,
+              "joint_type": articulation.joint_type,
+              "joint_unit": articulation.joint_unit,
+              "joint_value": articulation.from_display(answer["joint_disp"]),
+              **({"theta_deg": answer["joint_disp"]}
+                 if articulation.joint_type == "revolute" else {}),
+              "selected_joint_disp": joint_star_disp, "tie_break": tie_break,
               "rejected_pairs": rejected, "pairs_available": len(available),
               "pairs_agreeing": agreeing, "angle_disputed": len(rejected) > agreeing,
               # Every pair's sweep, including the rejected ones. A disputed frame is
@@ -558,8 +767,8 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
               "consensus": {f"{t:.1f}": consensus[t] for t in sorted(consensus)},
               "sweeps": sweeps, "answer": answer, "answer_from": seed_pair,
               "starts": candidates,
-              "start_spread_deg": (max(c["theta_deg"] for c in candidates.values())
-                                   - min(c["theta_deg"] for c in candidates.values())),
+              "start_spread_disp": (max(c["joint_disp"] for c in candidates.values())
+                                   - min(c["joint_disp"] for c in candidates.values())),
               # Kept under the old key so the existing diagnostics keep working.
               "results": candidates}
     (out_dir / "hybrid_result.json").write_text(
@@ -583,26 +792,26 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
         # start and hide the drift the sheet exists to show.
         windows = {cid: shared_window(render_cameras[cid], articulation,
                                       [(np.asarray(c["pose_body"]),
-                                        np.radians(c["theta_deg"]))
+                                        articulation.from_display(c["joint_disp"]))
                                        for c in candidates.values()])
                    for cid in views}
         mesh_overlay_sheet(
             out_dir / "final.png", frame_dir / "images", render_cameras, articulation,
-            np.asarray(answer["pose_body"]), np.radians(answer["theta_deg"]),
-            f"f{frame_index}  theta={answer['theta_deg']:.1f}deg  "
+            np.asarray(answer["pose_body"]), articulation.from_display(answer["joint_disp"]),
+            f"f{frame_index}  theta={answer['joint_disp']:.1f}deg  "
             f"IoU={answer['silhouette_iou']:.4f}", views, windows=windows)
         # The losing starts, only when they landed somewhere else: a start that
         # finished 9 deg away is the thing worth looking at, and when they all agree
         # there is nothing to see.
-        if record["start_spread_deg"] > 1.0:
+        if record["start_spread_disp"] > 1.0:
             sheets = []
             for pair in sorted(candidates, key=lambda p: -candidates[p]["silhouette_iou"]):
                 start = candidates[pair]
                 path = out_dir / f"start_{start['reference_camera']}.png"
                 mesh_overlay_sheet(
                     path, frame_dir / "images", render_cameras, articulation,
-                    np.asarray(start["pose_body"]), np.radians(start["theta_deg"]),
-                    f"start {pair.split(':')[0]}  theta={start['theta_deg']:.1f}deg  "
+                    np.asarray(start["pose_body"]), articulation.from_display(start["joint_disp"]),
+                    f"start {pair.split(':')[0]}  theta={start['joint_disp']:.1f}deg  "
                     f"IoU={start['silhouette_iou']:.4f}", views, windows=windows)
                 sheets.append(cv2.imread(str(path)))
             cv2.imwrite(str(out_dir / "starts.png"), np.vstack(sheets))
@@ -622,7 +831,33 @@ def main() -> int:
                              "depends on the frame; building them is most of a single run's "
                              "fixed cost.")
     parser.add_argument("--object", default="blue_plastic_box")
+    parser.add_argument(
+        "--output-root", type=Path, default=None,
+        help=("Root for frame_<index>/hybrid outputs. Depth is still read from "
+              "<capture-dir>/articulated_probe, so a new attempt can reuse stereo "
+              "depth without overwriting an earlier FoundationPose result."),
+    )
     parser.add_argument("--theta-step-deg", type=float, default=15.0)
+    parser.add_argument(
+        "--joint-step", type=float, default=None,
+        help="Prismatic joints only. Coarse sweep step, in the mesh's own units -- "
+             "the ones joint.json states its range in. Defaults to a twelfth of that "
+             "range. Separate from --theta-step-deg because 15 degrees says nothing "
+             "about how far a drawer should slide between hypotheses.")
+    parser.add_argument(
+        "--joint-min", type=float, default=None,
+        help="Prismatic joints only. Lower sweep bound in the mesh's own units; "
+             "defaults to joint.json. The angular counterpart is --theta-min-deg and "
+             "passing it for a prismatic joint is refused, not converted.")
+    parser.add_argument(
+        "--joint-max", type=float, default=None,
+        help="Prismatic joints only. Upper sweep bound in the mesh's own units. Treat "
+             "a published limit as a guard, not a measurement -- see --theta-max-deg.")
+    parser.add_argument(
+        "--joint-scan", type=float, default=None,
+        help="Prismatic joints only. Step of the tie-break scan, in the mesh's own "
+             "units. Defaults to a 250th of the range, which is the sample count the "
+             "hinge's 1-degree scan uses over its own.")
     parser.add_argument("--theta-min-deg", type=float, default=None,
                         help="Override the sweep's lower bound. Defaults to the joint file; "
                              "negative values are valid when zero lies between two stops.")
@@ -650,8 +885,42 @@ def main() -> int:
                         help="Angles kept per pair from the coarse sweep and re-scored "
                              "at the refine resolution, where the ranking differs.")
     parser.add_argument("--tie-margin", type=float, default=0.02,
-                        help="Angles scoring within this of the leader are refined and "
+                        help="Angles scoring within this of the leader are scanned and "
                              "compared, rather than decided on the unrefined score.")
+    parser.add_argument("--theta-scan-deg", type=float, default=1.0,
+                        help="Step of the theta scan that breaks a tie between "
+                             "contending angles, with the body frozen at what depth "
+                             "measured. 0 disables the tie-break entirely, leaving the "
+                             "fine grid's argmax to decide.")
+    parser.add_argument(
+        "--no-joint-depth", action="store_true",
+        help="Rank a prismatic joint's coordinate on the silhouette, as a revolute one "
+             "is ranked, instead of on measured depth. This is the pre-2026-08-13 "
+             "behaviour and it is kept only to reproduce those runs: on drawer/2 it "
+             "returned 0.6 mm against a truth near 220 because the mask held the "
+             "cabinet without the extended drawer. Has no effect on a revolute joint, "
+             "which never takes the depth path.")
+    parser.add_argument(
+        "--joint-depth-tolerance", type=float, default=20.0,
+        help="Millimetres by which a predicted surface may differ from the measured "
+             "depth and still count as agreeing. Wide because it absorbs the body "
+             "pose's own error as well as the stereo's; the discrimination this "
+             "provides comes from the moving part being displaced by ten times this, "
+             "not from tight matching.")
+    parser.add_argument(
+        "--joint-depth-scale", type=float, default=0.25,
+        help="Resolution the depth agreement is evaluated at, as a fraction of the "
+             "captured frame. The score is a pixel fraction, so it is insensitive to "
+             "this; the cost is not.")
+    parser.add_argument("--objective-backend", choices=["auto", "numpy", "torch"],
+                        default="auto",
+                        help="How the silhouette objective counts covered pixels. "
+                             "'torch' uses a GPU bitmap and is ~100x faster; 'numpy' is "
+                             "bit-identical to the sorting version it replaced. 'auto' "
+                             "takes torch when a CUDA device is visible. Force 'numpy' "
+                             "to compare IoU values against a pre-2026-08 run: the two "
+                             "agree to ~2e-5, which is far below any margin used here "
+                             "but still moves the fourth decimal of a reported score.")
     parser.add_argument("--max-contenders", type=int, default=3)
     parser.add_argument("--reject-deg", type=float, default=25.0,
                         help="Drop a pair whose pose at the chosen angle is further than "
@@ -686,12 +955,8 @@ def main() -> int:
     articulation = load_articulation(args.object)
     full_cameras = load_cameras(args.capture_dir)
 
-    theta_min_deg = (args.theta_min_deg if args.theta_min_deg is not None
-                     else np.degrees(articulation.theta_min))
-    theta_max_deg = (args.theta_max_deg if args.theta_max_deg is not None
-                     else np.degrees(articulation.theta_max))
-    thetas = theta_grid(np.radians(theta_min_deg), np.radians(theta_max_deg),
-                        args.theta_step_deg)
+    joint_lo, joint_hi = _joint_bounds(articulation, args)
+    thetas = _joint_sweep(articulation, joint_lo, joint_hi, args)
     scorer, refiner, glctx = ScorePredictor(), PoseRefinePredictor(), dr.RasterizeCudaContext()
     part_body, part_lid = _prepare_parts(articulation, args.decimate_faces)
     parent_name, child_name = articulation.part_names
@@ -704,14 +969,15 @@ def main() -> int:
             model_pts=mesh.vertices, model_normals=mesh.vertex_normals, mesh=mesh,
             scorer=scorer, refiner=refiner, glctx=glctx, debug=0,
             debug_dir="/tmp/fpose_real")))
-    print(f"built {len(estimators)} estimators, theta {np.degrees(thetas).round(0)}", flush=True)
+    print(f"built {len(estimators)} estimators, {articulation.joint_type} "
+          f"{articulation.display(thetas).round(1)} {articulation.joint_unit}", flush=True)
 
     summary = []
     for frame_index in frames:
         started = time.perf_counter()
         record = _solve_frame(args, frame_index, articulation, full_cameras, estimators)
         if record is None:
-            summary.append({"frame_index": frame_index, "theta_deg": None})
+            summary.append({"frame_index": frame_index, "joint_disp": None})
             continue
         summary.append({
             "frame_index": frame_index,
@@ -719,10 +985,10 @@ def main() -> int:
             # lived only in this report while the pipeline still returned one pose
             # per pair -- it made a spread between starts look like a tighter number
             # than anything actually computed.
-            "theta_deg": record["answer"]["theta_deg"],
-            "theta_spread_deg": record["start_spread_deg"],
-            "selected_theta_deg": record["selected_theta_deg"],
-            "coarse_theta_deg": sorted({r["coarse_theta_deg"]
+            "joint_disp": record["answer"]["joint_disp"],
+            "start_spread": record["start_spread_disp"],
+            "selected_joint_disp": record["selected_joint_disp"],
+            "coarse_joint_disp": sorted({r["coarse_joint_disp"]
                                         for r in record["starts"].values()}),
             "silhouette_iou": record["answer"]["silhouette_iou"],
             "pairs_kept": len(record["starts"]),
@@ -735,20 +1001,23 @@ def main() -> int:
         print(f"\n{'=' * 78}\nangle trajectory\n"
               f"  frame   coarse grid        chosen   refined    IoU  pairs   time", flush=True)
         for row in summary:
-            if row["theta_deg"] is None:
+            if row["joint_disp"] is None:
                 print(f"  {row['frame_index']:5d}   (no result)", flush=True)
                 continue
-            grid = ",".join(f"{t:.0f}" for t in row["coarse_theta_deg"])
+            grid = ",".join(f"{t:.0f}" for t in row["coarse_joint_disp"])
             flag = "  <-- disputed" if row["angle_disputed"] else ""
-            print(f"  {row['frame_index']:5d}   {grid:<16s} {row['selected_theta_deg']:6.1f}   "
-                  f"{row['theta_deg']:6.1f}  {row['silhouette_iou']:.4f}  "
+            print(f"  {row['frame_index']:5d}   {grid:<16s} {row['selected_joint_disp']:6.1f}   "
+                  f"{row['joint_disp']:6.1f}  {row['silhouette_iou']:.4f}  "
                   f"{row['pairs_kept']:5d}  {row['seconds']:5.0f}s{flag}", flush=True)
 
     if args.summary:
         args.summary.parent.mkdir(parents=True, exist_ok=True)
         args.summary.write_text(json.dumps(
             {"capture_dir": str(args.capture_dir), "object": args.object,
-             "theta_min_deg": theta_min_deg, "theta_max_deg": theta_max_deg,
+             "joint_type": articulation.joint_type,
+             "joint_unit": articulation.joint_unit,
+             "joint_min": articulation.display(joint_lo),
+             "joint_max": articulation.display(joint_hi),
              "frames": summary}, indent=2) + "\n",
             encoding="utf-8")
         print(f"wrote {args.summary}", flush=True)
