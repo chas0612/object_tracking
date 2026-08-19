@@ -238,11 +238,13 @@ def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[st
         if object_episode_map and episode not in object_episode_map[source_object]:
             continue
         input_dir = episode_dir / ("raw/images" if args.static_images else "videos")
-        input_glob = "*.png" if args.static_images else "*.avi"
+        input_globs = ("*.png",) if args.static_images else ("*.avi", "*.mp4")
         if (not (episode_dir / "cam_param" / "extrinsics.json").is_file()
-                or not input_dir.is_dir() or not any(input_dir.glob(input_glob))):
+                or not input_dir.is_dir()
+                or not any(any(input_dir.glob(pattern)) for pattern in input_globs)):
             skipped.append(
-                f"{rel}: missing {'raw/images/*.png' if args.static_images else 'videos/*.avi'} "
+                f"{rel}: missing "
+                f"{'raw/images/*.png' if args.static_images else 'videos/*.(avi|mp4)'} "
                 "or cam_param/extrinsics.json"
             )
             continue
