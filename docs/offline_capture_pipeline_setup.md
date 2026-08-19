@@ -633,6 +633,45 @@ conda run --no-capture-output -n gotrack python -u \
   --gotrack-records "$RECORDS" --port 8080
 ```
 
+Triangulation/MANO hand 결과가 standard capture layout에 있으면 `--hand left` 또는
+`--hand right`를 추가한다. Viewer는 `triangulation_cache/<side>/kpts_3d.json`과
+`hand/<side>/mano/*.obj`를 자동으로 찾고, world-space 손을 object와 같은 scene transform으로
+표시한다. 양손은 옵션을 두 번 사용한다. 특정 결과를 직접 지정할 때는 `--hand-kpts SIDE JSON`,
+`--hand-mano SIDE DIRECTORY`를 사용한다. 손과 object frame stem이 다를 때만
+`--hand-frame-offset SIDE N`을 준다. NaN keypoint와 존재하지 않는 MANO frame은 이전 값을
+hold하지 않고 해당 frame에서 숨긴다.
+
+```bash
+conda run --no-capture-output -n gotrack python -u \
+  src/process/view_gotrack_viser.py \
+  --capture-dir "$CAPTURE" --object-mesh "$STATIC_MESH" \
+  --moving-mesh "$MOVING_MESH" --articulation-json "$JOINT_JSON" \
+  --gotrack-records "$RECORDS" --hand right --no-robot --port 8080
+```
+
+### Viser 시점을 그대로 MP4로 export
+
+브라우저에서 orbit/pan/zoom하거나 camera frustum을 클릭해 원하는 시점을 먼저 잡는다. 오른쪽
+`MP4 export` 폴더에서 output, resolution, FPS를 정하고 `Export current view to MP4`를 누르면,
+버튼을 누른 browser client의 camera pose와 FOV를 고정한 채 전체 tracking frame을 렌더한다.
+Camera frustum, trajectory, object axis와 camera image는 export 동안 숨겨지고, object, articulated
+moving part, robot 및 현재 활성화된 hand skeleton/MANO는 그대로 포함된다. 인코딩에는 libx264를
+제공하는 ffmpeg가 필요하다.
+
+```bash
+conda run --no-capture-output -n gotrack python -u \
+  src/process/view_gotrack_viser.py \
+  --capture-dir "$CAPTURE" --object-mesh "$STATIC_MESH" \
+  --moving-mesh "$MOVING_MESH" --articulation-json "$JOINT_JSON" \
+  --gotrack-records "$RECORDS" --hand right --no-robot \
+  --export-output "$CAPTURE/articulated_runs/demo_viser.mp4" \
+  --export-width 1920 --export-height 1080 --export-fps 30 --port 8080
+```
+
+Export는 GUI 버튼을 누른 browser의 시점을 사용하므로 browser 연결 없이 command만 실행해서
+자동 시작되지는 않는다. 렌더 중에는 시점과 표시 옵션을 바꾸지 못하며, 완료 후 원래 timeline과
+표시 상태가 복원된다.
+
 Viser는 gotrack environment에 포함되며, 기존 environment를 수동 보완할 때만 다음을 실행한다.
 
 ```bash
