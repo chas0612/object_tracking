@@ -9,7 +9,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src/process/articulated"))
 
-from make_joint_anchors import adaptive_schedule  # noqa: E402
+from make_joint_anchors import (  # noqa: E402
+    adaptive_schedule,
+    parse_explicit_frames,
+    reject_isolated_interpolation_outliers,
+)
 
 
 failures = 0
@@ -42,6 +46,24 @@ frames, windows = adaptive_schedule(
     noisy, set(range(46)), stride=5, movement_threshold=0.020,
     padding_frames=None)
 check("sub-threshold quantization is ignored", frames == [] and windows == [])
+
+print("explicit targeted schedule")
+frames = parse_explicit_frames(["70", "74:86:4", "90:92"], set(range(100)))
+check("single frames and inclusive ranges are combined",
+      frames == [70, 74, 78, 82, 86, 90, 91, 92], str(frames))
+try:
+    parse_explicit_frames(["98:102:2"], set(range(100)))
+except ValueError as error:
+    check("unavailable body poses fail loudly", "unavailable" in str(error), str(error))
+else:
+    check("unavailable body poses fail loudly", False)
+
+print("isolated angular depth alias")
+filtered, rejected = reject_isolated_interpolation_outliers(
+    {88: 164.0, 92: 0.0, 96: 162.0, 100: 150.0}, 45.0)
+check("a lone zero between consistent open-lid angles is removed",
+      rejected == [92] and 92 not in filtered, str((filtered, rejected)))
+check("endpoints are always retained", 88 in filtered and 100 in filtered)
 
 print(f"\n{failures} failures")
 raise SystemExit(1 if failures else 0)

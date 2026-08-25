@@ -10,8 +10,13 @@ usage() {
     echo "                        flags above are refused on a sliding joint, not"
     echo "                        reinterpreted, and vice versa."
     echo "         --joint FILE   articulation file for the tracker (default: the mesh's)"
+    echo "         --mesh FILE    fused mesh override (default: ~/shared_data/mesh_new/NAME/NAME.obj)"
+    echo "         --external-init-pose FILE --external-init-joint-value FILE"
+    echo "                        calibrated 6-DoF pose and scalar joint .npy files. This"
+    echo "                        bypasses FoundationPose/stereo and evaluates tracking only."
     echo "         --direction both|forward|reverse   (default: both)"
     echo "         --cameras all|\"ID ID ...\"   (default: the built-in twelve)"
+    echo "         --input-resize-scale N --camera-micro-batch-size N"
     echo "         --joint-anchors FILE   depth-measured joint values to pin at named"
     echo "                        frames (make_joint_anchors.py). Second pass only:"
     echo "                        it needs body poses from a completed run."
@@ -51,8 +56,13 @@ JOINT_EXTRAP=""
 JOINT_ANCHORS=""
 JOINT_ANCHOR_MODE=pin
 JOINT_OVERRIDE=""
+MESH_OVERRIDE=""
+EXTERNAL_INIT_POSE=""
+EXTERNAL_INIT_JOINT=""
 DIRECTION=both
 CAMERAS_ARG=""
+INPUT_RESIZE_SCALE=1.0
+CAMERA_MICRO_BATCH_SIZE=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --capture-dir) CAPTURE_DIR=$2; shift 2 ;;
@@ -71,8 +81,13 @@ while [[ $# -gt 0 ]]; do
         --joint-anchors) JOINT_ANCHORS=$2; shift 2 ;;
         --joint-anchor-mode) JOINT_ANCHOR_MODE=$2; shift 2 ;;
         --joint) JOINT_OVERRIDE=$2; shift 2 ;;
+        --mesh) MESH_OVERRIDE=$2; shift 2 ;;
+        --external-init-pose) EXTERNAL_INIT_POSE=$2; shift 2 ;;
+        --external-init-joint-value) EXTERNAL_INIT_JOINT=$2; shift 2 ;;
         --direction) DIRECTION=$2; shift 2 ;;
         --cameras) CAMERAS_ARG=$2; shift 2 ;;
+        --input-resize-scale) INPUT_RESIZE_SCALE=$2; shift 2 ;;
+        --camera-micro-batch-size) CAMERA_MICRO_BATCH_SIZE=$2; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -98,6 +113,27 @@ if [[ -n "$JOINT_ANCHORS" && ! -f "$JOINT_ANCHORS" ]]; then
     echo "No such --joint-anchors file: $JOINT_ANCHORS" >&2
     exit 2
 fi
+if [[ -n "$EXTERNAL_INIT_POSE" || -n "$EXTERNAL_INIT_JOINT" ]]; then
+    if [[ -z "$EXTERNAL_INIT_POSE" || -z "$EXTERNAL_INIT_JOINT" ]]; then
+        echo "external initialization requires both --external-init-pose and --external-init-joint-value" >&2
+        exit 2
+    fi
+    for external_file in "$EXTERNAL_INIT_POSE" "$EXTERNAL_INIT_JOINT"; do
+        if [[ ! -f "$external_file" ]]; then
+            echo "No such external initialization file: $external_file" >&2
+            exit 2
+        fi
+    done
+fi
+if ! [[ "$INPUT_RESIZE_SCALE" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || \
+        [[ "$INPUT_RESIZE_SCALE" == 0 || "$INPUT_RESIZE_SCALE" == 0.0 ]]; then
+    echo "--input-resize-scale must be in (0, 1]; got $INPUT_RESIZE_SCALE" >&2
+    exit 2
+fi
+if ! [[ "$CAMERA_MICRO_BATCH_SIZE" =~ ^[0-9]+$ ]]; then
+    echo "--camera-micro-batch-size must be a non-negative integer" >&2
+    exit 2
+fi
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 HERE="$REPO/src/process/articulated"
@@ -119,7 +155,11 @@ if [[ -n "$JOINT_OVERRIDE" ]]; then
 else
     JOINT=$MESH_ROOT/articulation_particulate/joint.json
 fi
-MESH="$MESH_ROOT/$OBJECT.obj"
+if [[ -n "$MESH_OVERRIDE" ]]; then
+    MESH=$(cd "$(dirname "$MESH_OVERRIDE")" && pwd)/$(basename "$MESH_OVERRIDE")
+else
+    MESH="$MESH_ROOT/$OBJECT.obj"
+fi
 FRAME=$(printf '%06d' "$SEED_FRAME")
 RUN_ROOT="$CAPTURE_DIR/articulated_runs/$RUN_NAME"
 PROBE_ROOT="$RUN_ROOT/probe"
@@ -129,10 +169,13 @@ OUT="$RUN_ROOT/gotrack"
 LOG_DIR="$RUN_ROOT/logs"
 LOG="$LOG_DIR/pipeline.log"
 
-for required in \
-    "$JOINT" "$MESH" \
-    "$CAPTURE_DIR/articulated_probe/frame_$FRAME/depth/depth_manifest.json" \
-    "$CAPTURE_DIR/foundpose_frame_$FRAME/metadata.json"; do
+required_inputs=("$JOINT" "$MESH")
+if [[ -z "$EXTERNAL_INIT_POSE" ]]; then
+    required_inputs+=(
+        "$CAPTURE_DIR/articulated_probe/frame_$FRAME/depth/depth_manifest.json"
+        "$CAPTURE_DIR/foundpose_frame_$FRAME/metadata.json")
+fi
+for required in "${required_inputs[@]}"; do
     if [[ ! -e "$required" ]]; then
         echo "Missing prerequisite: $required" >&2
         exit 1
@@ -166,9 +209,12 @@ trap on_exit EXIT
 exec > >(tee -a "$LOG") 2>&1
 
 echo "[run] object=$OBJECT capture=$CAPTURE_DIR seed=$SEED_FRAME run=$RUN_NAME"
-echo "[run] joint=$JOINT output=$RUN_ROOT gpu=$GPU"
+echo "[run] mesh=$MESH joint=$JOINT output=$RUN_ROOT gpu=$GPU"
+echo "[run] input_resize_scale=$INPUT_RESIZE_SCALE camera_micro_batch_size=$CAMERA_MICRO_BATCH_SIZE"
 
-if [[ ! -f "$HYBRID" ]]; then
+if [[ -n "$EXTERNAL_INIT_POSE" ]]; then
+    echo "[skip] foundationpose_seed: external articulated initialization"
+elif [[ ! -f "$HYBRID" ]]; then
     echo "[stage] foundationpose_seed"
     theta_args=()
     [[ -n "$THETA_MIN" ]] && theta_args+=(--theta-min-deg "$THETA_MIN")
@@ -191,7 +237,14 @@ init_count=0
 if [[ -d "$INIT" ]]; then
     init_count=$(find "$INIT" -maxdepth 1 -type f -name '*.json' | wc -l)
 fi
-if [[ ${init_count:-0} -lt 1 ]]; then
+if [[ ${init_count:-0} -lt 1 && -n "$EXTERNAL_INIT_POSE" ]]; then
+    echo "[stage] external_gotrack_init"
+    "$CONDA_BIN" run -n object_6d --no-capture-output python -u \
+        "$HERE/make_external_gotrack_init.py" \
+        --capture-dir "$CAPTURE_DIR" --frame-index "$SEED_FRAME" \
+        --pose-npy "$EXTERNAL_INIT_POSE" --joint-value-npy "$EXTERNAL_INIT_JOINT" \
+        --joint-json "$JOINT" --out "$INIT"
+elif [[ ${init_count:-0} -lt 1 ]]; then
     echo "[stage] gotrack_init"
     "$CONDA_BIN" run -n object_6d --no-capture-output python -u "$HERE/make_gotrack_init.py" \
         --capture-dir "$CAPTURE_DIR" --frame-index "$SEED_FRAME" \
@@ -273,6 +326,8 @@ run_pass() {
             --forward-precision fp32 --torch-compile off \
             --worker-mode auto --tri-fit-worker-mode process \
             --triangulation-worker-mode auto --status-log-every 25 --debug-level 0 \
+            --input-resize-scale "$INPUT_RESIZE_SCALE" \
+            --camera-micro-batch-size "$CAMERA_MICRO_BATCH_SIZE" \
             --frame-order "$order" "${span[@]}" "${extrap[@]}" \
             --max-frames "$MAX_FRAMES" --camera-ids "${CAMERAS[@]}"
     )

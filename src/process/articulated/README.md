@@ -151,6 +151,18 @@ on the joint angle, and that is what made the angle-runaway diagnosis possible.
 ## Running
 
 ```bash
+# Dataset-provided articulated seed (tracking-only evaluation). This bypasses
+# FoundationPose and stereo depth, but otherwise uses the same direct 7-DoF tracker.
+bash src/process/articulated/run_case.sh \
+    --capture-dir ~/arctic/workspace/scissor_ep08 \
+    --object scissors --seed-frame 10 --run-name arctic_external_seed_full_v1 \
+    --mesh ~/arctic/workspace/scissor_mesh/scissors.obj \
+    --joint ~/arctic/workspace/scissor_mesh/articulation_particulate/joint.json \
+    --external-init-pose ~/arctic/workspace/scissor_ep08/init_pose_world.npy \
+    --external-init-joint-value ~/arctic/workspace/scissor_ep08/init_joint_angle_rad.npy \
+    --cameras "1 2 3 6 7 8" --direction both --max-frames -1 \
+    --input-resize-scale 0.5 --camera-micro-batch-size 2
+
 # One prepared object episode, with an isolated run directory. The capture must
 # already contain foundpose_frame_<seed> masks and articulated_probe stereo depth.
 bash src/process/articulated/run_case.sh \
@@ -225,6 +237,12 @@ conda run -n object_6d --no-capture-output python src/process/articulated/real_h
     --capture-dir "$CAPTURE" --frames 40 --refine-pairs 2 --budget-gib 6 \
     --theta-max-deg 260
 ```
+
+All cameras selected in one GoTrack invocation currently need the same decoded
+frame dimensions. ARCTIC cameras 1, 2, 3, 6, 7, and 8 are the static 2000x2800
+group. Cameras 4 and 5 are static but 2800x2000, so mixing the two groups fails
+while materialising the frame bitmap batch; camera 0 is moving and must not be used
+with its single schema-compatibility extrinsic.
 
 `run_case.sh` writes only below `<capture>/articulated_runs/<run-name>/` and resumes
 completed stages when invoked again. Choose a new run name for a clean retry. The

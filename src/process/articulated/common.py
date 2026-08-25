@@ -114,7 +114,12 @@ class Articulation:
 
 def load_articulation(object_name: str = DEFAULT_OBJECT) -> Articulation:
     root = MESH_ROOT / object_name / "articulation_particulate"
-    spec = load_single_joint_spec(root / "joint.json")
+    return load_articulation_from_joint(root / "joint.json")
+
+
+def load_articulation_from_joint(joint_json: Path) -> Articulation:
+    """Load the standard articulation contract from an explicit joint file."""
+    spec = load_single_joint_spec(Path(joint_json).expanduser().resolve())
     return Articulation(
         body=trimesh.load(spec.part_paths[0], force="mesh"),
         lid=trimesh.load(spec.part_paths[1], force="mesh"),

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Constrain a tracked prismatic trajectory by sparse stereo measurements.
+"""Constrain a tracked one-dimensional joint trajectory by sparse measurements.
 
-GoTrack can return a coherent but wrong displacement for a sliding part.  Applying
+GoTrack can return a coherent but wrong coordinate for a moving part.  Applying
 an external measurement only at the measured frame resets the tracker, but does not
 stop it from jumping back to the same visual alias one frame later.  This post-pass
 therefore treats the sparse measurements as hard constraints on the *whole* scalar
@@ -245,6 +245,7 @@ def constrain_records(
     anchors: dict[int, float],
     *,
     constraint_mode: str = "hard",
+    outside_mode: str = "hold",
     **solver_kwargs: float | None,
 ) -> tuple[list[dict], dict]:
     indexed = sorted(enumerate(records), key=lambda item: int(item[1]["frame_index"]))
@@ -253,10 +254,9 @@ def constrain_records(
     if not usable:
         raise ValueError("trajectory contains no solved joint records")
     joint_types = {record.get("joint_type", "revolute") for _, record in usable}
-    if joint_types != {"prismatic"}:
-        raise ValueError(
-            "sparse stereo trajectory constraints are only defined for a prismatic "
-            f"joint; records contain {sorted(joint_types)}")
+    if len(joint_types) != 1 or not joint_types <= {"prismatic", "revolute"}:
+        raise ValueError(f"records contain inconsistent/unsupported joint types: {sorted(joint_types)}")
+    joint_type = next(iter(joint_types))
 
     frames = np.asarray([int(record["frame_index"]) for _, record in usable])
     raw = np.asarray([
@@ -272,6 +272,14 @@ def constrain_records(
             frames, anchors, **solver_kwargs)
     else:
         raise ValueError(f"unknown constraint mode {constraint_mode!r}")
+    if outside_mode not in {"hold", "raw"}:
+        raise ValueError(f"unknown outside mode {outside_mode!r}")
+    if outside_mode == "raw":
+        used_frames = sorted(set(map(int, frames)) & set(anchors))
+        if not used_frames:
+            raise ValueError("none of the anchor frames occurs in the trajectory")
+        inside = (frames >= used_frames[0]) & (frames <= used_frames[-1])
+        constrained = np.where(inside, constrained, raw)
 
     output = [dict(record) for record in records]
     corrections = []
@@ -281,7 +289,7 @@ def constrain_records(
         updated["joint_value_before_temporal_constraint"] = float(raw_value)
         updated["joint_value"] = float(value)
         updated["joint_temporal_constraint_applied"] = True
-        updated["joint_temporal_constraint_source"] = "sparse_stereo"
+        updated["joint_temporal_constraint_source"] = "sparse_depth"
         updated["joint_temporal_constraint_mode"] = constraint_mode
         if int(record["frame_index"]) in anchor_frames:
             updated["joint_anchor_applied"] = True
@@ -300,6 +308,8 @@ def constrain_records(
             abs(output[original]["joint_value"] - anchors[int(record["frame_index"])])
             for original, record in usable if int(record["frame_index"]) in anchor_frames)),
         "constraint_mode": constraint_mode,
+        "joint_type": joint_type,
+        "outside_mode": outside_mode,
         **solver_report,
     }
     return output, report
@@ -313,6 +323,10 @@ def main() -> int:
     parser.add_argument("--object", required=True)
     parser.add_argument("--joint-anchors", type=Path, required=True)
     parser.add_argument("--constraint-mode", choices=("hard", "soft"), default="hard")
+    parser.add_argument("--outside-mode", choices=("hold", "raw"), default="hold",
+                        help="hold keeps the nearest anchor outside its measured span "
+                             "(drawer default); raw preserves the source trajectory "
+                             "outside a targeted correction interval.")
     parser.add_argument("--measurement-weight", type=float, default=1.0)
     parser.add_argument("--acceleration-weight", type=float, default=None,
                         help="Second-difference weight. Defaults to 0 in hard mode and "
@@ -355,13 +369,15 @@ def main() -> int:
             "max_flow_step": args.max_flow_step,
         }
     output, report = constrain_records(
-        records, anchors, constraint_mode=args.constraint_mode, **solver_kwargs)
+        records, anchors, constraint_mode=args.constraint_mode,
+        outside_mode=args.outside_mode, **solver_kwargs)
     record_path.write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
     report.update({
         "object": args.object,
         "record_path": str(record_path),
         "joint_anchors": str(args.joint_anchors),
         "constraint_mode": args.constraint_mode,
+        "outside_mode": args.outside_mode,
         "measurement_weight": args.measurement_weight,
         "acceleration_weight": acceleration_weight,
         "huber_delta": args.huber_delta,

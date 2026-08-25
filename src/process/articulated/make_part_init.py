@@ -82,8 +82,16 @@ def main() -> int:
 
     joint = load_single_joint_spec(args.joint_json)
     if joint.joint_type == "revolute":
-        value = float(np.radians(answer["theta_deg"]))
-        display = f"theta {answer['theta_deg']:.2f} deg"
+        # Current hybrid results expose the joint-type-neutral top-level value in
+        # native units (radians here).  Keep the legacy fields as fallbacks so old
+        # case-study seeds remain readable.
+        if record.get("joint_value") is not None:
+            value = float(record["joint_value"])
+        elif answer.get("theta_deg") is not None:
+            value = float(np.radians(answer["theta_deg"]))
+        else:
+            value = float(np.radians(answer["joint_disp"]))
+        display = f"theta {np.degrees(value):.2f} deg"
     elif joint.joint_type == "prismatic":
         # The top-level neutral field is in the mesh's native metres; joint_disp in
         # the diagnostic answer is display millimetres and must not be composed.

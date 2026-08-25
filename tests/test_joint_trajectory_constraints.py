@@ -56,6 +56,35 @@ check("stereo anchors are exact", report["max_anchor_error"] == 0.0)
 check("every solved frame is marked", all(
     record.get("joint_temporal_constraint_applied") for record in updated))
 
+print("the same scalar constraint supports a revolute trajectory")
+angular_records = [
+    {"frame_index": i, "status": "ok", "joint_type": "revolute",
+     "joint_value": float(np.radians([0, 0, 80, 100, -60, 20, 20, 20][i])),
+     "pose_world": pose}
+    for i in range(len(raw))
+]
+angular, angular_report = constrain_records(
+    angular_records, {1: np.radians(10.0), 5: np.radians(30.0)})
+check("angular interpolation stays in radians",
+      np.isclose(np.degrees(angular[3]["joint_value"]), 20.0),
+      f'{np.degrees(angular[3]["joint_value"]):.3f} deg')
+check("revolute body poses are unchanged",
+      all(a["pose_world"] == b["pose_world"]
+          for a, b in zip(angular_records, angular)))
+check("report records the revolute type", angular_report["joint_type"] == "revolute")
+
+targeted, targeted_report = constrain_records(
+    angular_records, {2: np.radians(10.0), 5: np.radians(30.0)},
+    outside_mode="raw")
+check("targeted correction preserves raw values before its first anchor",
+      targeted[0]["joint_value"] == angular_records[0]["joint_value"])
+check("targeted correction preserves raw values after its last anchor",
+      targeted[7]["joint_value"] == angular_records[7]["joint_value"])
+check("targeted correction changes the interior",
+      targeted[3]["joint_value"] != angular_records[3]["joint_value"])
+check("targeted report records raw outside mode",
+      targeted_report["outside_mode"] == "raw")
+
 print("idempotent input provenance")
 twice, _ = constrain_records(updated, {1: 0.0, 5: 0.20})
 check("a second pass preserves the original raw value",
