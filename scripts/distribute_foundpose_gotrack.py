@@ -81,6 +81,11 @@ def _schedule_dir(shared_root: Path, runs_root_rel: str, schedule_id: str) -> Pa
     return shared_root / runs_root_rel / schedule_id
 
 
+def _relative_symlink(target: Path, link: Path) -> None:
+    """Link one shared-storage result into a later attempt without copying it."""
+    link.symlink_to(os.path.relpath(target, link.parent), target_is_directory=target.is_dir())
+
+
 def _is_within(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
@@ -627,7 +632,12 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
     )
     log_path = schedule_dir / "logs" / f"{task['task_id']}.attempt{attempt}.{task['worker_id']}.log"
     attempt_dir.mkdir(parents=True, exist_ok=False)
-    task.update({"attempt_dir": str(attempt_dir.relative_to(shared)), "log": str(log_path), "phase": "undistort"})
+    reuse_foundpose = task.get("reuse_foundpose")
+    task.update({
+        "attempt_dir": str(attempt_dir.relative_to(shared)),
+        "log": str(log_path),
+        "phase": "reuse_foundpose" if reuse_foundpose else "undistort",
+    })
     _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
     gotrack = [str(Path.home() / "anaconda3/bin/conda"), "run", "--no-capture-output", "-n", args.gotrack_env, "python", "-u"]
     sam3 = [str(Path.home() / "anaconda3/bin/conda"), "run", "--no-capture-output", "-n", args.sam3_env, "python", "-u"]
@@ -638,48 +648,77 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
     try:
         with log_path.open("w", encoding="utf-8") as log:
             log.write(f"task={task['task_id']} worker={task['worker_id']} started_utc={_now()}\n")
-            if not static_images:
-                _run_command(gotrack + ["src/process/undistort_capture_videos.py", "--capture-dir", str(episode)], log, REPO_ROOT)
-            task["phase"] = "mask"
-            _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
             prompts = task.get("sam3_prompts") or _prompt_candidates(task["object_name"], args)
-            task["sam3_attempted_prompts"] = []
-            masks_available = False
-            for prompt in prompts:
-                task["sam3_prompt_current"] = prompt
-                task["sam3_attempted_prompts"].append(prompt)
-                _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
-                mask_command = sam3 + [
-                    "src/process/mask.py", "--capture_dir", str(episode),
-                    "--prompt", prompt, "--frame-output-dir", str(frame_dir),
-                ]
-                if static_images:
-                    mask_command += ["--static-image-dir", str(episode / "raw/images")]
-                else:
-                    mask_command += ["--frame-index", str(init_frame_index),
-                                     "--video-dir", str(episode / "undistorted_video")]
-                _run_command(mask_command, log, REPO_ROOT)
-                metadata_path = frame_dir / "metadata.json"
-                metadata = _read_json(metadata_path) if metadata_path.is_file() else {}
-                mask_count = int(metadata.get("masks_written", 0)) + int(metadata.get("masks_skipped", 0))
-                masks_available = mask_count >= args.min_sam3_mask_views
-                if masks_available:
-                    task["sam3_prompt_used"] = prompt
-                    break
-                log.write(f"[sam3] no masks with prompt={prompt!r}; trying fallback\n")
-                log.flush()
-            if not masks_available:
-                raise RuntimeError(
-                    f"SAM3 produced fewer than {args.min_sam3_mask_views} mask views "
-                    f"with prompts: {prompts}"
+            if reuse_foundpose:
+                if not static_images:
+                    _run_command(
+                        gotrack + [
+                            "src/process/undistort_capture_videos.py",
+                            "--capture-dir", str(episode),
+                        ],
+                        log, REPO_ROOT,
+                    )
+                source_frame_dir = shared / reuse_foundpose["frame_dir_rel"]
+                source_init_dir = shared / reuse_foundpose["init_dir_rel"]
+                source_pose = source_init_dir / "init_pose_world.npy"
+                if not source_frame_dir.is_dir() or not source_init_dir.is_dir() or not source_pose.is_file():
+                    raise FileNotFoundError(
+                        f"Reusable FoundPose result is incomplete: {source_init_dir}"
+                    )
+                _relative_symlink(source_frame_dir, frame_dir)
+                _relative_symlink(source_init_dir, init_dir)
+                task["reused_foundpose_init_rel"] = str(source_init_dir.relative_to(shared))
+                log.write(
+                    f"[reuse-foundpose] schedule={reuse_foundpose['schedule_id']} "
+                    f"init={source_init_dir}\n"
                 )
-            task["phase"] = "foundpose"
-            _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
-            _run_command(_foundpose_command(
-                gotrack, capture=episode, frame_dir=frame_dir, mesh=mesh,
-                object_name=task["object_name"], assets=assets,
-                output_dir=init_dir, args=args,
-            ), log, REPO_ROOT)
+                log.flush()
+            else:
+                if not static_images and not args.foundpose_init_only:
+                    _run_command(gotrack + ["src/process/undistort_capture_videos.py", "--capture-dir", str(episode)], log, REPO_ROOT)
+                task["phase"] = "mask"
+                _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
+                task["sam3_attempted_prompts"] = []
+                masks_available = False
+                for prompt in prompts:
+                    task["sam3_prompt_current"] = prompt
+                    task["sam3_attempted_prompts"].append(prompt)
+                    _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
+                    mask_command = sam3 + [
+                        "src/process/mask.py", "--capture_dir", str(episode),
+                        "--prompt", prompt, "--frame-output-dir", str(frame_dir),
+                    ]
+                    if static_images:
+                        mask_command += ["--static-image-dir", str(episode / "raw/images")]
+                    elif args.foundpose_init_only:
+                        mask_command += ["--frame-index", str(init_frame_index),
+                                         "--video-dir", str(episode / "videos"),
+                                         "--undistort-frame"]
+                    else:
+                        mask_command += ["--frame-index", str(init_frame_index),
+                                         "--video-dir", str(episode / "undistorted_video")]
+                    _run_command(mask_command, log, REPO_ROOT)
+                    metadata_path = frame_dir / "metadata.json"
+                    metadata = _read_json(metadata_path) if metadata_path.is_file() else {}
+                    mask_count = int(metadata.get("masks_written", 0)) + int(metadata.get("masks_skipped", 0))
+                    masks_available = mask_count >= args.min_sam3_mask_views
+                    if masks_available:
+                        task["sam3_prompt_used"] = prompt
+                        break
+                    log.write(f"[sam3] no masks with prompt={prompt!r}; trying fallback\n")
+                    log.flush()
+                if not masks_available:
+                    raise RuntimeError(
+                        f"SAM3 produced fewer than {args.min_sam3_mask_views} mask views "
+                        f"with prompts: {prompts}"
+                    )
+                task["phase"] = "foundpose"
+                _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
+                _run_command(_foundpose_command(
+                    gotrack, capture=episode, frame_dir=frame_dir, mesh=mesh,
+                    object_name=task["object_name"], assets=assets,
+                    output_dir=init_dir, args=args,
+                ), log, REPO_ROOT)
             if args.foundpose_init_only:
                 result_path = init_dir / "result.json"
                 result = _read_json(result_path) if result_path.is_file() else {}
@@ -777,6 +816,55 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
 
 def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
     tasks, skipped = _discover(shared, args)
+    if args.reuse_foundpose_schedule_id:
+        if args.foundpose_init_only:
+            raise ValueError("--reuse-foundpose-schedule-id cannot be combined with --foundpose-init-only")
+        source_schedule = _schedule_dir(
+            shared, args.runs_root_rel, args.reuse_foundpose_schedule_id,
+        )
+        source_manifest_path = source_schedule / "manifest.json"
+        if not source_manifest_path.is_file():
+            raise FileNotFoundError(f"Source FoundPose schedule is missing: {source_schedule}")
+        source_manifest = _read_json(source_manifest_path)
+        if not source_manifest.get("foundpose_init_only", False):
+            raise ValueError(f"Source schedule is not init-only: {source_schedule}")
+        if int(source_manifest.get("init_frame_index", -1)) != args.init_frame_index:
+            raise ValueError("Source and destination --init-frame-index must match")
+        unavailable: list[str] = []
+        for task in tasks:
+            source_task_path = _task_path(source_schedule, task["task_id"])
+            if not source_task_path.is_file():
+                unavailable.append(f"{task['task_id']}: source task missing")
+                continue
+            source_task = _read_json(source_task_path)
+            if (source_task.get("episode_rel") != task["episode_rel"]
+                    or source_task.get("object_name") != task["object_name"]):
+                unavailable.append(f"{task['task_id']}: source task identity mismatch")
+                continue
+            source_attempt_rel = source_task.get("attempt_dir")
+            if source_task.get("status") != "completed" or not source_attempt_rel:
+                unavailable.append(
+                    f"{task['task_id']}: source status={source_task.get('status')}"
+                )
+                continue
+            source_attempt = shared / source_attempt_rel
+            source_frame = source_attempt / f"foundpose_frame_{args.init_frame_index:06d}"
+            source_init = source_attempt / "foundpose_init"
+            if not source_frame.is_dir() or not (source_init / "init_pose_world.npy").is_file():
+                unavailable.append(f"{task['task_id']}: source init output incomplete")
+                continue
+            task["reuse_foundpose"] = {
+                "schedule_id": source_schedule.name,
+                "attempt_dir_rel": str(source_attempt.relative_to(shared)),
+                "frame_dir_rel": str(source_frame.relative_to(shared)),
+                "init_dir_rel": str(source_init.relative_to(shared)),
+            }
+            task["foundpose_init_summary"] = source_task.get("foundpose_init_summary")
+        if unavailable:
+            details = "\n  ".join(unavailable[:30])
+            raise RuntimeError(
+                "Not every task has a completed reusable FoundPose init:\n  " + details
+            )
     if args.dry_run:
         print(f"[dry-run] eligible={len(tasks)} skipped={len(skipped)}")
         for task in tasks[:30]: print(f"  {task['robot']}/{task['object_name']}/{task['episode']}")
@@ -811,6 +899,7 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
                                                 "foundpose_global_dino_score_margin": args.foundpose_global_dino_score_margin,
                                                 "foundpose_global_dino_inlier_threshold_px": args.foundpose_global_dino_inlier_threshold_px,
                                                 "foundpose_init_only": args.foundpose_init_only,
+                                                "reuse_foundpose_schedule_id": args.reuse_foundpose_schedule_id,
                                                 "static_images": args.static_images,
                                                 "object_aliases": args.object_aliases,
                                                 "debug_sheets": args.debug_sheets,
@@ -1086,6 +1175,8 @@ def main() -> int:
     p.add_argument("--foundpose-global-dino-inlier-threshold-px", type=float, default=10.0)
     p.add_argument("--foundpose-init-only", action="store_true",
                    help="Stop after SAM3 + FoundPose candidate generation; skip GoTrack and debug sheets.")
+    p.add_argument("--reuse-foundpose-schedule-id", default=None,
+                   help="With --mode init, build a GoTrack schedule from completed outputs of this init-only schedule.")
     p.add_argument("--max-attempts", type=int, default=2)
     debug_group = p.add_mutually_exclusive_group()
     debug_group.add_argument("--debug-sheets", dest="debug_sheets", action="store_true",

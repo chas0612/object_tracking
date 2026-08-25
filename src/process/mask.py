@@ -173,6 +173,7 @@ def process_episode_yoloe(seg, capture_dir, prompt, batch_size=50, skip=3, seria
 
 def process_episode_sam3_frame(
     seg, capture_dir, prompt, frame_index, output_dir, serials=None, video_dir=None,
+    undistort_frame=False,
 ):
     """Segment one frame from every camera with SAM3's image model.
 
@@ -192,6 +193,15 @@ def process_episode_sam3_frame(
     masks_dir = output_dir / "masks"
     images_dir.mkdir(parents=True, exist_ok=True)
     masks_dir.mkdir(parents=True, exist_ok=True)
+
+    calibration = None
+    if undistort_frame:
+        calibration_path = capture_dir / "cam_param" / "intrinsics.json"
+        if not calibration_path.is_file():
+            raise FileNotFoundError(
+                f"Calibration required by --undistort-frame: {calibration_path}"
+            )
+        calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
 
     all_serials = sorted(p.stem for p in video_dir.glob("*.avi"))
     if serials:
@@ -226,6 +236,29 @@ def process_episode_sam3_frame(
         finally:
             cap.release()
 
+        if calibration is not None:
+            entry = calibration.get(serial)
+            if not isinstance(entry, dict):
+                print(
+                    f"  cam [{cam_idx+1}/{len(all_serials)}] {serial}: "
+                    "FAILED (missing calibration)", flush=True,
+                )
+                failed += 1
+                continue
+            try:
+                import numpy as np
+                source_k = np.asarray(entry["original_intrinsics"], dtype=np.float64).reshape(3, 3)
+                target_k = np.asarray(entry["intrinsics_undistort"], dtype=np.float64).reshape(3, 3)
+                distortion = np.asarray(entry.get("dist_params", []), dtype=np.float64).reshape(-1)
+                bgr = cv2.undistort(bgr, source_k, distortion, None, target_k)
+            except (KeyError, TypeError, ValueError) as exc:
+                print(
+                    f"  cam [{cam_idx+1}/{len(all_serials)}] {serial}: "
+                    f"FAILED (bad calibration: {exc})", flush=True,
+                )
+                failed += 1
+                continue
+
         cv2.imwrite(str(image_path), bgr)
         t0 = time.perf_counter()
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -252,6 +285,7 @@ def process_episode_sam3_frame(
         "frame_index": int(frame_index),
         "prompt": prompt,
         "method": "sam3_image",
+        "undistort_frame": bool(undistort_frame),
         "serials_requested": all_serials,
         "masks_written": int(done),
         "masks_skipped": int(skipped),
@@ -393,6 +427,11 @@ examples:
               "Use <capture_dir>/undistorted_video for calibration-consistent FoundPose inputs."),
     )
     parser.add_argument(
+        "--undistort-frame", action="store_true",
+        help=("With --frame-index, undistort the decoded source frame using "
+              "cam_param/intrinsics.json before SAM3 and FoundPose."),
+    )
+    parser.add_argument(
         "--static-image-dir", type=str, default=None,
         help=("Read one PNG per camera from this directory, undistort it using "
               "<capture_dir>/cam_param/intrinsics.json, and write images/masks "
@@ -426,6 +465,8 @@ examples:
             parser.error("--frame-index must be non-negative")
         if args.method != "sam3":
             parser.error("--frame-index currently supports only --method sam3")
+    elif args.undistort_frame:
+        parser.error("--undistort-frame requires --frame-index")
 
     # Load segmentor
     if args.method == "sam3":
@@ -476,6 +517,7 @@ examples:
                 output_dir=output_dir,
                 serials=args.serials,
                 video_dir=args.video_dir,
+                undistort_frame=args.undistort_frame,
             )
         print(f"\nDone! {done}/{total} cameras, {failed} failed.", flush=True)
     else:
