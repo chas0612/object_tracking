@@ -166,6 +166,30 @@ def _load_object_episode_map(path_value: str | None) -> dict[str, set[str]]:
     return result
 
 
+def _load_init_frame_map(path_value: str | None) -> dict[str, int]:
+    """Load episode-to-frame annotations for task-specific FoundPose seeds."""
+    if not path_value:
+        return {}
+    path = Path(path_value).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Init frame map is missing: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict) and "annotations" in payload:
+        payload = payload["annotations"]
+    if not isinstance(payload, dict):
+        raise ValueError("Init frame map must be a JSON object or contain an 'annotations' object")
+    result: dict[str, int] = {}
+    for episode, frame in payload.items():
+        try:
+            frame_index = int(frame)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid frame index for episode {episode!r}: {frame!r}") from exc
+        if frame_index < 0:
+            raise ValueError(f"Frame index must be non-negative for episode {episode!r}")
+        result[str(episode)] = frame_index
+    return result
+
+
 def _load_object_aliases(path_value: str | None) -> dict[str, str]:
     if not path_value:
         return {}
@@ -272,6 +296,9 @@ def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[st
             "cache_repre_rel": str(repre.relative_to(shared_root)),
             "sam3_prompts": _prompt_candidates(source_object, args),
             "static_images": bool(args.static_images),
+            "init_frame_index": int(
+                args.init_frame_map.get(episode, args.init_frame_index)
+            ),
         })
     return tasks, skipped
 
@@ -624,7 +651,7 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
         if static_images else
         episode / "object_tracking_foundpose_gotrack" / schedule_dir.name / f"attempt_{attempt:02d}"
     )
-    init_frame_index = int(args.init_frame_index)
+    init_frame_index = int(task.get("init_frame_index", args.init_frame_index))
     frame_dir, init_dir, track_dir = (
         attempt_dir / f"foundpose_frame_{init_frame_index:06d}",
         attempt_dir / "foundpose_init",
@@ -732,6 +759,7 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                     "global_asymmetry_forced": result.get("global_asymmetry_forced"),
                     "global_asymmetry_detected": result.get("global_asymmetry_detected"),
                     "global_asymmetry_applied": result.get("global_asymmetry_applied"),
+                    "init_frame_index": init_frame_index,
                 }
                 if static_images:
                     pose = np.load(init_dir / "init_pose_world.npy").astype(np.float32)
@@ -816,6 +844,16 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
 
 def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
     tasks, skipped = _discover(shared, args)
+    if args.init_frame_map:
+        missing_frames = [
+            task["task_id"] for task in tasks
+            if str(task["episode"]) not in args.init_frame_map
+        ]
+        if missing_frames:
+            raise ValueError(
+                "Init frame map is missing discovered episodes: "
+                + ", ".join(missing_frames[:30])
+            )
     if args.reuse_foundpose_schedule_id:
         if args.foundpose_init_only:
             raise ValueError("--reuse-foundpose-schedule-id cannot be combined with --foundpose-init-only")
@@ -828,8 +866,6 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
         source_manifest = _read_json(source_manifest_path)
         if not source_manifest.get("foundpose_init_only", False):
             raise ValueError(f"Source schedule is not init-only: {source_schedule}")
-        if int(source_manifest.get("init_frame_index", -1)) != args.init_frame_index:
-            raise ValueError("Source and destination --init-frame-index must match")
         unavailable: list[str] = []
         for task in tasks:
             source_task_path = _task_path(source_schedule, task["task_id"])
@@ -841,6 +877,16 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
                     or source_task.get("object_name") != task["object_name"]):
                 unavailable.append(f"{task['task_id']}: source task identity mismatch")
                 continue
+            destination_frame = int(task.get("init_frame_index", args.init_frame_index))
+            source_frame_index = int(source_task.get(
+                "init_frame_index", source_manifest.get("init_frame_index", -1),
+            ))
+            if source_frame_index != destination_frame:
+                unavailable.append(
+                    f"{task['task_id']}: source frame={source_frame_index} "
+                    f"destination frame={destination_frame}"
+                )
+                continue
             source_attempt_rel = source_task.get("attempt_dir")
             if source_task.get("status") != "completed" or not source_attempt_rel:
                 unavailable.append(
@@ -848,7 +894,7 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
                 )
                 continue
             source_attempt = shared / source_attempt_rel
-            source_frame = source_attempt / f"foundpose_frame_{args.init_frame_index:06d}"
+            source_frame = source_attempt / f"foundpose_frame_{destination_frame:06d}"
             source_init = source_attempt / "foundpose_init"
             if not source_frame.is_dir() or not (source_init / "init_pose_world.npy").is_file():
                 unavailable.append(f"{task['task_id']}: source init output incomplete")
@@ -867,7 +913,11 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
             )
     if args.dry_run:
         print(f"[dry-run] eligible={len(tasks)} skipped={len(skipped)}")
-        for task in tasks[:30]: print(f"  {task['robot']}/{task['object_name']}/{task['episode']}")
+        for task in tasks[:30]:
+            print(
+                f"  {task['robot']}/{task['object_name']}/{task['episode']} "
+                f"frame={task['init_frame_index']}"
+            )
         for line in skipped[:20]: print(f"  [skip] {line}")
         return 0
     if schedule.exists(): raise FileExistsError(f"Schedule exists: {schedule}")
@@ -882,6 +932,7 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
                                                 "camera_micro_batch_size": args.camera_micro_batch_size,
                                                 "max_video_duration_skew_sec": args.max_video_duration_skew_sec,
                                                 "init_frame_index": args.init_frame_index,
+                                                "init_frame_map": args.init_frame_map,
                                                 "reverse_stop_frame_index": args.reverse_stop_frame_index,
                                                 "foundpose_selection_mode": args.foundpose_selection_mode,
                                                 "foundpose_candidate_rank": args.foundpose_candidate_rank,
@@ -1127,6 +1178,8 @@ def main() -> int:
                    help="JSON object mapping each object to its exact episode list; avoids --objects/--episodes cross products.")
     p.add_argument("--object-alias-json", default=None,
                    help="Optional JSON mapping capture object names to mesh/cache object names.")
+    p.add_argument("--init-frame-map-json", default=None,
+                   help="Episode-to-frame JSON, or annotation JSON containing an 'annotations' map.")
     p.add_argument("--static-images", action="store_true",
                    help="Process raw/images/*.png as one static multiview frame and store all outputs inside the schedule.")
     p.add_argument("--workers", nargs="+", default=None); p.add_argument("--worker-id", default=None)
@@ -1250,6 +1303,7 @@ def main() -> int:
     args.object_prompts_original = _load_prompt_map(args.object_prompts_original_json)
     args.object_episode_map = _load_object_episode_map(args.object_episodes_json)
     args.object_aliases = _load_object_aliases(args.object_alias_json)
+    args.init_frame_map = _load_init_frame_map(args.init_frame_map_json)
     args.local_worker = args.mode == "worker" and (args.worker_id or socket.gethostname()).startswith("local")
     if args.mode == "init":
         if not args.target_root_rel: raise ValueError("--target-root-rel is required for --mode init")
