@@ -16,6 +16,8 @@ Each phase must complete before the next is launched. Status and attempts are
 recorded independently for every task and phase. A stopped worker can be
 released with `--mode reset-running --phase PHASE --confirm-workers-stopped`.
 Failed phase tasks are retried by relaunching that phase with `--retry-failed`.
+By default, a final failure is marked `skipped` in every downstream phase so
+unrelated episodes continue through the complete pipeline.
 
 ## Example
 
@@ -49,6 +51,18 @@ Repeat with `--phase foundpose`, `gotrack`, and `debug`. The FoundPose
 phase uses deterministic object sharding, so its worker count and ordering
 must remain stable for normal launches. If a machine is replaced, reset stale
 claims and relaunch using a complete stable list.
+
+To drain all four phases from one tmux controller, use `launch-all`. It also
+attaches to a phase that is already running, waits for it, and launches only
+the next phase. Failed tasks are not retried unless `--retry-failed` is passed.
+
+```bash
+python -u scripts/distribute_foundpose_gotrack_phased.py \
+  --mode launch-all \
+  --schedule-id CAMPAIGN_gotrack_phased_01 \
+  --runs-root-rel object_tracking/campaigns/CAMPAIGN/phased_runs \
+  --workers local user@worker-a user@worker-b
+```
 
 ```bash
 python -u scripts/distribute_foundpose_gotrack_phased.py \

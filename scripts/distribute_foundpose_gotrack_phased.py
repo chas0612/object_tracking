@@ -30,6 +30,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -490,7 +491,10 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
 
 
 def _phase_counts(schedule: Path, phase: str) -> dict[str, int]:
-    counts = {name: 0 for name in ("blocked", "pending", "running", "completed", "failed")}
+    counts = {
+        name: 0
+        for name in ("blocked", "pending", "running", "completed", "failed", "skipped")
+    }
     for path in (schedule / "tasks").glob("*.json"):
         task = _read(path)
         status = task["phases"][phase]["status"]
@@ -499,6 +503,44 @@ def _phase_counts(schedule: Path, phase: str) -> dict[str, int]:
         else:
             counts[status] += 1
     return counts
+
+
+def _cascade_skipped(schedule: Path, phase: str) -> int:
+    """Make upstream failures terminal for this and all later phases."""
+    previous = PHASES[:PHASES.index(phase)]
+    if not previous:
+        return 0
+    skipped = 0
+    for path in (schedule / "tasks").glob("*.json"):
+        task = _read(path)
+        state = task["phases"][phase]
+        if state["status"] != "pending":
+            continue
+        failed_upstream = next(
+            (
+                name for name in previous
+                if task["phases"][name]["status"] in {"failed", "skipped"}
+            ),
+            None,
+        )
+        if failed_upstream is None:
+            continue
+        state.update({
+            "status": "skipped",
+            "worker_id": None,
+            "reason": f"upstream_{failed_upstream}_{task['phases'][failed_upstream]['status']}",
+            "updated_utc": legacy._now(),
+        })
+        task.update({
+            "status": "failed", "active_phase": None, "updated_utc": legacy._now(),
+        })
+        _write(path, task)
+        skipped += 1
+    return skipped
+
+
+def _phase_terminal(counts: dict[str, int]) -> bool:
+    return counts["blocked"] == 0 and counts["pending"] == 0 and counts["running"] == 0
 
 
 def _reset_running(schedule: Path, phase: str, confirmed: bool) -> int:
@@ -526,11 +568,18 @@ def _reset_running(schedule: Path, phase: str, confirmed: bool) -> int:
 
 
 def _launch(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
+    cascaded = _cascade_skipped(schedule, args.phase)
+    if cascaded:
+        print(f"[skip-cascade] phase={args.phase} skipped={cascaded}", flush=True)
     previous = PHASES[:PHASES.index(args.phase)]
     for prerequisite in previous:
         counts = _phase_counts(schedule, prerequisite)
-        if counts["completed"] != sum(counts.values()):
+        if not _phase_terminal(counts):
             raise RuntimeError(f"phase {args.phase} blocked by {prerequisite}: {counts}")
+    current = _phase_counts(schedule, args.phase)
+    if current["pending"] == 0 and not (args.retry_failed and current["failed"] > 0):
+        print(f"[launch] phase={args.phase} has no runnable tasks: {current}", flush=True)
+        return 0
     env_name = args.sam3_env if args.phase == "mask" else args.gotrack_env
     for rank, spec in enumerate(args.workers):
         worker_id = legacy._safe_id(spec)
@@ -574,13 +623,63 @@ def _launch(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
     return 0
 
 
+def _launch_all(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
+    """Drain all phases sequentially, attaching to an already-running phase."""
+    print(
+        f"[launch-all] schedule={schedule} phases={','.join(PHASES)} "
+        f"workers={args.workers}",
+        flush=True,
+    )
+    for phase in PHASES:
+        args.phase = phase
+        cascaded = _cascade_skipped(schedule, phase)
+        if cascaded:
+            print(f"[skip-cascade] phase={phase} skipped={cascaded}", flush=True)
+        launched = False
+        retried_failed = False
+        previous_snapshot: tuple[tuple[str, int], ...] | None = None
+        last_report = 0.0
+        while True:
+            counts = _phase_counts(schedule, phase)
+            snapshot = tuple(counts.items())
+            now = time.monotonic()
+            if snapshot != previous_snapshot or now - last_report >= 60.0:
+                print(
+                    phase + " " + " ".join(f"{key}={value}" for key, value in counts.items()),
+                    flush=True,
+                )
+                previous_snapshot = snapshot
+                last_report = now
+            if _phase_terminal(counts):
+                if args.retry_failed and counts["failed"] > 0 and not retried_failed:
+                    retried_failed = True
+                    launched = False
+                else:
+                    break
+            should_launch = (
+                counts["running"] == 0
+                and not launched
+                and (
+                    counts["pending"] > 0
+                    or (args.retry_failed and counts["failed"] > 0 and retried_failed)
+                )
+            )
+            if should_launch:
+                _launch(args, shared, schedule)
+                launched = True
+            time.sleep(args.poll_interval)
+        print(f"[launch-all] phase={phase} terminal", flush=True)
+    print("[launch-all] all phases terminal", flush=True)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--mode", choices=("init", "worker", "launch", "status", "reset-running"),
+        "--mode", choices=("init", "worker", "launch", "launch-all", "status", "reset-running"),
         required=True,
     )
-    parser.add_argument("--phase", choices=PHASES, default="undistort")
+    parser.add_argument("--phase", choices=PHASES, default="mask")
     parser.add_argument("--schedule-id", required=True)
     parser.add_argument("--shared-root-rel", default="shared_data")
     parser.add_argument("--runs-root-rel", default="object_tracking/phased_foundpose_gotrack_runs")
@@ -642,6 +741,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug-sheet-output-root-rel", default="object_tracking/gotrack_debug_sheets")
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--retry-failed", action="store_true")
+    parser.add_argument(
+        "--poll-interval", type=float, default=10.0,
+        help="Seconds between launch-all state checks. Default: 10.",
+    )
     parser.add_argument("--confirm-workers-stopped", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -652,6 +755,8 @@ def main() -> int:
     args.protected_root_rel = args.protected_root_rel or ["capture/eccv2026/v0"]
     if args.worker_count < 1 or not 0 <= args.worker_rank < args.worker_count:
         raise ValueError("invalid worker rank/count")
+    if args.poll_interval <= 0:
+        raise ValueError("--poll-interval must be positive")
     shared = Path.home() / args.shared_root_rel
     schedule = _schedule(shared, args)
     if args.mode == "init":
@@ -666,6 +771,10 @@ def main() -> int:
         if not args.workers:
             raise ValueError("--workers is required")
         return _launch(args, shared, schedule)
+    if args.mode == "launch-all":
+        if not args.workers:
+            raise ValueError("--workers is required")
+        return _launch_all(args, shared, schedule)
     if args.mode == "reset-running":
         return _reset_running(schedule, args.phase, args.confirm_workers_stopped)
     for phase in PHASES:

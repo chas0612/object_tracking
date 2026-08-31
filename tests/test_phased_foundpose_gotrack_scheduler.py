@@ -4,6 +4,7 @@ import json
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -98,6 +99,54 @@ def test_reset_running_releases_phase_claim(tmp_path: Path) -> None:
     task = json.loads((schedule / "tasks/apple_0.json").read_text(encoding="utf-8"))
     assert task["phases"]["mask"]["status"] == "pending"
     assert not claim.exists()
+
+
+def test_failed_phase_is_skipped_by_all_downstream_phases(tmp_path: Path) -> None:
+    task = _task("apple_0", "apple", 0)
+    task["phases"]["mask"].update({"status": "failed", "reason": "no mask"})
+    schedule = _schedule(tmp_path, [task])
+
+    assert phased._cascade_skipped(schedule, "foundpose") == 1
+    assert phased._cascade_skipped(schedule, "gotrack") == 1
+    assert phased._cascade_skipped(schedule, "debug") == 1
+
+    saved = json.loads((schedule / "tasks/apple_0.json").read_text(encoding="utf-8"))
+    assert saved["phases"]["foundpose"]["status"] == "skipped"
+    assert saved["phases"]["gotrack"]["status"] == "skipped"
+    assert saved["phases"]["debug"]["status"] == "skipped"
+    assert phased._phase_counts(schedule, "debug")["skipped"] == 1
+
+
+def test_launch_all_advances_and_preserves_failed_task_skip(tmp_path: Path, monkeypatch) -> None:
+    failed = _task("apple_0", "apple", 0)
+    good = _task("banana_0", "banana", 0)
+    failed["phases"]["mask"]["status"] = "failed"
+    good["phases"]["mask"]["status"] = "completed"
+    schedule = _schedule(tmp_path, [failed, good])
+    launched = []
+
+    def fake_launch(args, shared, schedule_path):
+        launched.append(args.phase)
+        for path in (schedule_path / "tasks").glob("*.json"):
+            task = json.loads(path.read_text(encoding="utf-8"))
+            state = task["phases"][args.phase]
+            if state["status"] == "pending" and phased._phase_ready(task, args.phase):
+                state["status"] = "completed"
+                path.write_text(json.dumps(task), encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(phased, "_launch", fake_launch)
+    monkeypatch.setattr(phased.time, "sleep", lambda _: None)
+    args = SimpleNamespace(
+        workers=["local"], phase="mask", retry_failed=False, poll_interval=0.01,
+    )
+    assert phased._launch_all(args, tmp_path, schedule) == 0
+    assert launched == ["foundpose", "gotrack", "debug"]
+    saved_failed = json.loads((schedule / "tasks/apple_0.json").read_text(encoding="utf-8"))
+    assert all(
+        saved_failed["phases"][phase]["status"] == "skipped"
+        for phase in ("foundpose", "gotrack", "debug")
+    )
 
 
 def test_foundpose_rebind_reuses_shared_backbone(tmp_path: Path) -> None:
