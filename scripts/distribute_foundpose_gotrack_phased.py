@@ -9,9 +9,10 @@ episode end-to-end.  It drains one phase at a time:
 The mask phase saves only undistorted init-frame PNGs. GoTrack decodes raw
 video and remaps frames in memory, so no full undistorted AVI is created. The
 SAM3 image model stays resident for the complete mask phase. During the
-FoundPose phase, tasks are deterministically sharded by object and ordered by
-episode, so each worker reuses one FoundPose model, object representation, and
-silhouette renderer across all episodes of that object.  GoTrack remains
+FoundPose phase, remaining objects are greedily balanced by episode count and
+each object stays on one worker. Tasks are ordered by episode, so each worker
+reuses one FoundPose model, object representation, and silhouette renderer
+across all episodes of that object. GoTrack remains
 process-isolated per episode because its model startup is small and its worker
 pools benefit from a clean lifecycle.
 
@@ -91,6 +92,63 @@ def _object_shard(object_name: str, count: int) -> int:
     return int.from_bytes(digest[:8], "big") % count
 
 
+def _foundpose_assignment_path(schedule: Path) -> Path:
+    return schedule / "assignments" / "foundpose.json"
+
+
+def _prepare_foundpose_assignment(
+    schedule: Path,
+    worker_count: int,
+    retry_failed: bool,
+    max_attempts: int,
+) -> dict[str, int]:
+    """Balance remaining episodes while keeping every object on one worker."""
+    weights: dict[str, int] = {}
+    for path in (schedule / "tasks").glob("*.json"):
+        task = _read(path)
+        if not _phase_ready(task, "foundpose"):
+            continue
+        state = task["phases"]["foundpose"]
+        runnable = state["status"] == "pending" or (
+            retry_failed
+            and state["status"] == "failed"
+            and int(state["attempts"]) < max_attempts
+        )
+        if runnable:
+            name = task["object_name"]
+            weights[name] = weights.get(name, 0) + 1
+
+    loads = [0] * worker_count
+    assignments: dict[str, int] = {}
+    for object_name, weight in sorted(weights.items(), key=lambda item: (-item[1], item[0])):
+        rank = min(range(worker_count), key=lambda candidate: (loads[candidate], candidate))
+        assignments[object_name] = rank
+        loads[rank] += weight
+
+    _write(_foundpose_assignment_path(schedule), {
+        "worker_count": worker_count,
+        "loads": loads,
+        "object_assignments": assignments,
+        "created_utc": legacy._now(),
+    })
+    print(
+        "[foundpose-balance] "
+        + " ".join(f"rank{rank}={load}" for rank, load in enumerate(loads)),
+        flush=True,
+    )
+    return assignments
+
+
+def _load_foundpose_assignment(schedule: Path, worker_count: int) -> dict[str, int] | None:
+    path = _foundpose_assignment_path(schedule)
+    if not path.is_file():
+        return None
+    value = _read(path)
+    if int(value.get("worker_count", -1)) != worker_count:
+        return None
+    return {str(name): int(rank) for name, rank in value["object_assignments"].items()}
+
+
 def _claim(
     schedule: Path,
     phase: str,
@@ -99,14 +157,21 @@ def _claim(
     max_attempts: int,
     worker_rank: int,
     worker_count: int,
+    foundpose_assignments: dict[str, int] | None = None,
 ) -> dict[str, Any] | None:
     candidates = []
     for path in (schedule / "tasks").glob("*.json"):
         task = _read(path)
         if not _phase_ready(task, phase):
             continue
-        if phase == "foundpose" and _object_shard(task["object_name"], worker_count) != worker_rank:
-            continue
+        if phase == "foundpose":
+            owner = (
+                foundpose_assignments.get(task["object_name"])
+                if foundpose_assignments is not None
+                else _object_shard(task["object_name"], worker_count)
+            )
+            if owner != worker_rank:
+                continue
         state = task["phases"][phase]
         allowed = state["status"] == "pending" or (
             retry_failed and state["status"] == "failed" and int(state["attempts"]) < max_attempts
@@ -366,15 +431,19 @@ def _worker(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
         "started_utc": legacy._now(),
     })
     sam_segmentor = None
+    foundpose_assignments = None
     if args.phase == "mask":
         from autodex.perception import Sam3ImageSegmentor
         print(f"[persistent] loading SAM3 image model once on {worker_id}", flush=True)
         sam_segmentor = Sam3ImageSegmentor(gpu=0)
+    elif args.phase == "foundpose":
+        foundpose_assignments = _load_foundpose_assignment(schedule, args.worker_count)
     completed = failed = 0
     while True:
         task = _claim(
             schedule, args.phase, worker_id, args.retry_failed,
             int(manifest["max_attempts"]), args.worker_rank, args.worker_count,
+            foundpose_assignments,
         )
         if task is None:
             break
@@ -543,6 +612,31 @@ def _phase_terminal(counts: dict[str, int]) -> bool:
     return counts["blocked"] == 0 and counts["pending"] == 0 and counts["running"] == 0
 
 
+def _print_status(schedule: Path) -> None:
+    columns = ("blocked", "pending", "running", "completed", "failed", "skipped")
+    rows = [(phase, _phase_counts(schedule, phase)) for phase in PHASES]
+    phase_width = max(len("phase"), *(len(phase) for phase, _ in rows))
+    widths = {
+        column: max(len(column), *(len(str(counts[column])) for _, counts in rows))
+        for column in columns
+    }
+    print(
+        f"{'phase':<{phase_width}}  "
+        + "  ".join(f"{column:>{widths[column]}}" for column in columns)
+    )
+    print(
+        f"{'-' * phase_width}  "
+        + "  ".join("-" * widths[column] for column in columns)
+    )
+    for phase, counts in rows:
+        print(
+            f"{phase:<{phase_width}}  "
+            + "  ".join(
+                f"{counts[column]:>{widths[column]}}" for column in columns
+            )
+        )
+
+
 def _reset_running(schedule: Path, phase: str, confirmed: bool) -> int:
     if not confirmed:
         raise ValueError("--confirm-workers-stopped is required")
@@ -581,6 +675,13 @@ def _launch(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
         print(f"[launch] phase={args.phase} has no runnable tasks: {current}", flush=True)
         return 0
     env_name = args.sam3_env if args.phase == "mask" else args.gotrack_env
+    if args.phase == "foundpose":
+        _prepare_foundpose_assignment(
+            schedule,
+            len(args.workers),
+            args.retry_failed,
+            int(_read(schedule / "manifest.json")["max_attempts"]),
+        )
     for rank, spec in enumerate(args.workers):
         worker_id = legacy._safe_id(spec)
         common = [
@@ -777,9 +878,7 @@ def main() -> int:
         return _launch_all(args, shared, schedule)
     if args.mode == "reset-running":
         return _reset_running(schedule, args.phase, args.confirm_workers_stopped)
-    for phase in PHASES:
-        counts = _phase_counts(schedule, phase)
-        print(phase + " " + " ".join(f"{key}={value}" for key, value in counts.items()))
+    _print_status(schedule)
     return 0
 
 

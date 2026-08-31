@@ -47,10 +47,12 @@ python -u scripts/distribute_foundpose_gotrack_phased.py \
   --workers local user@worker-a user@worker-b
 ```
 
-Repeat with `--phase foundpose`, `gotrack`, and `debug`. The FoundPose
-phase uses deterministic object sharding, so its worker count and ordering
-must remain stable for normal launches. If a machine is replaced, reset stale
-claims and relaunch using a complete stable list.
+Repeat with `--phase foundpose`, `gotrack`, and `debug`. At every FoundPose
+launch, the scheduler writes a new assignment for the remaining work. Objects
+are greedily balanced by their remaining episode counts, while every episode
+of one object stays on the same worker for representation reuse. If a machine
+is replaced, stop all workers, reset stale claims, and relaunch with the new
+complete worker list; completed episodes are not reassigned.
 
 To drain all four phases from one tmux controller, use `launch-all`. It also
 attaches to a phase that is already running, waits for it, and launches only

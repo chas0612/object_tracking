@@ -87,6 +87,25 @@ def test_foundpose_object_sharding_keeps_object_on_one_worker(tmp_path: Path) ->
     assert "apple" not in wrong_worker_objects
 
 
+def test_foundpose_rebalance_uses_remaining_episode_counts(tmp_path: Path) -> None:
+    tasks = [_task(f"large_{episode}", "large", episode) for episode in range(5)]
+    tasks += [_task(f"medium_{episode}", "medium", episode) for episode in range(3)]
+    tasks += [_task(f"small_{episode}", "small", episode) for episode in range(2)]
+    for task in tasks:
+        task["phases"]["mask"]["status"] = "completed"
+    tasks[0]["phases"]["foundpose"]["status"] = "completed"
+    schedule = _schedule(tmp_path, tasks)
+
+    assignments = phased._prepare_foundpose_assignment(schedule, 2, False, 3)
+    saved = json.loads(
+        (schedule / "assignments/foundpose.json").read_text(encoding="utf-8")
+    )
+
+    assert set(assignments) == {"large", "medium", "small"}
+    assert sorted(saved["loads"]) == [4, 5]
+    assert phased._load_foundpose_assignment(schedule, 2) == assignments
+
+
 def test_reset_running_releases_phase_claim(tmp_path: Path) -> None:
     task = _task("apple_0", "apple", 0)
     schedule = _schedule(tmp_path, [task])
