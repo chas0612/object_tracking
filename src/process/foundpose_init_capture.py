@@ -17,6 +17,7 @@ Run in the ``gotrack`` conda environment.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import sys
@@ -32,6 +33,28 @@ if str(REPO_ROOT) not in sys.path:
 
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 os.environ.setdefault("EGL_PLATFORM", "surfaceless")
+
+
+# Used only by the phased worker, which deliberately processes consecutive
+# episodes of one object in the same Python process.  The normal one-shot CLI
+# leaves this cache disabled and retains its original process isolation.
+_PERSISTENT_KEY: tuple[str, ...] | None = None
+_PERSISTENT_INIT: object | None = None
+_PERSISTENT_SILHOUETTE: object | None = None
+
+
+def _clear_persistent_session() -> None:
+    global _PERSISTENT_KEY, _PERSISTENT_INIT, _PERSISTENT_SILHOUETTE
+    _PERSISTENT_KEY = None
+    _PERSISTENT_INIT = None
+    _PERSISTENT_SILHOUETTE = None
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
 
 
 def _as_4x4(value: object) -> np.ndarray:
@@ -86,7 +109,7 @@ def load_frame_inputs(capture_dir: Path, frame_dir: Path):
     return images_rgb, masks_bool, intrinsics, extrinsics, first.shape[:2]
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture-dir", required=True,
                         help="Capture episode containing cam_param/.")
@@ -146,7 +169,10 @@ def main() -> int:
                         help="Only candidates this close to the best mask score are DINO-reranked.")
     parser.add_argument("--global-dino-inlier-threshold-px", type=float, default=10.0,
                         help="Soft reprojection threshold in FoundPose crop pixels.")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--persistent-session", action="store_true", help=argparse.SUPPRESS,
+    )
+    args = parser.parse_args(argv)
     if args.per_view_candidates < 1:
         raise ValueError("--per-view-candidates must be positive")
     if args.pose_selection_mode == "global" and args.skip_silhouette:
@@ -191,16 +217,39 @@ def main() -> int:
         select_best_pose_by_iou,
     )
 
-    init = FoundPoseInit(
-        mesh_path=str(mesh_path),
-        assets_root=str(assets_root),
-        obj_name=object_name,
-        object_id=1,
-        device=args.device,
-        reference_intrinsics_json=str(capture_dir / "cam_param" / "intrinsics.json"),
-        reference_camera_id=serials[0],
-        force_onboard=args.force_onboard,
+    global _PERSISTENT_KEY, _PERSISTENT_INIT, _PERSISTENT_SILHOUETTE
+    session_key = (
+        str(mesh_path), str(assets_root), object_name, str(args.device),
+        str(args.force_onboard),
     )
+    if args.persistent_session and _PERSISTENT_KEY == session_key:
+        init = _PERSISTENT_INIT
+        print(f"[persistent] reusing FoundPose model/repre for {object_name}", flush=True)
+    else:
+        shared_model = None
+        if args.persistent_session:
+            if _PERSISTENT_INIT is not None:
+                shared_model = getattr(_PERSISTENT_INIT, "model", None)
+            # Drop the old object representation and renderer, but retain the
+            # backbone through shared_model while the next object is rebound.
+            _PERSISTENT_KEY = None
+            _PERSISTENT_INIT = None
+            _PERSISTENT_SILHOUETTE = None
+            gc.collect()
+        init = FoundPoseInit(
+            mesh_path=str(mesh_path),
+            assets_root=str(assets_root),
+            obj_name=object_name,
+            object_id=1,
+            device=args.device,
+            reference_intrinsics_json=str(capture_dir / "cam_param" / "intrinsics.json"),
+            reference_camera_id=serials[0],
+            force_onboard=args.force_onboard,
+            shared_model=shared_model,
+        )
+        if args.persistent_session:
+            _PERSISTENT_KEY = session_key
+            _PERSISTENT_INIT = init
     t0 = time.perf_counter()
     per_view = init.estimate_per_view(
         images, masks, intrinsics, extrinsics,
@@ -235,7 +284,13 @@ def main() -> int:
               f"from {len(candidates)} views", flush=True)
 
     from autodex.perception.silhouette import SilhouetteOptimizer
-    sil = SilhouetteOptimizer(str(mesh_path), device=args.device)
+    if args.persistent_session and _PERSISTENT_SILHOUETTE is not None:
+        sil = _PERSISTENT_SILHOUETTE
+        print(f"[persistent] reusing silhouette renderer for {object_name}", flush=True)
+    else:
+        sil = SilhouetteOptimizer(str(mesh_path), device=args.device)
+        if args.persistent_session:
+            _PERSISTENT_SILHOUETTE = sil
     best_serial, legacy_pose, legacy_mean_iou, per_candidate_iou = select_best_pose_by_iou(
         candidates=candidates,
         masks=masks,

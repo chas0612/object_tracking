@@ -55,6 +55,8 @@ class FoundPoseInit:
         crop_size, crop_rel_pad, extractor_name, ...: FoundPoseOpts knobs.
         translation_scale: FoundPose returns t in mesh units (mm by default with
             mesh_scale=1000); we multiply by this to get meters. Default 1e-3.
+        shared_model: Optional already-loaded FoundPose model. Its DINO backbone
+            is retained while the object representation is replaced.
     """
 
     DEFAULT_OPTS = dict(
@@ -83,6 +85,7 @@ class FoundPoseInit:
         reference_camera_id: Optional[str] = None,
         opts: Optional[Mapping[str, Any]] = None,
         force_onboard: bool = False,
+        shared_model: Any = None,
     ):
         self.mesh_path = Path(mesh_path).resolve()
         self.assets_root = Path(assets_root).resolve()
@@ -108,7 +111,23 @@ class FoundPoseInit:
             if not repre_path.is_file():
                 raise RuntimeError(f"Onboarding finished but repre still missing: {repre_path}")
 
-        self._build_model(repre_path.parent.parent)  # repre_dir = .../object_repre/v1/{dataset_name}/
+        repre_dir = repre_path.parent.parent  # .../object_repre/v1/{dataset_name}/
+        if shared_model is None:
+            self._build_model(repre_dir)
+        else:
+            # A phased worker keeps the expensive DINO backbone resident while
+            # replacing only the current object's representation and kNN data.
+            t0 = time.perf_counter()
+            self.model = shared_model
+            self.model.to(self.device)
+            self.model.eval()
+            self.model.onboarding(repre_dir=repre_dir)
+            self.model.post_onboarding_processing()
+            self.model_load_sec = time.perf_counter() - t0
+            logger.info(
+                f"[FoundPoseInit] Rebound shared model to {self.obj_name} "
+                f"in {self.model_load_sec:.1f}s"
+            )
 
     def _onboard(
         self,

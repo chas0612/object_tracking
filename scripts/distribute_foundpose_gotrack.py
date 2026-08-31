@@ -449,6 +449,18 @@ def _foundpose_command(
     )
 
 
+def _mask_video_args(episode: Path, inline_undistort: bool) -> list[str]:
+    if inline_undistort:
+        return ["--video-dir", str(episode / "videos"), "--undistort-frame"]
+    return ["--video-dir", str(episode / "undistorted_video")]
+
+
+def _gotrack_video_args(episode: Path, inline_undistort: bool) -> list[str]:
+    if inline_undistort:
+        return ["--video-dir", str(episode / "videos"), "--inline-undistort"]
+    return ["--video-dir", str(episode / "undistorted_video")]
+
+
 def _attempt_tail_recovery(
     *, schedule_dir: Path, task: dict[str, Any], attempt_dir: Path, episode: Path,
     mesh: Path, assets: Path, track_dir: Path, gotrack: list[str], sam3: list[str],
@@ -516,9 +528,8 @@ def _attempt_tail_recovery(
             mask_command = sam3 + [
                 "src/process/mask.py", "--capture_dir", str(episode),
                 "--frame-index", str(seed_frame), "--prompt", prompt,
-                "--video-dir", str(episode / "undistorted_video"),
                 "--frame-output-dir", str(frame_dir),
-            ]
+            ] + _mask_video_args(episode, args.inline_gotrack_undistort)
             if selected:
                 mask_command += ["--serials", *selected]
             try:
@@ -574,14 +585,14 @@ def _attempt_tail_recovery(
     reverse_stop = max(0, gap["last_valid_frame"] - args.tail_recovery_overlap_frames + 1)
     track_command = gotrack + [
         "src/process/gotrack_capture.py", "--capture-dir", str(episode),
-        "--video-dir", str(episode / "undistorted_video"), "--mesh", str(mesh),
+        "--mesh", str(mesh),
         "--init-pose", str(init_dir / "init_pose_world.npy"),
         "--object-name", task["object_name"], "--num-cameras", str(args.num_cameras),
         "--allow-fewer-cameras", "--camera-micro-batch-size", str(args.camera_micro_batch_size),
         "--init-frame-index", str(seed_frame), "--reverse-stop-frame-index", str(reverse_stop),
         "--max-video-duration-skew-sec", str(args.max_video_duration_skew_sec),
         "--max-frames", str(args.max_frames), "--output-dir", str(recovery_track_dir),
-    ]
+    ] + _gotrack_video_args(episode, args.inline_gotrack_undistort)
     if selected:
         track_command += ["--camera-ids", *selected]
     recovery_manifest.update({
@@ -677,7 +688,7 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
             log.write(f"task={task['task_id']} worker={task['worker_id']} started_utc={_now()}\n")
             prompts = task.get("sam3_prompts") or _prompt_candidates(task["object_name"], args)
             if reuse_foundpose:
-                if not static_images:
+                if not static_images and not args.inline_gotrack_undistort:
                     _run_command(
                         gotrack + [
                             "src/process/undistort_capture_videos.py",
@@ -701,7 +712,8 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                 )
                 log.flush()
             else:
-                if not static_images and not args.foundpose_init_only:
+                if (not static_images and not args.foundpose_init_only
+                        and not args.inline_gotrack_undistort):
                     _run_command(gotrack + ["src/process/undistort_capture_videos.py", "--capture-dir", str(episode)], log, REPO_ROOT)
                 task["phase"] = "mask"
                 _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
@@ -717,10 +729,9 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                     ]
                     if static_images:
                         mask_command += ["--static-image-dir", str(episode / "raw/images")]
-                    elif args.foundpose_init_only:
+                    elif args.foundpose_init_only or args.inline_gotrack_undistort:
                         mask_command += ["--frame-index", str(init_frame_index),
-                                         "--video-dir", str(episode / "videos"),
-                                         "--undistort-frame"]
+                                         *_mask_video_args(episode, True)]
                     else:
                         mask_command += ["--frame-index", str(init_frame_index),
                                          "--video-dir", str(episode / "undistorted_video")]
@@ -772,14 +783,15 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                 return task
             task["phase"] = "gotrack"
             _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
-            _run_command(gotrack + ["src/process/gotrack_capture.py", "--capture-dir", str(episode), "--video-dir", str(episode / "undistorted_video"),
+            _run_command(gotrack + ["src/process/gotrack_capture.py", "--capture-dir", str(episode),
                                     "--mesh", str(mesh), "--init-pose", str(init_dir / "init_pose_world.npy"), "--object-name", task["object_name"],
                                     "--num-cameras", str(args.num_cameras), "--allow-fewer-cameras",
                                     "--camera-micro-batch-size", str(args.camera_micro_batch_size),
                                     "--init-frame-index", str(init_frame_index),
                                     "--reverse-stop-frame-index", str(args.reverse_stop_frame_index),
                                     "--max-video-duration-skew-sec", str(args.max_video_duration_skew_sec),
-                                    "--max-frames", str(args.max_frames), "--output-dir", str(track_dir)], log, REPO_ROOT)
+                                    "--max-frames", str(args.max_frames), "--output-dir", str(track_dir),
+                                    *_gotrack_video_args(episode, args.inline_gotrack_undistort)], log, REPO_ROOT)
             tracking_summary = _tracking_summary(
                 task, attempt_dir, args.min_valid_pose_coverage, args.max_trailing_missing_frames,
                 args.reverse_stop_frame_index,
@@ -952,6 +964,7 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
                                                 "foundpose_init_only": args.foundpose_init_only,
                                                 "reuse_foundpose_schedule_id": args.reuse_foundpose_schedule_id,
                                                 "static_images": args.static_images,
+                                                "inline_gotrack_undistort": args.inline_gotrack_undistort,
                                                 "object_aliases": args.object_aliases,
                                                 "debug_sheets": args.debug_sheets,
                                                 "debug_sheet_max_cameras": args.debug_sheet_max_cameras,
@@ -1026,6 +1039,9 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
     args.foundpose_global_dino_inlier_threshold_px = float(manifest.get("foundpose_global_dino_inlier_threshold_px", args.foundpose_global_dino_inlier_threshold_px))
     args.foundpose_init_only = bool(manifest.get("foundpose_init_only", args.foundpose_init_only))
     args.static_images = bool(manifest.get("static_images", args.static_images))
+    args.inline_gotrack_undistort = bool(manifest.get(
+        "inline_gotrack_undistort", args.inline_gotrack_undistort,
+    ))
     args.debug_sheets = bool(manifest.get("debug_sheets", args.debug_sheets))
     args.debug_sheet_max_cameras = int(manifest.get("debug_sheet_max_cameras", args.debug_sheet_max_cameras))
     args.debug_sheet_output_root_rel = str(manifest.get("debug_sheet_output_root_rel", args.debug_sheet_output_root_rel))
@@ -1091,6 +1107,10 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
             command.extend(["--protected-root-rel", protected_root_rel])
         command.append("--debug-sheets" if args.debug_sheets else "--no-debug-sheets")
         command.append("--tail-recovery" if args.tail_recovery else "--no-tail-recovery")
+        command.append(
+            "--inline-gotrack-undistort" if args.inline_gotrack_undistort
+            else "--no-inline-gotrack-undistort"
+        )
         command.append("--foundpose-global-dino-rerank" if args.foundpose_global_dino_rerank else
                        "--no-foundpose-global-dino-rerank")
         if args.foundpose_global_asymmetry_force:
@@ -1228,6 +1248,11 @@ def main() -> int:
     p.add_argument("--foundpose-global-dino-inlier-threshold-px", type=float, default=10.0)
     p.add_argument("--foundpose-init-only", action="store_true",
                    help="Stop after SAM3 + FoundPose candidate generation; skip GoTrack and debug sheets.")
+    p.add_argument(
+        "--inline-gotrack-undistort", action=argparse.BooleanOptionalAction, default=True,
+        help=("Use raw videos for init-frame extraction and remap decoded GoTrack frames "
+              "in memory; avoids writing intermediate undistorted AVIs (default)."),
+    )
     p.add_argument("--reuse-foundpose-schedule-id", default=None,
                    help="With --mode init, build a GoTrack schedule from completed outputs of this init-only schedule.")
     p.add_argument("--max-attempts", type=int, default=2)

@@ -35,8 +35,16 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GOTRACK_ROOT = REPO_ROOT / "autodex" / "perception" / "thirdparty" / "MV-GoTrack"
-GOTRACK_RUNNER = GOTRACK_ROOT / "run_multiview_gotrack_anchor_online_multi_object.py"
+GOTRACK_RUNNER = REPO_ROOT / "src/process/run_gotrack_with_inline_undistort.py"
+GOTRACK_PRIVATE_RUNNER = GOTRACK_ROOT / "archive/run_multiview_gotrack_anchor_online_multi_object.py"
 ANCHOR_GENERATOR = GOTRACK_ROOT / "scripts" / "generate_anchor_bank.py"
+
+
+def _supports_direct_reverse() -> bool:
+    if not GOTRACK_PRIVATE_RUNNER.is_file():
+        return False
+    source = GOTRACK_PRIVATE_RUNNER.read_text(encoding="utf-8", errors="ignore")
+    return '"--frame-order"' in source and '"--frame-begin"' in source
 
 
 def _as_pose_4x4(path: Path) -> np.ndarray:
@@ -129,21 +137,28 @@ def _write_init_pose_jsons(
             json.dump(record, handle, indent=2)
 
 
-def _stage_input(capture_dir: Path, video_dir: Path, stage_dir: Path) -> None:
+def _stage_input(
+    capture_dir: Path, video_dir: Path, stage_dir: Path, *, inline_undistort: bool,
+) -> None:
     stage_dir.mkdir()
     for name in ("cam_param",):
         source = capture_dir / name
         if not source.is_dir():
             raise FileNotFoundError(f"Missing required capture directory: {source}")
         (stage_dir / name).symlink_to(source.resolve(), target_is_directory=True)
-    # MV-GoTrack prioritizes undistorted_video/.  Always stage the selected
-    # input under that name so it cannot silently fall back to raw videos/.
-    (stage_dir / "undistorted_video").symlink_to(video_dir.resolve(), target_is_directory=True)
+    video_name = "videos" if inline_undistort else "undistorted_video"
+    (stage_dir / video_name).symlink_to(video_dir.resolve(), target_is_directory=True)
+    if inline_undistort:
+        (stage_dir / "inline_undistort.json").write_text(
+            json.dumps({"version": 1, "fixed_point_map": True}, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
 
 def _write_reversed_prefix_videos(
     source_dir: Path, destination_dir: Path, camera_ids: list[str], frame_index: int,
-    stop_frame_index: int = 0,
+    stop_frame_index: int = 0, *, capture_dir: Path | None = None,
+    inline_undistort: bool = False,
 ) -> None:
     """Write frames ``frame_index..stop_frame_index`` for the backward pass.
 
@@ -152,6 +167,13 @@ def _write_reversed_prefix_videos(
     is reliably readable by OpenCV and MV-GoTrack on all capture workers.
     """
     destination_dir.mkdir(parents=True)
+    calibration = None
+    if inline_undistort:
+        if capture_dir is None:
+            raise ValueError("capture_dir is required for inline-undistort reverse videos")
+        calibration = json.loads(
+            (capture_dir / "cam_param" / "intrinsics.json").read_text(encoding="utf-8")
+        )
     for camera_id in camera_ids:
         source = source_dir / f"{camera_id}.avi"
         cap = cv2.VideoCapture(str(source))
@@ -166,6 +188,16 @@ def _write_reversed_prefix_videos(
             if fps <= 0 or width <= 0 or height <= 0:
                 raise RuntimeError(f"Invalid AVI metadata for reverse pass: {source}")
             target = destination_dir / source.name
+            remap = None
+            if calibration is not None:
+                record = calibration[camera_id]
+                source_k = np.asarray(record["original_intrinsics"], dtype=np.float64).reshape(3, 3)
+                target_k = np.asarray(record["intrinsics_undistort"], dtype=np.float64).reshape(3, 3)
+                distortion = np.asarray(record.get("dist_params", []), dtype=np.float64).reshape(-1)
+                map_x, map_y = cv2.initUndistortRectifyMap(
+                    source_k, distortion, None, target_k, (width, height), cv2.CV_32FC1,
+                )
+                remap = cv2.convertMaps(map_x, map_y, cv2.CV_16SC2)
             writer = cv2.VideoWriter(str(target), cv2.VideoWriter_fourcc(*"MJPG"), fps, (width, height))
             if not writer.isOpened():
                 raise RuntimeError(f"Could not create reverse video: {target}")
@@ -175,6 +207,11 @@ def _write_reversed_prefix_videos(
                     ok, frame = cap.read()
                     if not ok:
                         raise RuntimeError(f"Could not decode {source} frame {original_index} for reverse pass")
+                    if remap is not None:
+                        frame = cv2.remap(
+                            frame, remap[0], remap[1], cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT,
+                        )
                     writer.write(frame)
             finally:
                 writer.release()
@@ -191,6 +228,7 @@ def _load_records(path: Path) -> list[dict[str, object]]:
 
 def _merge_bidirectional_records(
     forward_path: Path, backward_path: Path, destination: Path, seed_frame: int,
+    *, backward_uses_original_indices: bool = False,
 ) -> dict[str, int]:
     """Map reverse-local frames back to capture indices and join at the seed.
 
@@ -205,7 +243,11 @@ def _merge_bidirectional_records(
     for reverse_row in backward:
         if "frame_index" not in reverse_row:
             continue
-        original_index = seed_frame - int(reverse_row["frame_index"])
+        original_index = (
+            int(reverse_row["frame_index"])
+            if backward_uses_original_indices
+            else seed_frame - int(reverse_row["frame_index"])
+        )
         if original_index < 0 or original_index >= seed_frame:
             continue
         row = dict(reverse_row)
@@ -239,6 +281,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture-dir", required=True, help="Capture archive with cam_param/.")
     parser.add_argument("--video-dir", default=None,
                         help="Input AVI directory. Default: <capture-dir>/undistorted_video (required).")
+    parser.add_argument(
+        "--inline-undistort", action=argparse.BooleanOptionalAction, default=False,
+        help=("Decode raw videos and remap each frame in memory. This removes the "
+              "intermediate undistorted AVI; --video-dir must then point to raw videos/."),
+    )
     parser.add_argument("--mesh", required=True, help="Object mesh in meters.")
     parser.add_argument("--init-pose", required=True, help="FoundPose init_pose_world.npy.")
     parser.add_argument("--init-frame-index", type=int, default=30,
@@ -333,6 +380,8 @@ def main() -> int:
         "init_frame_index": args.init_frame_index,
         "reverse_stop_frame_index": args.reverse_stop_frame_index,
         "bidirectional": args.bidirectional,
+        "inline_undistort": args.inline_undistort,
+        "direct_reverse_supported": _supports_direct_reverse(),
         "gpus": args.gpus, "camera_micro_batch_size": args.camera_micro_batch_size,
     }
     if args.dry_run:
@@ -351,7 +400,10 @@ def main() -> int:
     reverse_init_dir = output_dir / "reverse_init_poses"
     reverse_output = output_dir / "reverse_output"
     final_records = output_dir / "gotrack_output" / args.object_name / "world_pose_records.json"
-    _stage_input(capture_dir, video_dir, forward_stage_dir)
+    _stage_input(
+        capture_dir, video_dir, forward_stage_dir,
+        inline_undistort=bool(args.inline_undistort),
+    )
     _write_init_pose_jsons(forward_init_dir, selected, pose, args.init_frame_index)
 
     generate_anchor_cmd = [
@@ -383,6 +435,8 @@ def main() -> int:
         "--input-root", str(forward_stage_dir), "--output-root", str(forward_output),
         "--init-pose-sources", str(forward_init_dir), "--max-frames", str(args.max_frames),
     ]
+    if _supports_direct_reverse():
+        forward_cmd += ["--frame-begin", str(args.init_frame_index)]
     subprocess.run(forward_cmd, check=True, cwd=str(GOTRACK_ROOT), env=env)
     forward_records = forward_output / args.object_name / "world_pose_records.json"
     if not args.bidirectional or args.init_frame_index == 0:
@@ -392,21 +446,43 @@ def main() -> int:
         return 0
 
     try:
-        print(f"[gotrack] building reversed interval "
-              f"{args.reverse_stop_frame_index}..{args.init_frame_index}", flush=True)
-        _write_reversed_prefix_videos(
-            video_dir, reverse_video_dir, selected, args.init_frame_index,
-            stop_frame_index=args.reverse_stop_frame_index,
-        )
-        _stage_input(capture_dir, reverse_video_dir, reverse_stage_dir)
-        _write_init_pose_jsons(reverse_init_dir, selected, pose, 0)
-        reverse_cmd = track_common + [
-            "--input-root", str(reverse_stage_dir), "--output-root", str(reverse_output),
-            "--init-pose-sources", str(reverse_init_dir), "--max-frames", str(args.init_frame_index + 1),
-        ]
+        direct_reverse = _supports_direct_reverse()
+        if direct_reverse:
+            print(f"[gotrack] tracking original videos in reverse over "
+                  f"{args.reverse_stop_frame_index}..{args.init_frame_index}", flush=True)
+            _stage_input(
+                capture_dir, video_dir, reverse_stage_dir,
+                inline_undistort=bool(args.inline_undistort),
+            )
+            _write_init_pose_jsons(reverse_init_dir, selected, pose, args.init_frame_index)
+            reverse_cmd = track_common + [
+                "--input-root", str(reverse_stage_dir), "--output-root", str(reverse_output),
+                "--init-pose-sources", str(reverse_init_dir), "--max-frames", "-1",
+                "--frame-begin", str(args.reverse_stop_frame_index),
+                "--frame-end", str(args.init_frame_index), "--frame-order", "reverse",
+            ]
+        else:
+            print(f"[gotrack] private runner lacks direct reverse; building compatibility interval "
+                  f"{args.reverse_stop_frame_index}..{args.init_frame_index}", flush=True)
+            _write_reversed_prefix_videos(
+                video_dir, reverse_video_dir, selected, args.init_frame_index,
+                stop_frame_index=args.reverse_stop_frame_index,
+                capture_dir=capture_dir, inline_undistort=bool(args.inline_undistort),
+            )
+            _stage_input(
+                capture_dir, reverse_video_dir, reverse_stage_dir, inline_undistort=False,
+            )
+            _write_init_pose_jsons(reverse_init_dir, selected, pose, 0)
+            reverse_cmd = track_common + [
+                "--input-root", str(reverse_stage_dir), "--output-root", str(reverse_output),
+                "--init-pose-sources", str(reverse_init_dir),
+                "--max-frames", str(args.init_frame_index - args.reverse_stop_frame_index + 1),
+            ]
         subprocess.run(reverse_cmd, check=True, cwd=str(GOTRACK_ROOT), env=env)
         merge_stats = _merge_bidirectional_records(
-            forward_records, reverse_output / args.object_name / "world_pose_records.json", final_records, args.init_frame_index,
+            forward_records, reverse_output / args.object_name / "world_pose_records.json",
+            final_records, args.init_frame_index,
+            backward_uses_original_indices=direct_reverse,
         )
         (output_dir / "merge_manifest.json").write_text(json.dumps({
             "seed_frame": args.init_frame_index,
@@ -414,8 +490,6 @@ def main() -> int:
             "strategy": "forward_from_seed_plus_reverse_interval", **merge_stats,
         }, indent=2) + "\n", encoding="utf-8")
     finally:
-        # This is a reproducible, short-lived staging artifact.  Keep tracker
-        # outputs for audit, but avoid permanently storing 22 duplicate AVIs.
         if reverse_video_dir.exists():
             shutil.rmtree(reverse_video_dir)
     print(f"[done] {final_records}", flush=True)

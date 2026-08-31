@@ -48,7 +48,9 @@ def _evenly_spaced(values: list[str], count: int) -> list[str]:
     return [values[index] for index in dict.fromkeys(indices)]
 
 
-def _read_frame(video_path: Path, index: int) -> np.ndarray:
+def _read_frame(
+    video_path: Path, index: int, undistort_maps: tuple[np.ndarray, np.ndarray] | None = None,
+) -> np.ndarray:
     cap = cv2.VideoCapture(str(video_path))
     try:
         if not cap.isOpened():
@@ -57,6 +59,11 @@ def _read_frame(video_path: Path, index: int) -> np.ndarray:
         ok, image = cap.read()
         if not ok:
             raise RuntimeError(f"Could not read frame {index} from {video_path}")
+        if undistort_maps is not None:
+            image = cv2.remap(
+                image, undistort_maps[0], undistort_maps[1],
+                interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+            )
         return image
     finally:
         cap.release()
@@ -101,6 +108,10 @@ def main() -> int:
     records_path = Path(args.gotrack_records).expanduser().resolve()
     output = Path(args.output).expanduser().resolve()
     video_dir = Path(args.video_dir).expanduser().resolve() if args.video_dir else capture / "undistorted_video"
+    inline_undistort = False
+    if args.video_dir is None and not video_dir.is_dir():
+        video_dir = capture / "videos"
+        inline_undistort = True
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite {output}")
     if not capture.is_dir() or not mesh_path.is_file() or not records_path.is_file() or not video_dir.is_dir():
@@ -108,6 +119,23 @@ def main() -> int:
 
     poses = _load_poses(records_path)
     intrinsics, extrinsics = load_cam_param(capture / "cam_param")
+    undistort_maps: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    if inline_undistort:
+        calibration = json.loads(
+            (capture / "cam_param" / "intrinsics.json").read_text(encoding="utf-8")
+        )
+        for serial, record in calibration.items():
+            source_k = np.asarray(record["original_intrinsics"], dtype=np.float64).reshape(3, 3)
+            target_k = np.asarray(record["intrinsics_undistort"], dtype=np.float64).reshape(3, 3)
+            distortion = np.asarray(record.get("dist_params", []), dtype=np.float64).reshape(-1)
+            probe_cap = cv2.VideoCapture(str(video_dir / f"{serial}.avi"))
+            width = int(probe_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(probe_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            probe_cap.release()
+            if width > 0 and height > 0:
+                undistort_maps[serial] = cv2.initUndistortRectifyMap(
+                    source_k, distortion, None, target_k, (width, height), cv2.CV_16SC2,
+                )
     available = sorted(path.stem for path in video_dir.glob("*.avi"))
     candidates = [serial for serial in available if serial in intrinsics and serial in extrinsics]
     serials = list(args.camera_ids) if args.camera_ids is not None else _evenly_spaced(candidates, args.max_cameras)
@@ -127,7 +155,9 @@ def main() -> int:
     if args.dry_run:
         return 0
 
-    probe = _read_frame(video_dir / f"{serials[0]}.avi", frames[0])
+    probe = _read_frame(
+        video_dir / f"{serials[0]}.avi", frames[0], undistort_maps.get(serials[0]),
+    )
     height, width = probe.shape[:2]
     mesh = trimesh.load(mesh_path, process=False)
     if isinstance(mesh, trimesh.Scene):
@@ -140,7 +170,10 @@ def main() -> int:
     cell_height = round(height * args.cell_width / width)
     rows: list[np.ndarray] = []
     for frame in frames:
-        images = [_read_frame(video_dir / f"{serial}.avi", frame) for serial in renderer.serials]
+        images = [
+            _read_frame(video_dir / f"{serial}.avi", frame, undistort_maps.get(serial))
+            for serial in renderer.serials
+        ]
         overlays = renderer.render(_pose_at(poses, frame), images)
         cells = [_label(cv2.resize(image, (args.cell_width, cell_height), interpolation=cv2.INTER_AREA),
                         f"{serial}  f{frame}") for serial, image in zip(renderer.serials, overlays)]
