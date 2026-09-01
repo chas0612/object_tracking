@@ -69,6 +69,22 @@ def _read_frame(
         cap.release()
 
 
+def _can_read_frames(video_path: Path, indices: list[int]) -> tuple[bool, str | None]:
+    """Probe every requested QA frame without retaining decoded images."""
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        if not cap.isOpened():
+            return False, "open failed"
+        for index in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ok, _ = cap.read()
+            if not ok:
+                return False, f"frame {index} unreadable"
+        return True, None
+    finally:
+        cap.release()
+
+
 def _pose_at(poses: dict[int, np.ndarray], frame: int) -> np.ndarray:
     earlier = [index for index in poses if index <= frame]
     return poses[max(earlier)] if earlier else poses[min(poses)]
@@ -119,31 +135,6 @@ def main() -> int:
 
     poses = _load_poses(records_path)
     intrinsics, extrinsics = load_cam_param(capture / "cam_param")
-    undistort_maps: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    if inline_undistort:
-        calibration = json.loads(
-            (capture / "cam_param" / "intrinsics.json").read_text(encoding="utf-8")
-        )
-        for serial, record in calibration.items():
-            source_k = np.asarray(record["original_intrinsics"], dtype=np.float64).reshape(3, 3)
-            target_k = np.asarray(record["intrinsics_undistort"], dtype=np.float64).reshape(3, 3)
-            distortion = np.asarray(record.get("dist_params", []), dtype=np.float64).reshape(-1)
-            probe_cap = cv2.VideoCapture(str(video_dir / f"{serial}.avi"))
-            width = int(probe_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(probe_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            probe_cap.release()
-            if width > 0 and height > 0:
-                undistort_maps[serial] = cv2.initUndistortRectifyMap(
-                    source_k, distortion, None, target_k, (width, height), cv2.CV_16SC2,
-                )
-    available = sorted(path.stem for path in video_dir.glob("*.avi"))
-    candidates = [serial for serial in available if serial in intrinsics and serial in extrinsics]
-    serials = list(args.camera_ids) if args.camera_ids is not None else _evenly_spaced(candidates, args.max_cameras)
-    invalid = [serial for serial in serials if serial not in candidates]
-    if invalid:
-        raise ValueError(f"Unusable camera IDs: {invalid}")
-    if not serials:
-        raise RuntimeError("No usable camera videos")
     first, last = min(poses), max(poses)
     # Frame 0 can be a stale capture or a deliberately recovered reverse
     # prefix.  Default QA should start at frame 1 when it exists, while still
@@ -151,6 +142,41 @@ def main() -> int:
     default_first = 1 if first == 0 and last >= 1 else first
     frames = args.frame_indices or [default_first, (default_first + last) // 2, last]
     frames = list(dict.fromkeys(max(first, min(last, int(frame))) for frame in frames))
+
+    available = sorted(path.stem for path in video_dir.glob("*.avi"))
+    candidates = [serial for serial in available if serial in intrinsics and serial in extrinsics]
+    requested = list(args.camera_ids) if args.camera_ids is not None else candidates
+    invalid = [serial for serial in requested if serial not in candidates]
+    if invalid:
+        raise ValueError(f"Unusable camera IDs: {invalid}")
+    readable: list[str] = []
+    for serial in requested:
+        ok, reason = _can_read_frames(video_dir / f"{serial}.avi", frames)
+        if ok:
+            readable.append(serial)
+        else:
+            print(f"[sheet] skipping camera {serial}: {reason}", flush=True)
+    serials = readable if args.camera_ids is not None else _evenly_spaced(readable, args.max_cameras)
+    if not serials:
+        raise RuntimeError(f"No camera videos readable at frames {frames}")
+
+    undistort_maps: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    if inline_undistort:
+        calibration = json.loads(
+            (capture / "cam_param" / "intrinsics.json").read_text(encoding="utf-8")
+        )
+        for serial in serials:
+            record = calibration[serial]
+            source_k = np.asarray(record["original_intrinsics"], dtype=np.float64).reshape(3, 3)
+            target_k = np.asarray(record["intrinsics_undistort"], dtype=np.float64).reshape(3, 3)
+            distortion = np.asarray(record.get("dist_params", []), dtype=np.float64).reshape(-1)
+            probe_cap = cv2.VideoCapture(str(video_dir / f"{serial}.avi"))
+            width = int(probe_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(probe_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            probe_cap.release()
+            undistort_maps[serial] = cv2.initUndistortRectifyMap(
+                source_k, distortion, None, target_k, (width, height), cv2.CV_16SC2,
+            )
     print(f"[sheet] cameras={serials}; frames={frames}; output={output}")
     if args.dry_run:
         return 0
