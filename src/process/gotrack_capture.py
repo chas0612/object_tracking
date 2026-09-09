@@ -70,6 +70,18 @@ def _video_timing(video_path: Path) -> dict[str, float | int]:
         cap.release()
 
 
+VIDEO_SUFFIXES = (".avi", ".mp4", ".mov", ".mkv")
+
+
+def _video_paths_by_stem(videos_dir: Path) -> dict[str, Path]:
+    """Return one supported video per camera id, independent of container suffix."""
+    paths: dict[str, Path] = {}
+    for suffix in VIDEO_SUFFIXES:
+        for path in sorted(videos_dir.glob(f"*{suffix}")):
+            paths.setdefault(path.stem, path)
+    return paths
+
+
 def _eligible_cameras(
     videos_dir: Path, min_frames: int, excluded: set[str], max_duration_skew_sec: float,
 ) -> tuple[list[str], dict[str, dict[str, float | int]], dict[str, str], float | None]:
@@ -79,7 +91,10 @@ def _eligible_cameras(
     encoded video duration (frame_count / FPS) to the median of otherwise valid
     cameras, rather than excluding a historical hard-coded serial.
     """
-    timings = {p.stem: _video_timing(p) for p in sorted(videos_dir.glob("*.avi"))}
+    timings = {
+        camera_id: _video_timing(path)
+        for camera_id, path in _video_paths_by_stem(videos_dir).items()
+    }
     rejected: dict[str, str] = {}
     baseline: list[float] = []
     for camera_id, info in timings.items():
@@ -147,7 +162,15 @@ def _stage_input(
             raise FileNotFoundError(f"Missing required capture directory: {source}")
         (stage_dir / name).symlink_to(source.resolve(), target_is_directory=True)
     video_name = "videos" if inline_undistort else "undistorted_video"
-    (stage_dir / video_name).symlink_to(video_dir.resolve(), target_is_directory=True)
+    staged_videos = stage_dir / video_name
+    if inline_undistort:
+        # MV-GoTrack's public capture loader constructs ``<camera>.avi`` paths.
+        # Keep its interface stable while allowing source captures stored as MP4.
+        staged_videos.mkdir()
+        for camera_id, source in _video_paths_by_stem(video_dir).items():
+            (staged_videos / f"{camera_id}.avi").symlink_to(source.resolve())
+    else:
+        staged_videos.symlink_to(video_dir.resolve(), target_is_directory=True)
     if inline_undistort:
         (stage_dir / "inline_undistort.json").write_text(
             json.dumps({"version": 1, "fixed_point_map": True}, indent=2) + "\n",
@@ -174,8 +197,11 @@ def _write_reversed_prefix_videos(
         calibration = json.loads(
             (capture_dir / "cam_param" / "intrinsics.json").read_text(encoding="utf-8")
         )
+    source_paths = _video_paths_by_stem(source_dir)
     for camera_id in camera_ids:
-        source = source_dir / f"{camera_id}.avi"
+        source = source_paths.get(camera_id)
+        if source is None:
+            raise FileNotFoundError(f"Missing source video for camera {camera_id}: {source_dir}")
         cap = cv2.VideoCapture(str(source))
         try:
             if not cap.isOpened():
