@@ -25,6 +25,17 @@ if str(REPO_ROOT) not in sys.path:
 from src.visualization.overlay_object_video_single import ObjectOverlayRenderer, load_cam_param
 
 
+VIDEO_SUFFIXES = (".avi", ".mp4", ".mov", ".mkv")
+
+
+def _video_paths_by_stem(video_dir: Path) -> dict[str, Path]:
+    paths: dict[str, Path] = {}
+    for suffix in VIDEO_SUFFIXES:
+        for path in sorted(video_dir.glob(f"*{suffix}")):
+            paths.setdefault(path.stem, path)
+    return paths
+
+
 def _load_poses(path: Path) -> dict[int, np.ndarray]:
     data = json.loads(path.read_text(encoding="utf-8"))
     poses: dict[int, np.ndarray] = {}
@@ -143,7 +154,8 @@ def main() -> int:
     frames = args.frame_indices or [default_first, (default_first + last) // 2, last]
     frames = list(dict.fromkeys(max(first, min(last, int(frame))) for frame in frames))
 
-    available = sorted(path.stem for path in video_dir.glob("*.avi"))
+    video_paths = _video_paths_by_stem(video_dir)
+    available = sorted(video_paths)
     candidates = [serial for serial in available if serial in intrinsics and serial in extrinsics]
     requested = list(args.camera_ids) if args.camera_ids is not None else candidates
     invalid = [serial for serial in requested if serial not in candidates]
@@ -151,7 +163,7 @@ def main() -> int:
         raise ValueError(f"Unusable camera IDs: {invalid}")
     readable: list[str] = []
     for serial in requested:
-        ok, reason = _can_read_frames(video_dir / f"{serial}.avi", frames)
+        ok, reason = _can_read_frames(video_paths[serial], frames)
         if ok:
             readable.append(serial)
         else:
@@ -170,7 +182,7 @@ def main() -> int:
             source_k = np.asarray(record["original_intrinsics"], dtype=np.float64).reshape(3, 3)
             target_k = np.asarray(record["intrinsics_undistort"], dtype=np.float64).reshape(3, 3)
             distortion = np.asarray(record.get("dist_params", []), dtype=np.float64).reshape(-1)
-            probe_cap = cv2.VideoCapture(str(video_dir / f"{serial}.avi"))
+            probe_cap = cv2.VideoCapture(str(video_paths[serial]))
             width = int(probe_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(probe_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             probe_cap.release()
@@ -182,7 +194,7 @@ def main() -> int:
         return 0
 
     probe = _read_frame(
-        video_dir / f"{serials[0]}.avi", frames[0], undistort_maps.get(serials[0]),
+        video_paths[serials[0]], frames[0], undistort_maps.get(serials[0]),
     )
     height, width = probe.shape[:2]
     mesh = trimesh.load(mesh_path, process=False)
@@ -197,7 +209,7 @@ def main() -> int:
     rows: list[np.ndarray] = []
     for frame in frames:
         images = [
-            _read_frame(video_dir / f"{serial}.avi", frame, undistort_maps.get(serial))
+            _read_frame(video_paths[serial], frame, undistort_maps.get(serial))
             for serial in renderer.serials
         ]
         overlays = renderer.render(_pose_at(poses, frame), images)
