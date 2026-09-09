@@ -48,6 +48,18 @@ AUTODEX_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(AUTODEX_ROOT))
 
 
+VIDEO_SUFFIXES = (".avi", ".mp4", ".mov", ".mkv")
+
+
+def _single_frame_video_paths(video_dir):
+    """Return one decodable video per camera stem, preferring legacy AVI."""
+    paths = {}
+    for suffix in VIDEO_SUFFIXES:
+        for path in sorted(video_dir.glob(f"*{suffix}")):
+            paths.setdefault(path.stem, path)
+    return paths
+
+
 # ── Episode discovery ────────────────────────────────────────────────────────
 
 def _find_episodes(base, objects=None):
@@ -203,7 +215,8 @@ def process_episode_sam3_frame(
             )
         calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
 
-    all_serials = sorted(p.stem for p in video_dir.glob("*.avi"))
+    video_paths = _single_frame_video_paths(video_dir)
+    all_serials = sorted(video_paths)
     if serials:
         wanted = set(serials)
         all_serials = [s for s in all_serials if s in wanted]
@@ -217,7 +230,7 @@ def process_episode_sam3_frame(
             skipped += 1
             continue
 
-        video_path = video_dir / f"{serial}.avi"
+        video_path = video_paths[serial]
         cap = cv2.VideoCapture(str(video_path))
         try:
             if not cap.isOpened():
