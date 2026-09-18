@@ -384,4 +384,110 @@ index 44a2a4e..27a6e98 100644
          vertices_list = []
          faces_list = []
          colors_list = []
-
+diff --git a/scripts/onboard_custom_mesh_for_foundpose.py b/scripts/onboard_custom_mesh_for_foundpose.py
+index 9f769d1..a9c24b3 100755
+--- a/scripts/onboard_custom_mesh_for_foundpose.py
++++ b/scripts/onboard_custom_mesh_for_foundpose.py
+@@ -147,8 +147,15 @@ def _load_and_export_mesh(
+     src_mesh_path: Path,
+     dst_ply_path: Path,
+     mesh_scale: float,
+-) -> dict:
+-    """Load mesh, scale, export as PLY, and return models_info entry (in destination units)."""
++) -> tuple[dict, Path]:
++    """Materialise the BOP model and return its metadata and render path.
++
++    PLY is retained for BOP compatibility, but it cannot preserve UV textures.
++    Sampling a texture only at the existing vertices destroys labels on sparse
++    meshes (for example ``spam_can``).  For UV-textured inputs we therefore
++    also export an embedded-texture GLB and use that file for template renders.
++    Dense vertex-coloured meshes continue to use the PLY path.
++    """
+     import trimesh
+ 
+     # Use the shared multi-geometry loader so per-geom PBR textures are packed
+@@ -157,21 +164,38 @@ def _load_and_export_mesh(
+ 
+     mesh = load_trimesh_with_merged_texture(src_mesh_path, process=False)
+ 
+-    # Bake UV textures to vertex colors before PLY export (PLY can't store UV maps).
+-    _bake_texture_to_vertex_colors(mesh)
+-
+     if mesh_scale != 1.0:
+         mesh.apply_scale(float(mesh_scale))
+ 
++    visual = getattr(mesh, "visual", None)
++    has_uv_texture = isinstance(visual, trimesh.visual.TextureVisuals) and (
++        getattr(visual, "uv", None) is not None
++        and getattr(visual, "material", None) is not None
++        and (
++            getattr(visual.material, "baseColorTexture", None) is not None
++            or getattr(visual.material, "image", None) is not None
++        )
++    )
++
++    render_model_path = dst_ply_path
++    if has_uv_texture:
++        render_model_path = dst_ply_path.with_suffix(".glb")
++        mesh.export(str(render_model_path))
++        print(f"[onboard] wrote UV-textured render mesh -> {render_model_path}")
++
++    # Keep the conventional BOP PLY as a geometry/metadata artifact.  Texture
++    # templates above are rendered from GLB, not from this lossy vertex bake.
++    ply_mesh = mesh.copy()
++    _bake_texture_to_vertex_colors(ply_mesh)
+     dst_ply_path.parent.mkdir(parents=True, exist_ok=True)
+-    mesh.export(str(dst_ply_path))
++    ply_mesh.export(str(dst_ply_path))
+     print(f"[onboard] wrote mesh -> {dst_ply_path}")
+ 
+     bounds_min = mesh.bounds[0].astype(np.float64)
+     bounds_max = mesh.bounds[1].astype(np.float64)
+     extents = (bounds_max - bounds_min)
+     diameter = float(np.linalg.norm(extents))
+-    return {
++    models_info_entry = {
+         "diameter": diameter,
+         "min_x": float(bounds_min[0]),
+         "min_y": float(bounds_min[1]),
+@@ -180,6 +204,7 @@ def _load_and_export_mesh(
+         "size_y": float(extents[1]),
+         "size_z": float(extents[2]),
+     }
++    return models_info_entry, render_model_path
+ 
+ 
+ def _resolve_depth_range(
+@@ -332,8 +357,12 @@ def main() -> None:
+             "size_y": float(extents[1]),
+             "size_z": float(extents[2]),
+         }
++        textured_model_path = dst_ply_path.with_suffix(".glb")
++        render_model_path = (
++            textured_model_path if textured_model_path.is_file() else dst_ply_path
++        )
+     else:
+-        models_info_entry = _load_and_export_mesh(
++        models_info_entry, render_model_path = _load_and_export_mesh(
+             src_mesh_path=Path(args.mesh_path).resolve(),
+             dst_ply_path=dst_ply_path,
+             mesh_scale=float(args.mesh_scale),
+@@ -366,9 +395,7 @@ def main() -> None:
+     _install_dataset_params_monkeypatch(
+         dataset_name=args.dataset_name,
+         object_id=int(args.object_id),
+-        model_tpath=str(dst_ply_path).replace(
+-            f"obj_{int(args.object_id):06d}.ply", "obj_{obj_id:06d}.ply"
+-        ),
++        model_tpath=str(render_model_path),
+         models_info_path=str(models_info_path),
+         image_size=(im_w, im_h),
+         intrinsics=intrinsics_K,
+@@ -444,6 +471,7 @@ def main() -> None:
+     summary = {
+         "mesh_path": str(Path(args.mesh_path).resolve()),
+         "ply_path": str(dst_ply_path),
++        "render_model_path": str(render_model_path),
+         "models_info_path": str(models_info_path),
+         "models_info_entry": models_info_entry,
+         "mesh_scale": float(args.mesh_scale),

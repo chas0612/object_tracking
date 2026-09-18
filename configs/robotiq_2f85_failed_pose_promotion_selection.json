@@ -1,0 +1,22 @@
+{
+  "black_holder_with_handle": ["3"],
+  "brown_ramen": ["2", "5"],
+  "cactus3": ["1", "2", "4"],
+  "circular_frying_pan": ["3"],
+  "french_mustard": ["2"],
+  "frog_cup": ["2", "5"],
+  "fruit_cutter_green": ["2"],
+  "green_attached_container": ["2"],
+  "green_cactus_vase": ["1", "2", "4"],
+  "icecream_scoop": ["4"],
+  "lilac_food_container": ["8"],
+  "meat_thermometer": ["4"],
+  "mug_holder": ["0"],
+  "pastel_light_green_bowl": ["3"],
+  "plastic_elephant_jug": ["1"],
+  "saucepan": ["2", "5"],
+  "scotch_tape": ["3"],
+  "toothbrush_holder": ["3", "5", "7"],
+  "white_candle_holder": ["0"],
+  "white_wood_handle_watering_can": ["2", "15", "18", "19", "20", "21"]
+}

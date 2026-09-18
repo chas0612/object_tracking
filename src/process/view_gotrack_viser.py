@@ -185,6 +185,46 @@ def _inspire_hand_qpos(hand_raw: np.ndarray) -> np.ndarray:
     return hand
 
 
+def _robot_hand_qpos(hand_raw: np.ndarray, robot_profile: str) -> np.ndarray:
+    """Convert a recorded hand state to the selected robot URDF joints."""
+    hand_raw = np.asarray(hand_raw, dtype=np.float64)
+    if hand_raw.ndim == 1:
+        hand_raw = hand_raw[:, None]
+    if hand_raw.ndim != 2:
+        raise ValueError(f"Expected a 2-D hand stream, got {hand_raw.shape}")
+
+    resolved_profile = robot_profile
+    if resolved_profile == "auto":
+        if hand_raw.shape[1] == 6:
+            resolved_profile = "inspire"
+        elif hand_raw.shape[1] == 1:
+            resolved_profile = "robotiq_2f85"
+        else:
+            raise ValueError(
+                "Cannot infer robot profile from hand stream with "
+                f"shape {hand_raw.shape}; pass --robot-profile explicitly"
+            )
+    if resolved_profile == "inspire":
+        if hand_raw.shape[1] != 6:
+            raise ValueError(f"Inspire hand state must be [N,6], got {hand_raw.shape}")
+        return _inspire_hand_qpos(hand_raw)
+    if resolved_profile == "robotiq_2f85":
+        if hand_raw.shape[1] != 1:
+            raise ValueError(f"Robotiq 2F-85 hand state must be [N,1], got {hand_raw.shape}")
+        # The capture stores the actuated left-knuckle position directly.
+        # The remaining gripper joints are URDF mimic joints.
+        return np.clip(hand_raw, 0.0, 0.8)
+    raise ValueError(f"Unsupported robot profile: {robot_profile}")
+
+
+def _robot_configuration(qpos: np.ndarray) -> np.ndarray | dict[str, float]:
+    """Name Robotiq joints explicitly so URDF mimic joints need no extra DOFs."""
+    if len(qpos) == 7:
+        names = [f"joint{i}" for i in range(1, 7)] + ["robotiq_85_left_knuckle_joint"]
+        return dict(zip(names, (float(value) for value in qpos)))
+    return qpos
+
+
 def _strict_time_samples(times: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Sort timestamped samples and retain the final value at duplicate times."""
     order = np.argsort(times, kind="stable")
@@ -195,32 +235,33 @@ def _strict_time_samples(times: np.ndarray, values: np.ndarray) -> tuple[np.ndar
 
 def _load_one_robot_qpos(
     raw: Path, arm_name: str, hand_name: str, frame_times: np.ndarray,
+    robot_profile: str,
 ) -> np.ndarray:
     arm_time = np.asarray(np.load(raw / arm_name / "time.npy", allow_pickle=True), dtype=np.float64)
     arm_qpos = np.asarray(np.load(raw / arm_name / "position.npy", allow_pickle=True), dtype=np.float64)
     hand_time = np.asarray(np.load(raw / hand_name / "time.npy", allow_pickle=True), dtype=np.float64)
     hand_raw = np.asarray(np.load(raw / hand_name / "position.npy", allow_pickle=True), dtype=np.float64)
-    if arm_qpos.ndim != 2 or arm_qpos.shape[1] != 6 or hand_raw.ndim != 2 or hand_raw.shape[1] != 6:
-        raise ValueError(f"Expected 6-DoF arm and hand streams, got arm={arm_qpos.shape}, hand={hand_raw.shape}")
+    if arm_qpos.ndim != 2 or arm_qpos.shape[1] != 6:
+        raise ValueError(f"Expected a 6-DoF arm stream, got {arm_qpos.shape}")
     if len(arm_time) < 2 or len(hand_time) < 2:
         raise ValueError("Robot streams must have at least two timestamped entries")
     arm_time, arm_qpos = _strict_time_samples(arm_time, arm_qpos)
     hand_time, hand_raw = _strict_time_samples(hand_time, hand_raw)
-    hand = _inspire_hand_qpos(hand_raw)
+    hand = _robot_hand_qpos(hand_raw, robot_profile)
     arm_at_frames = np.column_stack([
         np.interp(frame_times, arm_time, arm_qpos[:, index]) for index in range(6)
     ])
     hand_at_frames = np.column_stack([
-        np.interp(frame_times, hand_time, hand[:, index]) for index in range(6)
+        np.interp(frame_times, hand_time, hand[:, index]) for index in range(hand.shape[1])
     ])
     return np.concatenate([arm_at_frames, hand_at_frames], axis=1)
 
 
 def _load_robot_qpos(
     capture_dir: Path, frame_count: int, *, video_fps: float,
-    robot_video_offset_sec: float,
+    robot_video_offset_sec: float, robot_profile: str,
 ) -> dict[str, np.ndarray]:
-    """Interpolate unimanual or bimanual Inspire recordings onto video frames.
+    """Interpolate supported unimanual or bimanual robot recordings onto video frames.
 
     When camera timestamps exist, they remain the default timebase and the
     optional offset is added to them.  Timestamp-less captures use the earliest
@@ -247,7 +288,7 @@ def _load_robot_qpos(
         ]
         frame_times = min(starts) + float(robot_video_offset_sec) + np.arange(frame_count) / float(video_fps)
     return {
-        side: _load_one_robot_qpos(raw, arm_name, hand_name, frame_times)
+        side: _load_one_robot_qpos(raw, arm_name, hand_name, frame_times, robot_profile)
         for side, (arm_name, hand_name) in streams.items()
     }
 
@@ -324,9 +365,13 @@ def parse_args() -> argparse.Namespace:
                         help="Scene frame. robot uses inv(C2R) and is the default for Inspire captures.")
     parser.add_argument("--c2r", default=None,
                         help="world_from_robot C2R.npy. Default: <capture-dir>/C2R.npy when using robot coordinates.")
-    parser.add_argument("--no-robot", action="store_true", help="Do not load or animate the recorded Inspire robot.")
-    parser.add_argument("--robot-urdf", default=str(Path.home() / "paradex/rsc/robot/xarm_inspire_DFTP.urdf"),
-                        help="Right/unimanual Inspire arm+hand URDF (backward-compatible option name).")
+    parser.add_argument("--no-robot", action="store_true", help="Do not load or animate the recorded robot.")
+    parser.add_argument("--robot-urdf", default=None,
+                        help="Right/unimanual URDF override; default follows recorded hand DOFs.")
+    parser.add_argument(
+        "--robot-profile", choices=("auto", "inspire", "robotiq_2f85"), default="auto",
+        help="Hand-state conversion used by the robot URDF. Auto infers it from 6- or 1-DoF raw hand data.",
+    )
     parser.add_argument("--left-robot-urdf", default=str(Path.home() / "paradex/rsc/robot/xarm_inspire_left_new.urdf"),
                         help="Left Inspire arm+hand URDF for bimanual raw streams.")
     parser.add_argument("--right-c2r", default=None,
@@ -508,6 +553,7 @@ def main() -> int:
             robot_qpos = _load_robot_qpos(
                 capture_dir, last_frame + 1, video_fps=args.video_fps,
                 robot_video_offset_sec=args.robot_video_offset_sec,
+                robot_profile=args.robot_profile,
             )
             if "left" in robot_qpos and args.left_wrist_joint_offset_deg:
                 robot_qpos["left"] = robot_qpos["left"].copy()
@@ -517,7 +563,11 @@ def main() -> int:
                     f"{args.left_wrist_joint_offset_deg:g} deg"
                 )
             side_specs = {
-                "right": (Path(args.robot_urdf).expanduser().resolve(), world_from_right),
+                "right": (Path(args.robot_urdf).expanduser().resolve() if args.robot_urdf else
+                          paradex_root / "rsc/robot" / (
+                              "xarm_robotiq_2f_85.urdf" if robot_qpos.get("right", np.empty((0, 0))).shape[1] == 7
+                              else "xarm_inspire_DFTP.urdf"
+                          ), world_from_right),
                 "left": (Path(args.left_robot_urdf).expanduser().resolve(), world_from_left),
             }
             for side, qpos in robot_qpos.items():
@@ -535,13 +585,13 @@ def main() -> int:
                 # ViserUrdf updates joint transforms only; the parent frame owns
                 # the per-side calibrated robot-base transform.
                 visualizer = ViserUrdf(server, urdf_path, root_node_name=f"/robots/{side}")
-                visualizer.update_cfg(qpos[first_frame])
+                visualizer.update_cfg(_robot_configuration(qpos[first_frame]))
                 robot_visualizers[side] = visualizer
                 print(f"[viewer] robot[{side}]={urdf_path} qpos_frames={len(qpos)}")
             if not robot_visualizers:
                 raise ValueError("No robot could be placed; provide a valid right/left C2R")
         except Exception as exc:
-            raise RuntimeError("Could not load the recorded Inspire arm/hand; use --no-robot to inspect object only") from exc
+            raise RuntimeError("Could not load the recorded arm/hand; use --no-robot to inspect object only") from exc
 
     with server.gui.add_folder("GoTrack inspection"):
         frame_gui = server.gui.add_slider("Frame", min=first_frame, max=last_frame, step=args.frame_step, initial_value=first_frame)
@@ -590,7 +640,7 @@ def main() -> int:
             text_gui.value = f"frame={frame_index}; " + ", ".join(pose_status)
             for side, robot_vis in robot_visualizers.items():
                 qpos = robot_qpos[side]
-                robot_vis.update_cfg(qpos[min(frame_index, len(qpos) - 1)])
+                robot_vis.update_cfg(_robot_configuration(qpos[min(frame_index, len(qpos) - 1)]))
                 robot_vis.show_visual = robot_gui.value
             if readers is not None:
                 refresh_images = (last_camera_image_frame is None or not image_gui.value

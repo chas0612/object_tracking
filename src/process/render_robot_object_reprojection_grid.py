@@ -31,10 +31,11 @@ if str(PARADEX_ROOT) not in sys.path:
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.process.gotrack_capture import _eligible_cameras
+from src.process.gotrack_capture import _eligible_cameras, _video_paths_by_stem
 
-URDF_PATH = (REPO_ROOT / "autodex" / "planner" / "src" / "curobo" / "content" /
-             "assets" / "robot" / "inspire_description" / "xarm_inspire.urdf")
+INSPIRE_URDF_PATH = (REPO_ROOT / "autodex" / "planner" / "src" / "curobo" / "content" /
+                     "assets" / "robot" / "inspire_description" / "xarm_inspire.urdf")
+ROBOTIQ_URDF_PATH = PARADEX_ROOT / "rsc" / "robot" / "xarm_robotiq_2f_85.urdf"
 
 
 def inspire_action_to_qpos(action: np.ndarray) -> np.ndarray:
@@ -65,14 +66,25 @@ def _as_4x4(value: object) -> np.ndarray:
     return matrix
 
 
-def _load_calibration(capture_dir: Path) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+def _load_calibration(
+    capture_dir: Path,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, tuple[np.ndarray, np.ndarray]]]:
     intr_raw = json.loads((capture_dir / "cam_param" / "intrinsics.json").read_text())
     extr_raw = json.loads((capture_dir / "cam_param" / "extrinsics.json").read_text())
     shared = sorted(set(intr_raw) & set(extr_raw))
     intrinsics = {serial: np.asarray(intr_raw[serial]["intrinsics_undistort"], dtype=np.float32).reshape(3, 3)
                   for serial in shared}
     extrinsics = {serial: _as_4x4(extr_raw[serial]) for serial in shared}
-    return intrinsics, extrinsics
+    undistort_maps = {}
+    for serial in shared:
+        values = intr_raw[serial]
+        original = np.asarray(values["original_intrinsics"], dtype=np.float64).reshape(3, 3)
+        distortion = np.asarray(values["dist_params"], dtype=np.float64).reshape(-1)
+        width, height = int(values["width"]), int(values["height"])
+        undistort_maps[serial] = cv2.initUndistortRectifyMap(
+            original, distortion, None, intrinsics[serial], (width, height), cv2.CV_32FC1,
+        )
+    return intrinsics, extrinsics, undistort_maps
 
 
 def _interpolate(times_src: np.ndarray, data: np.ndarray, times_dst: np.ndarray) -> np.ndarray:
@@ -80,17 +92,32 @@ def _interpolate(times_src: np.ndarray, data: np.ndarray, times_dst: np.ndarray)
     return np.column_stack([np.interp(times_dst, times_src, values[:, i]) for i in range(values.shape[1])])
 
 
-def _load_robot_qpos(capture_dir: Path, frame_count: int, arm_time_offset: float) -> np.ndarray:
+def _load_robot_qpos(
+    capture_dir: Path, frame_count: int, arm_time_offset: float, robot_profile: str,
+) -> np.ndarray:
     raw = capture_dir / "raw"
     arm_time = np.asarray(np.load(raw / "arm" / "time.npy", allow_pickle=True), dtype=np.float64)
     arm_qpos = np.asarray(np.load(raw / "arm" / "position.npy", allow_pickle=True), dtype=np.float64)
     hand_time = np.asarray(np.load(raw / "hand" / "time.npy", allow_pickle=True), dtype=np.float64)
     hand_raw = np.asarray(np.load(raw / "hand" / "position.npy", allow_pickle=True), dtype=np.float64)
-    if arm_qpos.ndim != 2 or arm_qpos.shape[1] != 6 or hand_raw.ndim != 2 or hand_raw.shape[1] != 6:
-        raise ValueError(f"Expected 6-DOF arm and hand streams, got arm={arm_qpos.shape}, hand={hand_raw.shape}")
+    if arm_qpos.ndim != 2 or arm_qpos.shape[1] != 6 or hand_raw.ndim != 2:
+        raise ValueError(f"Expected a 6-DOF arm and 2-D hand stream, got arm={arm_qpos.shape}, hand={hand_raw.shape}")
 
-    # This is the same conversion/order as Paradex visualize_all.py.
-    hand_qpos = inspire_action_to_qpos(_interpolate(hand_time, hand_raw, arm_time))
+    resolved_profile = robot_profile
+    if resolved_profile == "auto":
+        resolved_profile = "robotiq_2f85" if hand_raw.shape[1] == 1 else "inspire"
+    hand_at_arm = _interpolate(hand_time, hand_raw, arm_time)
+    if resolved_profile == "inspire":
+        if hand_at_arm.shape[1] != 6:
+            raise ValueError(f"Inspire hand stream must be [N,6], got {hand_at_arm.shape}")
+        hand_qpos = inspire_action_to_qpos(hand_at_arm)
+    elif resolved_profile == "robotiq_2f85":
+        if hand_at_arm.shape[1] != 1:
+            raise ValueError(f"Robotiq 2F-85 hand stream must be [N,1], got {hand_at_arm.shape}")
+        # Recorded state is the URDF's actuated left-knuckle position.
+        hand_qpos = np.clip(hand_at_arm, 0.0, 0.8)
+    else:
+        raise ValueError(f"Unsupported robot profile: {robot_profile}")
     full_qpos = np.concatenate([arm_qpos, hand_qpos], axis=1)
     arm_time = arm_time + float(arm_time_offset)
     frame_times = np.asarray(np.load(raw / "timestamps" / "timestamp.npy", allow_pickle=True), dtype=np.float64)
@@ -156,6 +183,12 @@ def parse_args() -> argparse.Namespace:
                               "Order must match repeated --object-mesh."))
     parser.add_argument("--object-only", action="store_true",
                         help="Render object overlays only; do not load/render the robot.")
+    parser.add_argument(
+        "--robot-profile", choices=("auto", "inspire", "robotiq_2f85"), default="auto",
+        help="Robot hand-state/URDF profile. Auto infers it from the raw hand width.",
+    )
+    parser.add_argument("--robot-urdf", default=None,
+                        help="Optional combined arm+hand URDF override.")
     parser.add_argument("--output", required=True, help="New output .mp4; never overwritten.")
     parser.add_argument("--camera-ids", nargs="*", default=None, help="Default: every full-length capture camera.")
     parser.add_argument("--exclude-cameras", nargs="*", default=[],
@@ -170,6 +203,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grid-scale", type=float, default=0.20, help="Per-view scale in the output grid.")
     parser.add_argument("--arm-time-offset", type=float, default=0.0,
                         help="Seconds added to arm timestamps. This capture's raw arm and GoTrack events align at 0.0.")
+    parser.add_argument("--undistort-input", action="store_true",
+                        help="Undistort original capture videos before drawing overlays.")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -188,14 +223,21 @@ def main() -> int:
         raise ValueError("Repeat --object-mesh and --gotrack-records the same number of times")
     if not capture_dir.is_dir() or not video_dir.is_dir() or not all(path.is_file() for path in object_mesh_paths + records_paths):
         raise FileNotFoundError("capture directory/video directory, every object mesh, and every GoTrack record must exist")
-    if not args.object_only and not URDF_PATH.is_file():
-        raise FileNotFoundError(f"Inspire arm/hand URDF not found: {URDF_PATH}")
+    resolved_profile = args.robot_profile
+    if resolved_profile == "auto" and not args.object_only:
+        raw_hand = np.load(capture_dir / "raw" / "hand" / "position.npy", allow_pickle=True)
+        resolved_profile = "robotiq_2f85" if raw_hand.ndim == 2 and raw_hand.shape[1] == 1 else "inspire"
+    default_urdf = ROBOTIQ_URDF_PATH if resolved_profile == "robotiq_2f85" else INSPIRE_URDF_PATH
+    robot_urdf_path = Path(args.robot_urdf).expanduser().resolve() if args.robot_urdf else default_urdf
+    if not args.object_only and not robot_urdf_path.is_file():
+        raise FileNotFoundError(f"Combined arm/hand URDF not found: {robot_urdf_path}")
     if not 0 < args.grid_scale <= 1:
         raise ValueError("--grid-scale must be in (0, 1]")
     if args.min_video_frames < 1 or args.max_video_duration_skew_sec < 0:
         raise ValueError("--min-video-frames must be positive and --max-video-duration-skew-sec non-negative")
 
-    intrinsics, extrinsics = _load_calibration(capture_dir)
+    intrinsics, extrinsics, undistort_maps = _load_calibration(capture_dir)
+    video_paths = _video_paths_by_stem(video_dir)
     excluded = set(args.exclude_cameras)
     eligible, video_timings, rejected_cameras, median_duration = _eligible_cameras(
         video_dir, args.min_video_frames, excluded, args.max_video_duration_skew_sec,
@@ -220,6 +262,8 @@ def main() -> int:
                 "video_dir": str(video_dir), "object_only": args.object_only,
                 "objects": [str(path) for path in records_paths],
                 "arm_time_offset": args.arm_time_offset, "grid_scale": args.grid_scale,
+                "robot_profile": resolved_profile, "robot_urdf": str(robot_urdf_path),
+                "undistort_input": args.undistort_input,
                 "manual_excluded_cameras": sorted(excluded),
                 "rejected_cameras": rejected_cameras,
                 "median_video_duration_sec": median_duration,
@@ -242,8 +286,10 @@ def main() -> int:
                 ) from exc
             raise
         from src.visualization.overlay_robot_video import RobotOverlayRenderer, _label_for_link
-        robot_qpos = _load_robot_qpos(capture_dir, total_frames, args.arm_time_offset)
-        robot = RobotModule(str(URDF_PATH))
+        robot_qpos = _load_robot_qpos(
+            capture_dir, total_frames, args.arm_time_offset, resolved_profile,
+        )
+        robot = RobotModule(str(robot_urdf_path))
         robot.update_cfg(robot_qpos[0, :robot.get_num_joints()])
         scene = robot.scene
         link_names = list(scene.geometry.keys())
@@ -256,9 +302,11 @@ def main() -> int:
     caps: dict[str, cv2.VideoCapture] = {}
     robot_renderers = {}
     object_renderers: dict[str, list[ObjectOverlayRenderer]] = {}
-    colors = [(0, 255, 0), (0, 165, 255), (255, 0, 255), (255, 255, 0)]
+    # Robot overlays are green; keep the primary object red so temporal drift
+    # can be attributed to the correct signal by eye.
+    colors = [(0, 0, 255), (0, 165, 255), (255, 0, 255), (255, 255, 0)]
     for serial in serials:
-        cap = cv2.VideoCapture(str(video_dir / f"{serial}.avi"))
+        cap = cv2.VideoCapture(str(video_paths[serial]))
         if not cap.isOpened():
             raise RuntimeError(f"Could not open video for camera {serial}")
         caps[serial] = cap
@@ -292,7 +340,11 @@ def main() -> int:
             frames = {}
             for serial, cap in caps.items():
                 ok, frame = cap.read()
-                frames[serial] = frame if ok else np.zeros((full_h, full_w, 3), dtype=np.uint8)
+                if not ok:
+                    frame = np.zeros((full_h, full_w, 3), dtype=np.uint8)
+                elif args.undistort_input:
+                    frame = cv2.remap(frame, *undistort_maps[serial], interpolation=cv2.INTER_LINEAR)
+                frames[serial] = frame
             if frame_idx < start:
                 continue
             if not args.object_only:

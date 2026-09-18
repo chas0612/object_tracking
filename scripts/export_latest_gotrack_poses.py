@@ -85,13 +85,28 @@ def _schedule_entries(schedule_dir: Path, shared_root: Path) -> dict[tuple[str, 
     tasks_dir = schedule_dir / "tasks"
     if not manifest_path.is_file() or not tasks_dir.is_dir():
         raise FileNotFoundError(f"Schedule has no manifest/tasks: {schedule_dir}")
+    manifest = _read_json(manifest_path)
     entries: dict[tuple[str, str], dict[str, Any]] = {}
     for task_path in sorted(tasks_dir.glob("*.json")):
         task = _read_json(task_path)
         object_name, episode = str(task.get("object_name")), str(task.get("episode"))
         attempt_dir = task.get("attempt_dir")
         if not isinstance(attempt_dir, str):
-            raise ValueError(f"Task has no attempt_dir: {task_path}")
+            # The phased scheduler uses one stable attempt directory per
+            # schedule and deliberately does not duplicate that derived path
+            # in every task JSON.
+            if manifest.get("layout") == "phased-persistent-inline-undistort-v2":
+                episode_rel = task.get("episode_rel")
+                if not isinstance(episode_rel, str):
+                    raise ValueError(f"Phased task has no episode_rel: {task_path}")
+                attempt_dir = str(
+                    Path(episode_rel)
+                    / "object_tracking_foundpose_gotrack"
+                    / schedule_dir.name
+                    / "attempt_01"
+                )
+            else:
+                raise ValueError(f"Task has no attempt_dir: {task_path}")
         record = (
             shared_root
             / attempt_dir
@@ -298,6 +313,11 @@ def parse_args() -> argparse.Namespace:
         help="Completed scheduler directory whose tasks override matching latest-manifest entries.",
     )
     parser.add_argument(
+        "--scheduled-only",
+        action="store_true",
+        help="Export only episodes represented by the supplied scheduler directories.",
+    )
+    parser.add_argument(
         "--object-episodes-json",
         default=None,
         help="Optional exact object-to-episode selection; other target episodes are ignored.",
@@ -386,10 +406,15 @@ def main() -> int:
     schedule_dirs = [Path(value).expanduser().resolve() for value in args.schedule_dir]
     if manifest_path is None and not schedule_dirs:
         raise ValueError("--no-latest-manifest requires at least one --schedule-dir")
+    scheduled: set[tuple[str, str]] = set()
     for schedule_dir in schedule_dirs:
-        latest.update(_schedule_entries(schedule_dir, shared_root))
+        entries = _schedule_entries(schedule_dir, shared_root)
+        scheduled.update(entries)
+        latest.update(entries)
     held_objects, held_pairs = _load_holds(holds_path)
     selection = _load_selection(selection_path)
+    if args.scheduled_only:
+        selection = scheduled if selection is None else selection & scheduled
 
     results: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
@@ -466,6 +491,7 @@ def main() -> int:
         "shared_root": str(shared_root),
         "latest_manifest": str(manifest_path) if manifest_path else None,
         "schedule_dirs": [str(path) for path in schedule_dirs],
+        "scheduled_only": args.scheduled_only,
         "object_episodes_json": str(selection_path) if selection_path else None,
         "holds_json": str(holds_path) if holds_path else None,
         "original_name": args.original_name,

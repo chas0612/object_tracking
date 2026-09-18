@@ -136,6 +136,17 @@ reference calibration에 종속된다. canonical cache의 기본 위치는
 가정하지 않는다. `foundpose_init_capture.py`는 mesh 옆 canonical cache를 자동으로 우선한다.
 먼저 아래 전처리 CLI로 object당 한 번 생성한다(57 viewpoints × 14 rotations = 798 templates).
 
+UV texture와 material image가 있는 OBJ/GLB는 patched MV-GoTrack onboarding이 texture를
+포함한 GLB를 별도로 만들고, 798개 RGB template은 그 GLB에서 렌더한다. BOP 호환용 PLY도
+계속 생성하지만 이는 geometry/metadata artifact이며, sparse mesh의 label을 vertex color로
+근사한 PLY를 template RGB 원본으로 사용하지 않는다. 완료 후
+`foundpose_assets/summary.json`의 `render_model_path`가 `.glb`인지 확인하면 실제 적용 여부를
+감사할 수 있다. 기존 `repre.pth`는 자동 갱신되지 않으므로 이 개선이 필요한 object는 별도
+cache에서 A/B 검증한 뒤 canonical cache를 명시적으로 재온보딩해야 한다. dense vertex-color
+mesh는 기존 PLY 경로를 유지하며, dense UV mesh도 기존 bake가 이미 충분히 선명했다면 pose가
+달라지지 않을 수 있다. 세부 동작과 검증 한계는
+[MV-GoTrack offline-capture patch 설명](../patches/MV-GoTrack-offline-capture.md)을 참고한다.
+
 ```bash
 conda run --no-capture-output -n gotrack python -u \
   src/process/onboard_foundpose_mesh.py \
