@@ -10,7 +10,7 @@ export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/autodex-matplotlib}"
 mkdir -p "$MPLCONFIGDIR"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GOTRACK_DIR="$REPO_ROOT/autodex/perception/thirdparty/MV-GoTrack"
+GOTRACK_DIR="$REPO_ROOT/autodex/perception/thirdparty/MV-GoTrack-next"
 GOTRACK_ENV="gotrack"
 SAM3_ENV="sam3"
 INSTALL_GOTRACK=1

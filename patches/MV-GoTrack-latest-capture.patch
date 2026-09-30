@@ -1,0 +1,752 @@
+diff --git a/utils/renderer_nvdiffrast.py b/utils/renderer_nvdiffrast.py
+index 44a2a4e..4bdf5f4 100644
+--- a/utils/renderer_nvdiffrast.py
++++ b/utils/renderer_nvdiffrast.py
+@@ -3,7 +3,7 @@
+ 
+ # pyre-strict
+ 
+-"""nvdiffrast-based renderer with a safe pyrender fallback."""
++"""CUDA nvdiffrast renderer used by the offline FoundPose/GoTrack pipeline."""
+ 
+ from __future__ import annotations
+ 
+@@ -15,7 +15,7 @@ import torch
+ import trimesh
+ from PIL import Image
+ 
+-from utils import logging, renderer as pyrender_renderer
++from utils import logging
+ from utils import renderer_base, structs, torch_helpers, transform3d
+ 
+ logger = logging.get_logger(__name__)
+@@ -25,26 +25,6 @@ _DEFAULT_BASE_COLOR = (0.7, 0.7, 0.7)
+ 
+ 
+ class NvdiffrastRasterizer(renderer_base.RendererBase):
+-    def _install_pyrender_fallback(
+-        self,
+-        model_path: Optional[str],
+-        kwargs: Dict[str, Any],
+-    ) -> None:
+-        """Initialize the pyrender delegate used when nvdiffrast is unavailable.
+-
+-        Callers that support both renderer backends pre-register meter-scale
+-        GSO meshes through ``renderer.object_meshes`` before calling
+-        ``add_object_model``.  Keep renderer caches shared with the delegate so
+-        fallback rendering observes those preloaded meshes instead of attempting
+-        a second lazy load with no ``model_path`` configured.
+-        """
+-        self._delegate = pyrender_renderer.PyrenderRasterizer(
+-            model_path=model_path,
+-            **kwargs,
+-        )
+-        self._delegate.object_meshes = self.object_meshes
+-        self.object_scenes = self._delegate.object_scenes
+-
+     def __init__(
+         self,
+         model_path: Optional[str] = None,
+@@ -74,29 +54,17 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         )
+         self.device = requested_device
+ 
+-        try:
+-            import nvdiffrast.torch as dr  # type: ignore
+-
+-            self._dr = dr
+-        except Exception:
+-            logger.warning(
+-                "nvdiffrast is not available; falling back to PyrenderRasterizer."
+-            )
+-            self.backend_name = "nvdiffrast_unavailable_pyrender_fallback"
+-            self.is_fallback = True
+-            self._install_pyrender_fallback(model_path, kwargs)
+-            return
+-
+         if requested_device.type != "cuda" or not torch.cuda.is_available():
+-            logger.warning(
+-                "nvdiffrast requires CUDA; falling back to PyrenderRasterizer."
++            raise RuntimeError(
++                "NvdiffrastRasterizer requires CUDA; got "
++                f"requested_device={requested_device}, cuda_available={torch.cuda.is_available()}."
+             )
+-            self.backend_name = "nvdiffrast_cpu_requested_pyrender_fallback"
+-            self.is_fallback = True
+-            self._install_pyrender_fallback(model_path, kwargs)
+-            return
+ 
+-        self._delegate = None
++        try:
++            import nvdiffrast.torch as dr  # type: ignore
++        except Exception as exc:
++            raise RuntimeError("NvdiffrastRasterizer requires importable nvdiffrast.") from exc
++        self._dr = dr
+         self.device = torch.device(
+             "cuda",
+             requested_device.index
+@@ -140,11 +108,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+             return np.asarray(self._resize_pil_texture_if_needed(material_image))
+         return self._resize_texture_array_if_needed(np.asarray(material_image))
+ 
+-    def __getattr__(self, name: str) -> Any:
+-        if self.is_fallback:
+-            return getattr(self._delegate, name)
+-        raise AttributeError(name)
+-
+     def _get_context(self) -> Any:
+         device_index = int(
+             self.device.index if self.device.index is not None else torch.cuda.current_device()
+@@ -248,9 +211,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+ 
+     def free_object_buffers(self, obj_id: int) -> None:
+         """Release GPU buffers for a single object."""
+-        if self.is_fallback:
+-            self._delegate.object_scenes.pop(obj_id, None)
+-            return
+         self._mesh_cache.pop(obj_id, None)
+ 
+     def add_object_model(
+@@ -260,17 +220,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         mesh_color: Optional[structs.Color] = None,
+         **kwargs: Any,
+     ) -> None:
+-        if self.is_fallback:
+-            if obj_id in self.object_meshes:
+-                self._delegate.object_meshes[obj_id] = self.object_meshes[obj_id]
+-            self._delegate.add_object_model(
+-                obj_id=obj_id,
+-                model_path=model_path,
+-                mesh_color=mesh_color,
+-                **kwargs,
+-            )
+-            return
+-
+         if obj_id in self._mesh_cache:
+             return
+ 
+@@ -544,15 +493,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         return_tensors: bool = False,
+         background: Optional[structs.Color] = None,
+     ) -> structs.Collection:
+-        if self.is_fallback:
+-            return self._render_object_models_batch_with_fallback(
+-                obj_ids=obj_ids,
+-                camera_models_c2w=camera_models_c2w,
+-                render_types=render_types,
+-                return_tensors=return_tensors,
+-                background=background,
+-            )
+-
+         if len(obj_ids) != len(camera_models_c2w):
+             raise ValueError("Number of object ids and cameras must match.")
+ 
+@@ -617,64 +557,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         output.depths = depths if return_tensors else torch_helpers.tensor_to_array(depths)
+         return output
+ 
+-    def _render_object_models_batch_with_fallback(
+-        self,
+-        obj_ids: Sequence[int],
+-        camera_models_c2w: Sequence[structs.CameraModel],
+-        render_types: Sequence[renderer_base.RenderType],
+-        return_tensors: bool = False,
+-        background: Optional[structs.Color] = None,
+-    ) -> structs.Collection:
+-        if len(obj_ids) != len(camera_models_c2w):
+-            raise ValueError("Number of object ids and cameras must match.")
+-        if len(obj_ids) == 0:
+-            raise ValueError("At least one object render is required.")
+-
+-        height = int(camera_models_c2w[0].height)
+-        width = int(camera_models_c2w[0].width)
+-        rgbs = torch.zeros((len(obj_ids), 3, height, width), dtype=torch.float32)
+-        masks = torch.zeros((len(obj_ids), height, width), dtype=torch.bool)
+-        depths = torch.zeros((len(obj_ids), height, width), dtype=torch.float32)
+-
+-        for sample_id, (obj_id, camera_model) in enumerate(
+-            zip(obj_ids, camera_models_c2w)
+-        ):
+-            rendered = self._delegate.render_object_model(
+-                obj_id=int(obj_id),
+-                camera_model_c2w=camera_model,
+-                render_types=render_types,
+-                return_tensors=True,
+-                background=background,
+-            )
+-            if renderer_base.RenderType.COLOR in render_types:
+-                color = rendered[renderer_base.RenderType.COLOR]
+-                if not isinstance(color, torch.Tensor):
+-                    color = torch_helpers.array_to_tensor(color)
+-                if color.ndim != 3:
+-                    raise ValueError(
+-                        f"Expected color render to be 3D, got shape {tuple(color.shape)}"
+-                    )
+-                if color.shape[0] == 3 and color.shape[-1] != 3:
+-                    rgbs[sample_id] = color.float()
+-                else:
+-                    rgbs[sample_id] = color.permute(2, 0, 1).float()
+-            if renderer_base.RenderType.MASK in render_types:
+-                mask = rendered[renderer_base.RenderType.MASK]
+-                if not isinstance(mask, torch.Tensor):
+-                    mask = torch_helpers.array_to_tensor(mask)
+-                masks[sample_id] = mask.bool()
+-            if renderer_base.RenderType.DEPTH in render_types:
+-                depth = rendered[renderer_base.RenderType.DEPTH]
+-                if not isinstance(depth, torch.Tensor):
+-                    depth = torch_helpers.array_to_tensor(depth)
+-                depths[sample_id] = depth.float()
+-
+-        output = structs.Collection()
+-        output.rgbs = rgbs if return_tensors else torch_helpers.tensor_to_array(rgbs)
+-        output.masks = masks if return_tensors else torch_helpers.tensor_to_array(masks)
+-        output.depths = depths if return_tensors else torch_helpers.tensor_to_array(depths)
+-        return output
+-
+     def render_object_model(
+         self,
+         obj_id: int,
+@@ -684,16 +566,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         background: Optional[structs.Color] = None,
+         **kwargs: Any,
+     ) -> Dict[renderer_base.RenderType, structs.ArrayData]:
+-        if self.is_fallback:
+-            return self._delegate.render_object_model(
+-                obj_id=obj_id,
+-                camera_model_c2w=camera_model_c2w,
+-                render_types=render_types,
+-                return_tensors=return_tensors,
+-                background=background,
+-                **kwargs,
+-            )
+-
+         batch = self.render_object_models_batch(
+             obj_ids=[obj_id],
+             camera_models_c2w=[camera_model_c2w],
+@@ -731,17 +603,6 @@ class NvdiffrastRasterizer(renderer_base.RendererBase):
+         background: Optional[structs.Color] = None,
+         **kwargs: Any,
+     ) -> Dict[renderer_base.RenderType, structs.ArrayData]:
+-        if self.is_fallback:
+-            return self._delegate.render_meshes(
+-                meshes_in_w=meshes_in_w,
+-                camera_model_c2w=camera_model_c2w,
+-                render_types=render_types,
+-                mesh_colors=mesh_colors,
+-                return_tensors=return_tensors,
+-                background=background,
+-                **kwargs,
+-            )
+-
+         vertices_list = []
+         faces_list = []
+         colors_list = []
+diff --git a/scripts/onboard_custom_mesh_for_foundpose.py b/scripts/onboard_custom_mesh_for_foundpose.py
+new file mode 100755
+index 0000000..a9c24b3
+--- /dev/null
++++ b/scripts/onboard_custom_mesh_for_foundpose.py
+@@ -0,0 +1,503 @@
++#!/usr/bin/env python3
++"""One-time onboarding of a custom mesh into a FoundPose object representation.
++
++This builds a BOP-stub directory layout (mesh + monkey-patched dataset_params)
++that lets us call ``utils.template_util.synthesize_templates`` and
++``utils.gen_repre_util.generate_repre_from_list`` unchanged for an arbitrary
++mesh that does not live in a real BOP dataset.
++
++The output is a ``FeatureBasedObjectRepre`` (``repre.pth``) that the FoundPose
++model can load via ``model.base.ModelBase.onboarding``.
++
++Default settings target the attached_container demo:
++
++    python scripts/onboard_custom_mesh_for_foundpose.py \\
++        --mesh-path demo_data/attached_container/mesh/attached_container.obj \\
++        --object-id 1 \\
++        --dataset-name attached_container \\
++        --output-root output/foundpose_assets/attached_container \\
++        --reference-intrinsics-json demo_data/attached_container/cam_param/intrinsics.json \\
++        --reference-camera-id 25322638 \\
++        --mesh-scale 1000.0
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import sys
++from pathlib import Path
++
++import numpy as np
++
++# Make local utils/ importable when run as a script.
++REPO_ROOT = Path(__file__).resolve().parents[1]
++if str(REPO_ROOT) not in sys.path:
++    sys.path.insert(0, str(REPO_ROOT))
++
++
++def _parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--mesh-path", type=str, required=True,
++                        help="Path to source mesh (.obj/.ply). Will be re-exported as PLY.")
++    parser.add_argument("--object-id", type=int, default=1,
++                        help="Object local ID (lid). Default 1.")
++    parser.add_argument("--dataset-name", type=str, default="attached_container",
++                        help="Synthetic BOP-style dataset name (used as a directory tag).")
++    parser.add_argument("--output-root", type=str, required=True,
++                        help="Root output dir; receives models/, templates/, object_repre/, summary.json.")
++    parser.add_argument("--reference-intrinsics-json", type=str, required=True,
++                        help="Path to a JSON mapping camera_id -> {intrinsics_undistort, width, height}.")
++    parser.add_argument("--reference-camera-id", type=str, required=True,
++                        help="Camera id (key inside the intrinsics JSON) whose intrinsics drive template rendering.")
++    parser.add_argument("--reference-image-scale", type=float, default=1.0,
++                        help="Uniform scale applied to the reference image size and intrinsics before template "
++                             "synthesis. Use values < 1.0 to speed up onboarding for smoke tests.")
++    parser.add_argument("--mesh-scale", type=float, default=1000.0,
++                        help="Multiplier applied to mesh vertices before export. Default 1000 (m -> mm).")
++    parser.add_argument("--depth-min-mm", type=float, default=None,
++                        help="Override min camera-object distance for template viewspheres (in mm).")
++    parser.add_argument("--depth-max-mm", type=float, default=None,
++                        help="Override max camera-object distance for template viewspheres (in mm).")
++    parser.add_argument("--num-viewspheres", type=int, default=1)
++    parser.add_argument("--min-num-viewpoints", type=int, default=57)
++    parser.add_argument("--num-inplane-rotations", type=int, default=14)
++    parser.add_argument("--ssaa-factor", type=float, default=4.0)
++    parser.add_argument("--background-type", type=str, default="gray")
++    parser.add_argument("--crop-rel-pad", type=float, default=0.05)
++    parser.add_argument("--crop-size", type=int, nargs=2, default=(280, 280))
++    parser.add_argument("--templates-version", type=str, default="v1")
++    parser.add_argument("--repre-version", type=str, default="v1")
++    parser.add_argument("--extractor-name", type=str, default="dinov2_vits14-reg")
++    parser.add_argument("--grid-cell-size", type=float, default=14.0)
++    parser.add_argument("--pca-components", type=int, default=256)
++    parser.add_argument("--cluster-num", type=int, default=2048)
++    parser.add_argument("--tfidf-knn-k", type=int, default=3)
++    parser.add_argument("--overwrite", action="store_true")
++    return parser.parse_args()
++
++
++def _bake_texture_to_vertex_colors(mesh: "trimesh.Trimesh") -> None:
++    """Sample a UV texture map at each vertex to produce per-vertex colors.
++
++    PLY cannot store UV texture maps, so we bake the texture into vertex colors
++    before export.  Modifies *mesh* in-place, replacing ``TextureVisuals`` with
++    ``ColorVisuals``.  No-op when the mesh has no UV-mapped texture.
++    """
++    import trimesh
++
++    visual = getattr(mesh, "visual", None)
++    if visual is None or not isinstance(visual, trimesh.visual.TextureVisuals):
++        return
++    uv = getattr(visual, "uv", None)
++    material = getattr(visual, "material", None)
++    if uv is None or material is None:
++        return
++
++    # Retrieve texture image – PBRMaterial stores it as baseColorTexture,
++    # SimpleMaterial as image.
++    tex_image = getattr(material, "baseColorTexture", None)
++    if tex_image is None:
++        tex_image = getattr(material, "image", None)
++    if tex_image is None:
++        return
++
++    tex_array = np.asarray(tex_image)
++    if tex_array.ndim == 2:
++        tex_array = np.stack([tex_array] * 3, axis=-1)
++
++    h, w = tex_array.shape[:2]
++    u = np.clip(uv[:, 0], 0.0, 1.0)
++    v = np.clip(uv[:, 1], 0.0, 1.0)
++    px = np.clip((u * (w - 1)).astype(int), 0, w - 1)
++    py = np.clip(((1.0 - v) * (h - 1)).astype(int), 0, h - 1)
++
++    vc = tex_array[py, px]
++    if vc.ndim == 1:
++        vc = vc.reshape(-1, 1)
++    if vc.shape[-1] == 3:
++        vc = np.concatenate(
++            [vc, np.full((vc.shape[0], 1), 255, dtype=vc.dtype)], axis=-1,
++        )
++
++    mesh.visual = trimesh.visual.ColorVisuals(mesh=mesh, vertex_colors=vc)
++    n_unique = len(np.unique(vc[:, :3].reshape(-1, 3), axis=0))
++    print(f"[onboard] baked UV texture -> {n_unique} unique vertex colors")
++
++
++def _extract_trimesh(loaded: "Any") -> "trimesh.Trimesh":
++    """Extract a single ``trimesh.Trimesh`` from *loaded*, which may be a Scene."""
++    import trimesh
++
++    if isinstance(loaded, trimesh.Trimesh):
++        return loaded
++    if isinstance(loaded, trimesh.Scene):
++        geometries = list(loaded.geometry.values())
++        if len(geometries) == 1:
++            mesh = geometries[0]
++        else:
++            mesh = trimesh.util.concatenate(geometries)
++        if isinstance(mesh, trimesh.Trimesh):
++            return mesh
++        raise ValueError(f"Could not extract Trimesh from Scene: got {type(mesh)}")
++    raise ValueError(f"Loaded object is not a Trimesh or Scene: {type(loaded)}")
++
++
++def _load_and_export_mesh(
++    src_mesh_path: Path,
++    dst_ply_path: Path,
++    mesh_scale: float,
++) -> tuple[dict, Path]:
++    """Materialise the BOP model and return its metadata and render path.
++
++    PLY is retained for BOP compatibility, but it cannot preserve UV textures.
++    Sampling a texture only at the existing vertices destroys labels on sparse
++    meshes (for example ``spam_can``).  For UV-textured inputs we therefore
++    also export an embedded-texture GLB and use that file for template renders.
++    Dense vertex-coloured meshes continue to use the PLY path.
++    """
++    import trimesh
++
++    # Use the shared multi-geometry loader so per-geom PBR textures are packed
++    # into a valid atlas (UVs within [0,1]) before baking to vertex colors.
++    from utils.mesh_io import load_trimesh_with_merged_texture
++
++    mesh = load_trimesh_with_merged_texture(src_mesh_path, process=False)
++
++    if mesh_scale != 1.0:
++        mesh.apply_scale(float(mesh_scale))
++
++    visual = getattr(mesh, "visual", None)
++    has_uv_texture = isinstance(visual, trimesh.visual.TextureVisuals) and (
++        getattr(visual, "uv", None) is not None
++        and getattr(visual, "material", None) is not None
++        and (
++            getattr(visual.material, "baseColorTexture", None) is not None
++            or getattr(visual.material, "image", None) is not None
++        )
++    )
++
++    render_model_path = dst_ply_path
++    if has_uv_texture:
++        render_model_path = dst_ply_path.with_suffix(".glb")
++        mesh.export(str(render_model_path))
++        print(f"[onboard] wrote UV-textured render mesh -> {render_model_path}")
++
++    # Keep the conventional BOP PLY as a geometry/metadata artifact.  Texture
++    # templates above are rendered from GLB, not from this lossy vertex bake.
++    ply_mesh = mesh.copy()
++    _bake_texture_to_vertex_colors(ply_mesh)
++    dst_ply_path.parent.mkdir(parents=True, exist_ok=True)
++    ply_mesh.export(str(dst_ply_path))
++    print(f"[onboard] wrote mesh -> {dst_ply_path}")
++
++    bounds_min = mesh.bounds[0].astype(np.float64)
++    bounds_max = mesh.bounds[1].astype(np.float64)
++    extents = (bounds_max - bounds_min)
++    diameter = float(np.linalg.norm(extents))
++    models_info_entry = {
++        "diameter": diameter,
++        "min_x": float(bounds_min[0]),
++        "min_y": float(bounds_min[1]),
++        "min_z": float(bounds_min[2]),
++        "size_x": float(extents[0]),
++        "size_y": float(extents[1]),
++        "size_z": float(extents[2]),
++    }
++    return models_info_entry, render_model_path
++
++
++def _resolve_depth_range(
++    diameter_mm: float,
++    depth_min_mm: float | None,
++    depth_max_mm: float | None,
++) -> tuple[float, float]:
++    """Pick template viewsphere radii in mm.
++
++    Heuristic: aim for a midpoint at ~7.5 x diameter (or at least 1.5 m), with
++    a +/-25 % window. The midpoint controls apparent template size when
++    num_viewspheres == 1, so we want it to roughly match real camera-to-object
++    distances on the target footage.
++    """
++    if depth_min_mm is not None and depth_max_mm is not None:
++        return float(depth_min_mm), float(depth_max_mm)
++
++    midpoint = max(diameter_mm * 7.5, 1500.0)
++    half_window = midpoint * 0.25
++    auto_min = midpoint - half_window
++    auto_max = midpoint + half_window
++    return (
++        float(depth_min_mm) if depth_min_mm is not None else auto_min,
++        float(depth_max_mm) if depth_max_mm is not None else auto_max,
++    )
++
++
++def _load_reference_intrinsics(
++    intrinsics_json_path: Path,
++    camera_id: str,
++    image_scale: float,
++) -> tuple[np.ndarray, int, int]:
++    with open(intrinsics_json_path, "r", encoding="utf-8") as f:
++        payload = json.load(f)
++    if camera_id not in payload:
++        raise KeyError(
++            f"Camera id {camera_id} not found in {intrinsics_json_path}. "
++            f"Available: {list(payload.keys())[:10]}..."
++        )
++    record = payload[camera_id]
++    if "intrinsics_undistort" in record:
++        K = np.asarray(record["intrinsics_undistort"], dtype=np.float64)
++    elif "intrinsics" in record:
++        K = np.asarray(record["intrinsics"], dtype=np.float64)
++    else:
++        raise KeyError(f"No intrinsics field for {camera_id} in {intrinsics_json_path}")
++    width = int(record.get("width") or record.get("dist_width") or 0)
++    height = int(record.get("height") or record.get("dist_height") or 0)
++    if width <= 0 or height <= 0:
++        raise ValueError(
++            f"Could not resolve image size for {camera_id} from {intrinsics_json_path}"
++        )
++    if image_scale <= 0.0:
++        raise ValueError(f"reference image scale must be positive, got {image_scale}")
++    if abs(float(image_scale) - 1.0) > 1e-6:
++        scaled_width = max(1, int(round(width * float(image_scale))))
++        scaled_height = max(1, int(round(height * float(image_scale))))
++        scale_x = scaled_width / float(width)
++        scale_y = scaled_height / float(height)
++        K = K.copy()
++        K[0, 0] *= scale_x
++        K[0, 2] *= scale_x
++        K[1, 1] *= scale_y
++        K[1, 2] *= scale_y
++        width = scaled_width
++        height = scaled_height
++    return K, width, height
++
++
++def _install_dataset_params_monkeypatch(
++    dataset_name: str,
++    object_id: int,
++    model_tpath: str,
++    models_info_path: str,
++    image_size: tuple[int, int],
++    intrinsics: np.ndarray,
++    depth_range: tuple[float, float],
++) -> None:
++    """Override bop_toolkit_lib.dataset_params lookups for our synthetic dataset."""
++    from bop_toolkit_lib import dataset_params
++
++    target_dataset_name = dataset_name
++    orig_get_model_params = dataset_params.get_model_params
++    orig_get_split_params = dataset_params.get_split_params
++    orig_get_camera_params = dataset_params.get_camera_params
++
++    def patched_get_model_params(datasets_path, dataset_name, model_type=None):  # noqa: ARG001
++        if dataset_name != target_dataset_name:
++            return orig_get_model_params(datasets_path, dataset_name, model_type)
++        return {
++            "obj_ids": [int(object_id)],
++            "symmetric_obj_ids": [],
++            "model_tpath": model_tpath,
++            "models_info_path": models_info_path,
++        }
++
++    def patched_get_split_params(datasets_path, dataset_name, split, split_type=None):  # noqa: ARG001
++        if dataset_name != target_dataset_name:
++            return orig_get_split_params(datasets_path, dataset_name, split, split_type)
++        return {
++            "name": dataset_name,
++            "split": split,
++            "split_type": split_type,
++            "base_path": str(Path(model_tpath).parent.parent),
++            "depth_range": (float(depth_range[0]), float(depth_range[1])),
++            "azimuth_range": (0.0, 2.0 * float(np.pi)),
++            "elev_range": (-0.5 * float(np.pi), 0.5 * float(np.pi)),
++            "im_size": (int(image_size[0]), int(image_size[1])),
++            "scene_ids": [0],
++            "im_modalities": ["rgb"],
++        }
++
++    def patched_get_camera_params(datasets_path, dataset_name, cam_type=None):  # noqa: ARG001
++        if dataset_name != target_dataset_name:
++            return orig_get_camera_params(datasets_path, dataset_name, cam_type)
++        return {
++            "im_size": (int(image_size[0]), int(image_size[1])),
++            "K": np.asarray(intrinsics, dtype=np.float64),
++        }
++
++    dataset_params.get_model_params = patched_get_model_params
++    dataset_params.get_split_params = patched_get_split_params
++    dataset_params.get_camera_params = patched_get_camera_params
++    print(f"[onboard] monkey-patched bop_toolkit_lib.dataset_params for dataset='{dataset_name}'")
++
++
++def main() -> None:
++    args = _parse_args()
++
++    output_root = Path(args.output_root).resolve()
++    output_root.mkdir(parents=True, exist_ok=True)
++
++    # 1. Materialise the BOP-stub mesh directory.
++    models_dir = output_root / args.dataset_name / "models"
++    models_dir.mkdir(parents=True, exist_ok=True)
++    dst_ply_path = models_dir / f"obj_{int(args.object_id):06d}.ply"
++    if dst_ply_path.exists() and not args.overwrite:
++        print(f"[onboard] reusing existing mesh: {dst_ply_path}")
++        # Need to re-derive models_info even if we don't re-export.
++        import trimesh
++        existing = trimesh.load(str(dst_ply_path), process=False, force="mesh")
++        bounds_min = existing.bounds[0].astype(np.float64)
++        extents = (existing.bounds[1] - existing.bounds[0]).astype(np.float64)
++        models_info_entry = {
++            "diameter": float(np.linalg.norm(extents)),
++            "min_x": float(bounds_min[0]),
++            "min_y": float(bounds_min[1]),
++            "min_z": float(bounds_min[2]),
++            "size_x": float(extents[0]),
++            "size_y": float(extents[1]),
++            "size_z": float(extents[2]),
++        }
++        textured_model_path = dst_ply_path.with_suffix(".glb")
++        render_model_path = (
++            textured_model_path if textured_model_path.is_file() else dst_ply_path
++        )
++    else:
++        models_info_entry, render_model_path = _load_and_export_mesh(
++            src_mesh_path=Path(args.mesh_path).resolve(),
++            dst_ply_path=dst_ply_path,
++            mesh_scale=float(args.mesh_scale),
++        )
++
++    models_info_path = models_dir / "models_info.json"
++    models_info = {str(int(args.object_id)): models_info_entry}
++    with open(models_info_path, "w", encoding="utf-8") as f:
++        json.dump(models_info, f, indent=2)
++    print(f"[onboard] wrote models_info -> {models_info_path}")
++
++    # 2. Resolve reference intrinsics + image size.
++    intrinsics_K, im_w, im_h = _load_reference_intrinsics(
++        Path(args.reference_intrinsics_json).resolve(),
++        str(args.reference_camera_id),
++        float(args.reference_image_scale),
++    )
++    print(f"[onboard] reference camera {args.reference_camera_id}: "
++          f"size=({im_w}, {im_h}), fx={intrinsics_K[0, 0]:.2f}, fy={intrinsics_K[1, 1]:.2f}")
++
++    # 3. Compute depth range used for template viewspheres.
++    depth_range = _resolve_depth_range(
++        diameter_mm=models_info_entry["diameter"],
++        depth_min_mm=args.depth_min_mm,
++        depth_max_mm=args.depth_max_mm,
++    )
++    print(f"[onboard] template depth range (mm): {depth_range}")
++
++    # 4. Monkey-patch bop_toolkit_lib.dataset_params before any of our utils import it.
++    _install_dataset_params_monkeypatch(
++        dataset_name=args.dataset_name,
++        object_id=int(args.object_id),
++        model_tpath=str(render_model_path),
++        models_info_path=str(models_info_path),
++        image_size=(im_w, im_h),
++        intrinsics=intrinsics_K,
++        depth_range=depth_range,
++    )
++
++    # 5. Build options and call template synthesis + repre generation.
++    from utils import config as utils_config
++    from utils import gen_repre_util, repre_util, template_util
++
++    gen_templates_opts = utils_config.GenTemplatesOpts(
++        version=str(args.templates_version),
++        dataset_name=str(args.dataset_name),
++        object_lids=[int(args.object_id)],
++        num_viewspheres=int(args.num_viewspheres),
++        min_num_viewpoints=int(args.min_num_viewpoints),
++        num_inplane_rotations=int(args.num_inplane_rotations),
++        ssaa_factor=float(args.ssaa_factor),
++        background_type=str(args.background_type),
++        crop=True,
++        crop_rel_pad=float(args.crop_rel_pad),
++        crop_size=(int(args.crop_size[0]), int(args.crop_size[1])),
++        save_templates=True,
++        overwrite=bool(args.overwrite),
++        debug=True,
++    )
++    print(f"[onboard] running synthesize_templates: {gen_templates_opts}")
++    template_util.synthesize_templates(bop_root_dir=output_root, opts=gen_templates_opts)
++
++    # NOTE: utils/gen_repre_util.py only assigns its local `template_desc_opts`
++    # variable inside an `if not isinstance(..., TemplateDescOpts)` branch, so
++    # it crashes with UnboundLocalError when we pass a TemplateDescOpts instance
++    # directly. Pass a plain dict so the unpack-and-rebuild path is taken.
++    template_desc_opts_dict = {
++        "desc_type": "tfidf",
++        "tfidf_knn_k": int(args.tfidf_knn_k),
++    }
++    gen_repre_opts = utils_config.GenRepreOpts(
++        version=str(args.repre_version),
++        templates_version=str(args.templates_version),
++        dataset_name=str(args.dataset_name),
++        object_lids=[int(args.object_id)],
++        extractor_name=str(args.extractor_name),
++        grid_cell_size=float(args.grid_cell_size),
++        apply_pca=True,
++        pca_components=int(args.pca_components),
++        cluster_features=True,
++        cluster_num=int(args.cluster_num),
++        template_desc_opts=template_desc_opts_dict,
++        overwrite=bool(args.overwrite),
++        debug=True,
++    )
++    print(f"[onboard] running generate_repre_from_list: {gen_repre_opts}")
++    repre_root = gen_repre_util.generate_repre_from_list(
++        bop_root_dir=output_root, opts=gen_repre_opts
++    )
++    print(f"[onboard] generated object_repre under: {repre_root}")
++
++    # 6. Sanity-check load.
++    obj_repre_dir = (
++        output_root / "object_repre" / args.repre_version / args.dataset_name / str(int(args.object_id))
++    )
++    if not (obj_repre_dir / "repre.pth").is_file():
++        raise FileNotFoundError(
++            f"Expected repre.pth not found at {obj_repre_dir / 'repre.pth'}"
++        )
++    repre = repre_util.load_object_repre(repre_dir=obj_repre_dir, tensor_device="cpu")
++    num_templates = len(repre.templates) if repre.templates is not None else 0
++    feat_count = int(repre.feat_vectors.shape[0]) if repre.feat_vectors is not None else 0
++    print(f"[onboard] sanity-check OK: {num_templates} templates, {feat_count} feature vectors")
++
++    # 7. Write summary.
++    summary = {
++        "mesh_path": str(Path(args.mesh_path).resolve()),
++        "ply_path": str(dst_ply_path),
++        "render_model_path": str(render_model_path),
++        "models_info_path": str(models_info_path),
++        "models_info_entry": models_info_entry,
++        "mesh_scale": float(args.mesh_scale),
++        "dataset_name": args.dataset_name,
++        "object_id": int(args.object_id),
++        "reference_intrinsics_json": str(Path(args.reference_intrinsics_json).resolve()),
++        "reference_camera_id": str(args.reference_camera_id),
++        "reference_image_scale": float(args.reference_image_scale),
++        "image_size": [int(im_w), int(im_h)],
++        "intrinsics": intrinsics_K.tolist(),
++        "depth_range_mm": list(depth_range),
++        "templates_version": args.templates_version,
++        "repre_version": args.repre_version,
++        "num_viewspheres": int(args.num_viewspheres),
++        "min_num_viewpoints": int(args.min_num_viewpoints),
++        "num_inplane_rotations": int(args.num_inplane_rotations),
++        "extractor_name": args.extractor_name,
++        "object_repre_dir": str(obj_repre_dir),
++        "num_templates": int(num_templates),
++        "num_feature_vectors": int(feat_count),
++    }
++    summary_path = output_root / "summary.json"
++    with open(summary_path, "w", encoding="utf-8") as f:
++        json.dump(summary, f, indent=2)
++    print(f"[done] wrote summary -> {summary_path}")
++
++
++if __name__ == "__main__":
++    main()

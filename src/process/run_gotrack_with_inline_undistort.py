@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-GOTRACK_ROOT = REPO_ROOT / "autodex/perception/thirdparty/MV-GoTrack"
+GOTRACK_ROOT = Path(os.environ.get("AUTODEX_GOTRACK_ROOT", str(
+    REPO_ROOT / "autodex/perception/thirdparty/MV-GoTrack"))).resolve()
 for path in (REPO_ROOT, GOTRACK_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))

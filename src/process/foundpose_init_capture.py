@@ -111,6 +111,8 @@ def load_frame_inputs(capture_dir: Path, frame_dir: Path):
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--gotrack-dir", default=str(REPO_ROOT / "autodex/perception/thirdparty/MV-GoTrack-next"),
+                        help="Select the private runtime before importing FoundPose.")
     parser.add_argument("--capture-dir", required=True,
                         help="Capture episode containing cam_param/.")
     parser.add_argument("--frame-dir", default=None,
@@ -173,6 +175,8 @@ def main(argv: list[str] | None = None) -> int:
         "--persistent-session", action="store_true", help=argparse.SUPPRESS,
     )
     args = parser.parse_args(argv)
+    if args.gotrack_dir:
+        os.environ["AUTODEX_GOTRACK_ROOT"] = str(Path(args.gotrack_dir).expanduser().resolve())
     if args.per_view_candidates < 1:
         raise ValueError("--per-view-candidates must be positive")
     if args.pose_selection_mode == "global" and args.skip_silhouette:

@@ -130,7 +130,13 @@ def main() -> int:
     parser.add_argument("--overwrite", action="store_true",
                         help="Deprecated compatibility flag. Existing caches are never replaced automatically.")
     parser.add_argument("--dry-run", action="store_true", help="Print resolved paths and command only.")
+    parser.add_argument("--gotrack-dir", default=str(REPO_ROOT / "autodex/perception/thirdparty/MV-GoTrack-next"),
+                        help="Private runtime containing the onboarding compatibility patch.")
     args = parser.parse_args()
+    global GOTRACK_ROOT, ONBOARD_SCRIPT
+    if args.gotrack_dir:
+        GOTRACK_ROOT = Path(args.gotrack_dir).expanduser().resolve()
+        ONBOARD_SCRIPT = GOTRACK_ROOT / "scripts/onboard_custom_mesh_for_foundpose.py"
 
     object_name = _validate_object_name(args.object_name)
     mesh_root = Path(args.mesh_root).expanduser().resolve()

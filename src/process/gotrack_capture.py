@@ -34,6 +34,10 @@ import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from autodex.tracking.gotrack_runtime import LEGACY_ROOT, LATEST_ROOT, checkpoint_path
+
 GOTRACK_ROOT = REPO_ROOT / "autodex" / "perception" / "thirdparty" / "MV-GoTrack"
 GOTRACK_RUNNER = REPO_ROOT / "src/process/run_gotrack_with_inline_undistort.py"
 GOTRACK_PRIVATE_RUNNER = GOTRACK_ROOT / "archive/run_multiview_gotrack_anchor_online_multi_object.py"
@@ -123,17 +127,21 @@ def _eligible_cameras(
 
 
 def _select_cameras(extrinsics_json: Path, available: list[str], number: int) -> list[str]:
-    cmd = [
-        sys.executable, str(GOTRACK_ROOT / "scripts" / "select_cameras.py"),
-        "--extrinsics-json", str(extrinsics_json),
-        "--num-cameras", str(number), "--mode", "fps",
-        "--available-ids", *available,
-    ]
-    result = subprocess.run(cmd, check=True, cwd=str(GOTRACK_ROOT), text=True, capture_output=True)
-    selected = result.stdout.strip().split()
-    if len(selected) != number:
-        raise RuntimeError(f"Camera selector returned {len(selected)} cameras, expected {number}: {selected}")
-    return selected
+    from autodex.tracking.latest_gotrack import homogeneous
+    raw = json.loads(extrinsics_json.read_text(encoding="utf-8"))
+    ids = sorted(set(available) & set(raw))
+    if not 1 <= number <= len(ids):
+        raise ValueError(f"Cannot select {number} cameras from {ids}")
+    points = np.asarray([-homogeneous(raw[c])[:3, :3].T @ homogeneous(raw[c])[:3, 3] for c in ids])
+    seed = int(np.argmin(np.linalg.norm(points - points.mean(axis=0), axis=1)))
+    selected = [seed]
+    distances = np.linalg.norm(points - points[seed], axis=1)
+    for _ in range(number - 1):
+        distances[selected] = -1
+        chosen = int(np.argmax(distances))
+        selected.append(chosen)
+        distances = np.minimum(distances, np.linalg.norm(points - points[chosen], axis=1))
+    return [ids[i] for i in selected]
 
 
 def _write_init_pose_jsons(
@@ -304,6 +312,12 @@ def _require_gotrack_dependencies() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--backend", choices=("irls", "trifit", "legacy"), default="irls",
+                        help="Current MV-GoTrack IRLS (default), current tri-fit, or preserved legacy runtime.")
+    parser.add_argument("--gotrack-dir", default=None, help="Override the explicitly selected private runtime.")
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--observer-compile", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--warmup-steps", type=int, default=2)
     parser.add_argument("--capture-dir", required=True, help="Capture archive with cam_param/.")
     parser.add_argument("--video-dir", default=None,
                         help="Input AVI directory. Default: <capture-dir>/undistorted_video (required).")
@@ -353,10 +367,24 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    global GOTRACK_ROOT, GOTRACK_RUNNER, GOTRACK_PRIVATE_RUNNER, ANCHOR_GENERATOR
     args = parse_args()
+    latest = args.backend != "legacy"
+    GOTRACK_ROOT = (Path(args.gotrack_dir).expanduser().resolve() if args.gotrack_dir else
+                    LATEST_ROOT if latest else LEGACY_ROOT)
+    GOTRACK_PRIVATE_RUNNER = GOTRACK_ROOT / "archive/run_multiview_gotrack_anchor_online_multi_object.py"
+    ANCHOR_GENERATOR = GOTRACK_ROOT / "scripts/generate_anchor_bank.py"
+    GOTRACK_RUNNER = REPO_ROOT / ("src/process/run_gotrack_latest.py" if latest else
+                                  "src/process/run_gotrack_with_inline_undistort.py")
+    direct_reverse = latest or _supports_direct_reverse()
+    ckpt = Path(args.checkpoint).expanduser().resolve() if args.checkpoint else checkpoint_path(GOTRACK_ROOT)
+    if latest and (len(args.gpus) != 1 or args.camera_micro_batch_size):
+        raise ValueError("The latest runtime uses one GPU and a full view batch; use --backend legacy for sharding/micro-batches.")
+    if latest and args.num_anchors not in (128, 256):
+        raise ValueError("The latest rigid tracker supports 128 or 256 anchors")
     capture_dir = Path(args.capture_dir).expanduser().resolve()
     video_dir = (Path(args.video_dir).expanduser().resolve() if args.video_dir else
-                 capture_dir / "undistorted_video")
+                 capture_dir / ("videos" if args.inline_undistort else "undistorted_video"))
     mesh_path = Path(args.mesh).expanduser().resolve()
     init_pose_path = Path(args.init_pose).expanduser().resolve()
     if not capture_dir.is_dir() or not video_dir.is_dir() or not mesh_path.is_file() or not init_pose_path.is_file():
@@ -407,7 +435,9 @@ def main() -> int:
         "reverse_stop_frame_index": args.reverse_stop_frame_index,
         "bidirectional": args.bidirectional,
         "inline_undistort": args.inline_undistort,
-        "direct_reverse_supported": _supports_direct_reverse(),
+        "direct_reverse_supported": direct_reverse,
+        "backend": args.backend, "gotrack_dir": str(GOTRACK_ROOT), "checkpoint": str(ckpt),
+        "observer_compile": args.observer_compile, "warmup_steps": args.warmup_steps,
         "gpus": args.gpus, "camera_micro_batch_size": args.camera_micro_batch_size,
     }
     if args.dry_run:
@@ -436,10 +466,11 @@ def main() -> int:
         sys.executable, str(ANCHOR_GENERATOR), "--mesh-path", str(mesh_path),
         "--output-path", str(anchor_bank), "--num-anchors", str(args.num_anchors), "--mesh-scale", "1.0",
     ]
-    subprocess.run(generate_anchor_cmd, check=True, cwd=str(GOTRACK_ROOT))
+    if not latest:
+        subprocess.run(generate_anchor_cmd, check=True, cwd=str(GOTRACK_ROOT))
     track_common = [
         sys.executable, str(GOTRACK_RUNNER),
-        "--checkpoint-path", str(GOTRACK_ROOT / "gotrack_checkpoint.pt"), "--gpus", *args.gpus,
+        "--checkpoint-path", str(ckpt), "--gpus", *args.gpus,
         "--camera-ids", *selected, "--object-names", args.object_name, "--object-ids", "1",
         "--mesh-paths", str(mesh_path),
         "--anchor-bank-paths", str(anchor_bank), "--num-iters", "1",
@@ -454,17 +485,31 @@ def main() -> int:
         "--worker-mode", "auto", "--tri-fit-worker-mode", "process", "--triangulation-worker-mode", "auto",
         "--status-log-every", "50", "--debug-level", "0",
     ]
-    env = dict(os.environ, PYTHONUNBUFFERED="1", PYOPENGL_PLATFORM="egl", EGL_PLATFORM="surfaceless")
+    if latest:
+        track_common = [
+            sys.executable, str(GOTRACK_RUNNER), "--gotrack-dir", str(GOTRACK_ROOT),
+            "--backend", args.backend, "--checkpoint-path", str(ckpt), "--gpu", args.gpus[0],
+            "--camera-ids", *selected, "--object-name", args.object_name,
+            "--mesh-path", str(mesh_path), "--num-anchors", str(args.num_anchors),
+            "--first-frame-num-iters", str(args.first_frame_num_iters),
+            "--input-resize-scale", str(args.input_resize_scale), "--warmup-steps", str(args.warmup_steps),
+            "--observer-compile" if args.observer_compile else "--no-observer-compile",
+        ]
+    init_flag = "--init-pose-source" if latest else "--init-pose-sources"
+    env = dict(os.environ, PYTHONUNBUFFERED="1", PYOPENGL_PLATFORM="egl", EGL_PLATFORM="surfaceless",
+               AUTODEX_GOTRACK_ROOT=str(GOTRACK_ROOT))
     print("[gotrack] selected cameras:", " ".join(selected), flush=True)
     print("[gotrack] output:", output_dir, flush=True)
     forward_cmd = track_common + [
         "--input-root", str(forward_stage_dir), "--output-root", str(forward_output),
-        "--init-pose-sources", str(forward_init_dir), "--max-frames", str(args.max_frames),
+        init_flag, str(forward_init_dir), "--max-frames", str(args.max_frames),
     ]
-    if _supports_direct_reverse():
+    if direct_reverse:
         forward_cmd += ["--frame-begin", str(args.init_frame_index)]
     subprocess.run(forward_cmd, check=True, cwd=str(GOTRACK_ROOT), env=env)
     forward_records = forward_output / args.object_name / "world_pose_records.json"
+    if latest:
+        shutil.copy2(forward_output / args.object_name / "anchor_bank.npz", anchor_bank)
     if not args.bidirectional or args.init_frame_index == 0:
         final_records.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(forward_records, final_records)
@@ -472,7 +517,6 @@ def main() -> int:
         return 0
 
     try:
-        direct_reverse = _supports_direct_reverse()
         if direct_reverse:
             print(f"[gotrack] tracking original videos in reverse over "
                   f"{args.reverse_stop_frame_index}..{args.init_frame_index}", flush=True)
@@ -483,7 +527,7 @@ def main() -> int:
             _write_init_pose_jsons(reverse_init_dir, selected, pose, args.init_frame_index)
             reverse_cmd = track_common + [
                 "--input-root", str(reverse_stage_dir), "--output-root", str(reverse_output),
-                "--init-pose-sources", str(reverse_init_dir), "--max-frames", "-1",
+                init_flag, str(reverse_init_dir), "--max-frames", "-1",
                 "--frame-begin", str(args.reverse_stop_frame_index),
                 "--frame-end", str(args.init_frame_index), "--frame-order", "reverse",
             ]

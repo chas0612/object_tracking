@@ -113,6 +113,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture-dir", required=True)
     parser.add_argument("--object-mesh", required=True)
     parser.add_argument("--gotrack-records", required=True)
+    parser.add_argument("--articulation-json", help="Render moving-part geometry from each record's joint coordinate.")
+    parser.add_argument("--gotrack-dir", default=str(REPO_ROOT / "autodex/perception/thirdparty/MV-GoTrack-next"))
     parser.add_argument("--output", required=True, help="New .jpg/.jpeg/.png file; never overwritten.")
     parser.add_argument("--video-dir", default=None, help="Default: <capture-dir>/undistorted_video")
     parser.add_argument("--camera-ids", nargs="*", default=None)
@@ -204,17 +206,38 @@ def main() -> int:
         raise ValueError(f"Could not load mesh: {mesh_path}")
     selected_intrinsics = {serial: intrinsics[serial] for serial in serials}
     selected_extrinsics = {serial: extrinsics[serial] for serial in serials}
+    joint = None
+    if args.articulation_json:
+        sys.path.insert(0, str(Path(args.gotrack_dir).expanduser().resolve()))
+        from evaluation.dexycb_tracking.articulated import load_joint_spec
+        from utils.anchor_bank import fuse_articulated_parts
+        from utils.anchor_tracking import pose_anchors_at_joint_angle
+        joint = load_joint_spec(args.articulation_json)
+        mesh, moving_mask = fuse_articulated_parts(joint["parts"])
+        canonical_vertices = np.asarray(mesh.vertices, dtype=np.float32).copy()
+        joint_records = {int(row["frame_index"]): row for row in json.loads(records_path.read_text())}
     renderer = ObjectOverlayRenderer(mesh, selected_intrinsics, selected_extrinsics, height, width, alpha=args.alpha)
     cell_height = round(height * args.cell_width / width)
     rows: list[np.ndarray] = []
     for frame in frames:
+        coordinate = None
+        if joint is not None:
+            record = joint_records[max(i for i in joint_records if i <= frame)]
+            coordinate = record.get("joint_value", record.get("theta_rad"))
+            if coordinate is None:
+                raise ValueError(f"Frame {frame} has no joint coordinate")
+            vertices = pose_anchors_at_joint_angle(canonical_vertices, moving_mask.astype(np.int64),
+                joint["axis"], joint.get("origin", [0, 0, 0]), coordinate, joint_type=joint["joint_type"])
+            import torch
+            renderer.base_verts = torch.as_tensor(vertices, dtype=torch.float32, device=renderer.device)
         images = [
             _read_frame(video_paths[serial], frame, undistort_maps.get(serial))
             for serial in renderer.serials
         ]
         overlays = renderer.render(_pose_at(poses, frame), images)
         cells = [_label(cv2.resize(image, (args.cell_width, cell_height), interpolation=cv2.INTER_AREA),
-                        f"{serial}  f{frame}") for serial, image in zip(renderer.serials, overlays)]
+                        f"{serial}  f{frame}" + (f" q={coordinate:.3f}" if coordinate is not None else ""))
+                 for serial, image in zip(renderer.serials, overlays)]
         rows.append(np.concatenate(cells, axis=1))
     sheet = np.concatenate(rows, axis=0)
     output.parent.mkdir(parents=True, exist_ok=True)
