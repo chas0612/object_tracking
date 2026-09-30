@@ -88,6 +88,7 @@ def load_frame_inputs(capture_dir: Path, frame_dir: Path):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--gotrack-dir", default=str(REPO_ROOT / "autodex/perception/thirdparty/MV-GoTrack-next"))
     parser.add_argument("--capture-dir", required=True,
                         help="Capture episode containing cam_param/.")
     parser.add_argument("--frame-dir", default=None,
@@ -140,6 +141,8 @@ def main() -> int:
     parser.add_argument("--global-dino-inlier-threshold-px", type=float, default=10.0,
                         help="Soft reprojection threshold in FoundPose crop pixels.")
     args = parser.parse_args()
+    if args.gotrack_dir:
+        os.environ["AUTODEX_GOTRACK_ROOT"] = str(Path(args.gotrack_dir).expanduser().resolve())
     if args.per_view_candidates < 1:
         raise ValueError("--per-view-candidates must be positive")
     if args.pose_selection_mode == "global" and args.skip_silhouette:

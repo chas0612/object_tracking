@@ -1,0 +1,11 @@
+{
+  "upstream_sha": "842bdfeb61f7f15dd649172077cc72ad6a45d718",
+  "checkpoint_sha256": "f7d127abe2b8e37b1322a19115343286a6560700c6e02fc6080b4e2426a01086",
+  "submodules": {
+    "bop_toolkit": "78940aed90b48209818875b3b2454d2ce88fa835",
+    "dinov2": "e1277af2ba9496fbadf7aec6eba56e8d882d1e35"
+  },
+  "patches": ["MV-GoTrack-latest-capture.patch", "MV-GoTrack-latest-articulated.patch"],
+  "legacy_base_sha": "a9f033734c0bdf2d191265d22ea732a914c861f6",
+  "legacy_snapshot": "MV-GoTrack-legacy-runtime.patch"
+}

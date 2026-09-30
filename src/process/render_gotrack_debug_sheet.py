@@ -25,6 +25,17 @@ if str(REPO_ROOT) not in sys.path:
 from src.visualization.overlay_object_video_single import ObjectOverlayRenderer, load_cam_param
 
 
+VIDEO_SUFFIXES = (".avi", ".mp4", ".mov", ".mkv")
+
+
+def _video_paths_by_stem(video_dir: Path) -> dict[str, Path]:
+    paths: dict[str, Path] = {}
+    for suffix in VIDEO_SUFFIXES:
+        for path in sorted(video_dir.glob(f"*{suffix}")):
+            paths.setdefault(path.stem, path)
+    return paths
+
+
 def _load_poses(path: Path) -> dict[int, np.ndarray]:
     data = json.loads(path.read_text(encoding="utf-8"))
     poses: dict[int, np.ndarray] = {}
@@ -48,7 +59,9 @@ def _evenly_spaced(values: list[str], count: int) -> list[str]:
     return [values[index] for index in dict.fromkeys(indices)]
 
 
-def _read_frame(video_path: Path, index: int) -> np.ndarray:
+def _read_frame(
+    video_path: Path, index: int, undistort_maps: tuple[np.ndarray, np.ndarray] | None = None,
+) -> np.ndarray:
     cap = cv2.VideoCapture(str(video_path))
     try:
         if not cap.isOpened():
@@ -57,7 +70,28 @@ def _read_frame(video_path: Path, index: int) -> np.ndarray:
         ok, image = cap.read()
         if not ok:
             raise RuntimeError(f"Could not read frame {index} from {video_path}")
+        if undistort_maps is not None:
+            image = cv2.remap(
+                image, undistort_maps[0], undistort_maps[1],
+                interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+            )
         return image
+    finally:
+        cap.release()
+
+
+def _can_read_frames(video_path: Path, indices: list[int]) -> tuple[bool, str | None]:
+    """Probe every requested QA frame without retaining decoded images."""
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        if not cap.isOpened():
+            return False, "open failed"
+        for index in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ok, _ = cap.read()
+            if not ok:
+                return False, f"frame {index} unreadable"
+        return True, None
     finally:
         cap.release()
 
@@ -79,6 +113,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture-dir", required=True)
     parser.add_argument("--object-mesh", required=True)
     parser.add_argument("--gotrack-records", required=True)
+    parser.add_argument("--articulation-json", help="Render moving-part geometry from each record's joint coordinate.")
+    parser.add_argument("--gotrack-dir", default=str(REPO_ROOT / "autodex/perception/thirdparty/MV-GoTrack-next"))
     parser.add_argument("--output", required=True, help="New .jpg/.jpeg/.png file; never overwritten.")
     parser.add_argument("--video-dir", default=None, help="Default: <capture-dir>/undistorted_video")
     parser.add_argument("--camera-ids", nargs="*", default=None)
@@ -101,6 +137,10 @@ def main() -> int:
     records_path = Path(args.gotrack_records).expanduser().resolve()
     output = Path(args.output).expanduser().resolve()
     video_dir = Path(args.video_dir).expanduser().resolve() if args.video_dir else capture / "undistorted_video"
+    inline_undistort = False
+    if args.video_dir is None and not video_dir.is_dir():
+        video_dir = capture / "videos"
+        inline_undistort = True
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite {output}")
     if not capture.is_dir() or not mesh_path.is_file() or not records_path.is_file() or not video_dir.is_dir():
@@ -108,14 +148,6 @@ def main() -> int:
 
     poses = _load_poses(records_path)
     intrinsics, extrinsics = load_cam_param(capture / "cam_param")
-    available = sorted(path.stem for path in video_dir.glob("*.avi"))
-    candidates = [serial for serial in available if serial in intrinsics and serial in extrinsics]
-    serials = list(args.camera_ids) if args.camera_ids is not None else _evenly_spaced(candidates, args.max_cameras)
-    invalid = [serial for serial in serials if serial not in candidates]
-    if invalid:
-        raise ValueError(f"Unusable camera IDs: {invalid}")
-    if not serials:
-        raise RuntimeError("No usable camera videos")
     first, last = min(poses), max(poses)
     # Frame 0 can be a stale capture or a deliberately recovered reverse
     # prefix.  Default QA should start at frame 1 when it exists, while still
@@ -123,11 +155,49 @@ def main() -> int:
     default_first = 1 if first == 0 and last >= 1 else first
     frames = args.frame_indices or [default_first, (default_first + last) // 2, last]
     frames = list(dict.fromkeys(max(first, min(last, int(frame))) for frame in frames))
+
+    video_paths = _video_paths_by_stem(video_dir)
+    available = sorted(video_paths)
+    candidates = [serial for serial in available if serial in intrinsics and serial in extrinsics]
+    requested = list(args.camera_ids) if args.camera_ids is not None else candidates
+    invalid = [serial for serial in requested if serial not in candidates]
+    if invalid:
+        raise ValueError(f"Unusable camera IDs: {invalid}")
+    readable: list[str] = []
+    for serial in requested:
+        ok, reason = _can_read_frames(video_paths[serial], frames)
+        if ok:
+            readable.append(serial)
+        else:
+            print(f"[sheet] skipping camera {serial}: {reason}", flush=True)
+    serials = readable if args.camera_ids is not None else _evenly_spaced(readable, args.max_cameras)
+    if not serials:
+        raise RuntimeError(f"No camera videos readable at frames {frames}")
+
+    undistort_maps: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    if inline_undistort:
+        calibration = json.loads(
+            (capture / "cam_param" / "intrinsics.json").read_text(encoding="utf-8")
+        )
+        for serial in serials:
+            record = calibration[serial]
+            source_k = np.asarray(record["original_intrinsics"], dtype=np.float64).reshape(3, 3)
+            target_k = np.asarray(record["intrinsics_undistort"], dtype=np.float64).reshape(3, 3)
+            distortion = np.asarray(record.get("dist_params", []), dtype=np.float64).reshape(-1)
+            probe_cap = cv2.VideoCapture(str(video_paths[serial]))
+            width = int(probe_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(probe_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            probe_cap.release()
+            undistort_maps[serial] = cv2.initUndistortRectifyMap(
+                source_k, distortion, None, target_k, (width, height), cv2.CV_16SC2,
+            )
     print(f"[sheet] cameras={serials}; frames={frames}; output={output}")
     if args.dry_run:
         return 0
 
-    probe = _read_frame(video_dir / f"{serials[0]}.avi", frames[0])
+    probe = _read_frame(
+        video_paths[serials[0]], frames[0], undistort_maps.get(serials[0]),
+    )
     height, width = probe.shape[:2]
     mesh = trimesh.load(mesh_path, process=False)
     if isinstance(mesh, trimesh.Scene):
@@ -136,14 +206,38 @@ def main() -> int:
         raise ValueError(f"Could not load mesh: {mesh_path}")
     selected_intrinsics = {serial: intrinsics[serial] for serial in serials}
     selected_extrinsics = {serial: extrinsics[serial] for serial in serials}
+    joint = None
+    if args.articulation_json:
+        sys.path.insert(0, str(Path(args.gotrack_dir).expanduser().resolve()))
+        from evaluation.dexycb_tracking.articulated import load_joint_spec
+        from utils.anchor_bank import fuse_articulated_parts
+        from utils.anchor_tracking import pose_anchors_at_joint_angle
+        joint = load_joint_spec(args.articulation_json)
+        mesh, moving_mask = fuse_articulated_parts(joint["parts"])
+        canonical_vertices = np.asarray(mesh.vertices, dtype=np.float32).copy()
+        joint_records = {int(row["frame_index"]): row for row in json.loads(records_path.read_text())}
     renderer = ObjectOverlayRenderer(mesh, selected_intrinsics, selected_extrinsics, height, width, alpha=args.alpha)
     cell_height = round(height * args.cell_width / width)
     rows: list[np.ndarray] = []
     for frame in frames:
-        images = [_read_frame(video_dir / f"{serial}.avi", frame) for serial in renderer.serials]
+        coordinate = None
+        if joint is not None:
+            record = joint_records[max(i for i in joint_records if i <= frame)]
+            coordinate = record.get("joint_value", record.get("theta_rad"))
+            if coordinate is None:
+                raise ValueError(f"Frame {frame} has no joint coordinate")
+            vertices = pose_anchors_at_joint_angle(canonical_vertices, moving_mask.astype(np.int64),
+                joint["axis"], joint.get("origin", [0, 0, 0]), coordinate, joint_type=joint["joint_type"])
+            import torch
+            renderer.base_verts = torch.as_tensor(vertices, dtype=torch.float32, device=renderer.device)
+        images = [
+            _read_frame(video_paths[serial], frame, undistort_maps.get(serial))
+            for serial in renderer.serials
+        ]
         overlays = renderer.render(_pose_at(poses, frame), images)
         cells = [_label(cv2.resize(image, (args.cell_width, cell_height), interpolation=cv2.INTER_AREA),
-                        f"{serial}  f{frame}") for serial, image in zip(renderer.serials, overlays)]
+                        f"{serial}  f{frame}" + (f" q={coordinate:.3f}" if coordinate is not None else ""))
+                 for serial, image in zip(renderer.serials, overlays)]
         rows.append(np.concatenate(cells, axis=1))
     sheet = np.concatenate(rows, axis=0)
     output.parent.mkdir(parents=True, exist_ok=True)

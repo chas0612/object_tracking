@@ -1,5 +1,31 @@
 # Offline capture: FoundPose + GoTrack 설치 매뉴얼
 
+## 2026-09-30 최신 MV-GoTrack 경로
+
+현재 offline pipeline은 `autodex/perception/thirdparty/MV-GoTrack-next`의
+`842bdfeb61f7f15dd649172077cc72ad6a45d718`을 사용한다. 아래의 과거
+`a9f0337` checkout 절차는 **legacy runtime** 설치용이다. 최신 설치는
+[패치 적용 순서 및 재현 helper](../patches/MV-GoTrack-offline-capture.md)를 따른다.
+일반 rigid tracking은 `gotrack_capture.py --backend irls`가 기본이며
+`--backend trifit`과 `--backend legacy`도 제공한다. FoundPose 초기화와 mesh
+onboarding CLI도 최신 경로를 기본으로 쓰며 `--gotrack-dir`로 지정할 수 있다.
+
+```bash
+conda run -n gotrack python src/process/gotrack_capture.py \
+  --capture-dir /path/to/capture --inline-undistort \
+  --mesh /path/to/object.obj --init-pose /path/to/init_pose_world.npy \
+  --init-frame-index 30 --object-name object --backend irls \
+  --max-frames -1 --output-dir /path/to/new_tracking_result
+```
+
+`--inline-undistort`는 기본적으로 capture의 `videos/`를 읽는다. 이미 보정된
+`undistorted_video/`를 쓸 때는 해당 옵션을 생략한다. 최신 runtime은 1 GPU,
+카메라 전체 batch, 128/256 anchors를 사용한다. 기존 micro-batch/sharding 설정은
+`--backend legacy`에서 실행한다. mesh/capture 입력은 수정하지 않고 새 결과
+디렉터리만 만든다. GPU 추적 전 checkpoint·submodule·upstream SHA를 preflight로
+검사한다. live daemon/분산 observer와 과거 direct archive 스크립트는 기존
+`MV-GoTrack` 경로를 유지한다.
+
 이 문서는 capture archive 한 개에 대해 아래의 **offline** 파이프라인을 새 Linux PC에서
 재현하기 위한 기준 문서다. 실시간 daemon, planner, FoundationStereo,
 FoundationPose의 기존 `src/process/pose.py`는 범위 밖이다.

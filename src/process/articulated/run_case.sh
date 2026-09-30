@@ -4,6 +4,7 @@ set -Eeuo pipefail
 
 usage() {
     echo "Usage: $0 --capture-dir DIR --object NAME --seed-frame N --run-name NAME [options]"
+    echo "Options: --tracker-backend latest|legacy (default: latest)"
     echo "Options: --gpu N --budget-gib N --max-frames N --theta-min-deg N --theta-max-deg N"
     echo "         --joint-min M --joint-max M   sweep bounds for a PRISMATIC joint, in"
     echo "                        the mesh's units (metres here). The degree-denominated"
@@ -63,8 +64,10 @@ DIRECTION=both
 CAMERAS_ARG=""
 INPUT_RESIZE_SCALE=1.0
 CAMERA_MICRO_BATCH_SIZE=0
+TRACKER_BACKEND=latest
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --tracker-backend) TRACKER_BACKEND=$2; shift 2 ;;
         --capture-dir) CAPTURE_DIR=$2; shift 2 ;;
         --object) OBJECT=$2; shift 2 ;;
         --seed-frame) SEED_FRAME=$2; shift 2 ;;
@@ -137,7 +140,16 @@ fi
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 HERE="$REPO/src/process/articulated"
-GT="$REPO/autodex/perception/thirdparty/MV-GoTrack"
+if [[ "$TRACKER_BACKEND" == latest ]]; then
+    GT="$REPO/autodex/perception/thirdparty/MV-GoTrack-next"
+    if [[ "$CAMERA_MICRO_BATCH_SIZE" != 0 ]]; then
+        echo "Latest observer uses a full view batch; select --tracker-backend legacy for micro-batches" >&2; exit 2
+    fi
+elif [[ "$TRACKER_BACKEND" == legacy ]]; then
+    GT="$REPO/autodex/perception/thirdparty/MV-GoTrack"
+else
+    echo "--tracker-backend must be latest or legacy" >&2; exit 2
+fi
 CONDA_BIN=${CONDA_BIN:-$HOME/anaconda3/bin/conda}
 if [[ ! -x "$CONDA_BIN" ]]; then
     CONDA_BIN=$(command -v conda || true)
@@ -267,7 +279,8 @@ capture = sys.argv[1]
 param = os.path.join(capture, "cam_param")
 intrinsics = set(json.load(open(os.path.join(param, "intrinsics.json"))))
 extrinsics = set(json.load(open(os.path.join(param, "extrinsics.json"))))
-videos = {name[:-4] for name in os.listdir(os.path.join(capture, "undistorted_video"))
+video_dir = "undistorted_video" if os.path.isdir(os.path.join(capture, "undistorted_video")) else "videos"
+videos = {name[:-4] for name in os.listdir(os.path.join(capture, video_dir))
           if name.endswith(".avi")}
 print("\n".join(sorted(intrinsics & extrinsics & videos)))
 PYEOF
@@ -308,6 +321,20 @@ run_pass() {
     [[ -n "$THETA_EXTRAP" ]] && extrap+=(--theta-extrapolate-max-deg "$THETA_EXTRAP")
     [[ -n "$JOINT_EXTRAP" ]] && extrap+=(--joint-extrapolate-max "$JOINT_EXTRAP")
     [[ -n "$JOINT_ANCHORS" ]] && extrap+=(--joint-anchor-json "$JOINT_ANCHORS")
+    if [[ "$TRACKER_BACKEND" == latest ]]; then
+        "$CONDA_BIN" run -n gotrack --no-capture-output python -u \
+            "$REPO/src/process/run_gotrack_latest.py" \
+            --gotrack-dir "$GT" --backend trifit --gpu "$GPU" \
+            --input-root "$CAPTURE_DIR" --output-root "$out" \
+            --checkpoint-path "$GT/checkpoints/gotrack_checkpoint.pt" \
+            --object-name "$OBJECT" --mesh-path "$MESH" \
+            --init-pose-source "$INIT" --anchor-bank-path "$BANK" \
+            --articulation-json "$JOINT" --num-anchors 512 \
+            --input-resize-scale "$INPUT_RESIZE_SCALE" \
+            --frame-order "$order" "${span[@]}" "${extrap[@]}" \
+            --max-frames "$MAX_FRAMES" --camera-ids "${CAMERAS[@]}"
+        return
+    fi
     echo "[stage] articulated_gotrack ($order)"
     mkdir -p "$out"
     (

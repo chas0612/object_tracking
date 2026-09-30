@@ -1,5 +1,7 @@
 # Articulated (7-DoF) tracking pipeline
 
+Current `run_case.sh` defaults to the pinned `MV-GoTrack-next` observer plus articulated tri-fit. Use `--tracker-backend legacy` for the preserved archive runtime (including camera micro-batches). See [the current patch/reproduction contract](../../../patches/MV-GoTrack-offline-capture.md). The two older direct entry points `run_all_captures.sh` and `run_body_bootstrap.sh` retain the legacy runtime.
+
 Six degrees of freedom for the static parent plus one joint coordinate, per frame.
 The seed accepts both the legacy blue-box `measured` joint file and the promoted
 `parts` + `joints[]` mesh schema. Exactly one parent-child joint is required; a

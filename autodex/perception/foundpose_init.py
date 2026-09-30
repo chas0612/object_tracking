@@ -26,9 +26,14 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_GOTRACK_ROOT = Path(__file__).resolve().parent / "thirdparty/MV-GoTrack"
+_GOTRACK_ROOT = Path(os.environ.get(
+    "AUTODEX_GOTRACK_ROOT", str(Path(__file__).resolve().parent / "thirdparty/MV-GoTrack"))).resolve()
 if str(_GOTRACK_ROOT) not in sys.path:
     sys.path.insert(0, str(_GOTRACK_ROOT))
+for _dependency in ("bop_toolkit", "dinov2"):
+    _path = _GOTRACK_ROOT / "external" / _dependency
+    if _path.is_dir() and str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 
 def _foundpose_repre_path(assets_root: Path, dataset_name: str, object_id: int = 1) -> Path:

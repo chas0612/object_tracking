@@ -14,11 +14,12 @@ import importlib
 import json
 import os
 import sys
+import subprocess
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_GOTRACK_DIR = REPO_ROOT / "autodex" / "perception" / "thirdparty" / "MV-GoTrack"
+DEFAULT_GOTRACK_DIR = REPO_ROOT / "autodex" / "perception" / "thirdparty" / "MV-GoTrack-next"
 DEFAULT_CHECKPOINT_SHA256 = "f7d127abe2b8e37b1322a19115343286a6560700c6e02fc6080b4e2426a01086"
 
 # Several renderer imports transitively import matplotlib. Keep its cache out
@@ -71,48 +72,48 @@ def _run_sam3(args: argparse.Namespace, errors: list[str], checks: list[str]) ->
 
 def _run_gotrack(args: argparse.Namespace, errors: list[str], checks: list[str]) -> None:
     gotrack_dir = Path(args.gotrack_dir).expanduser().resolve()
+    latest = args.backend == "latest" or (args.backend == "auto" and
+                                          (gotrack_dir / "evaluation/dexycb_tracking/adapters.py").is_file())
     checkpoint = (Path(args.checkpoint).expanduser().resolve() if args.checkpoint else
-                  gotrack_dir / "gotrack_checkpoint.pt")
+                  gotrack_dir / ("checkpoints/gotrack_checkpoint.pt" if latest else "gotrack_checkpoint.pt"))
     runner = gotrack_dir / "run_multiview_gotrack_anchor_online_multi_object.py"
     patched_runner = gotrack_dir / "archive" / "run_multiview_gotrack_anchor_online_multi_object.py"
     renderer = gotrack_dir / "utils" / "renderer_nvdiffrast.py"
-    for path in (gotrack_dir, runner, patched_runner, renderer):
+    required = (gotrack_dir, renderer,
+                gotrack_dir / "evaluation/dexycb_tracking/adapters.py",
+                gotrack_dir / "configs/tracker/irls.json",
+                gotrack_dir / "scripts/onboard_custom_mesh_for_foundpose.py") if latest else (
+                    gotrack_dir, runner, patched_runner, renderer)
+    for path in required:
         if not path.exists():
             errors.append(f"missing required MV-GoTrack path: {path}")
-    runner_source = patched_runner.read_text(encoding="utf-8") if patched_runner.is_file() else ""
-    if runner_source and "--camera-micro-batch-size" not in runner_source:
+    if not latest and patched_runner.is_file() and "--camera-micro-batch-size" not in patched_runner.read_text(encoding="utf-8"):
         errors.append("MV-GoTrack micro-batch patch is not present in the runner")
     if args.require_articulated:
-        # Marker-based, like the micro-batch check above: the articulated patch is
-        # applied by hand to a private checkout, so nothing else can tell whether it
-        # is there. Without this an articulated run against an unpatched tree does not
-        # fail, it silently tracks the object as rigid at whatever angle it was seeded
-        # with -- which looks like a plausible result.
-        for marker, description in (
-            ("--theta-extrapolate-max-deg", "joint-angle prediction"),
-            ("--articulation-json", "articulation wiring"),
-            # Prismatic support ships in the same patch. An older articulated patch
-            # would accept a prismatic joint file and track the object as a hinge at
-            # a fixed angle -- the same silent-success failure the checks above guard
-            # against, one joint type down.
-            ("--joint-extrapolate-max", "prismatic joint support"),
-        ):
-            if runner_source and marker not in runner_source:
-                errors.append(
-                    f"MV-GoTrack articulated patch is not present in the runner "
-                    f"({description}: {marker} missing)")
-        geometry = gotrack_dir / "utils" / "multiview_geometry.py"
-        if geometry.is_file():
-            geometry_source = geometry.read_text(encoding="utf-8")
-            for symbol in ("robust_fit_articulated_pose_from_anchors",
-                           "reject_wrong_surface_anchors",
+        target = (gotrack_dir / "evaluation/dexycb_tracking/articulated.py" if latest else patched_runner)
+        if not target.is_file():
+            errors.append(f"Missing articulated runtime: {target}")
+        elif not latest:
+            for marker in ("--articulation-json", "--joint-extrapolate-max", "--frame-order", "--joint-anchor-json"):
+                if marker not in target.read_text():
+                    errors.append(f"Legacy articulated runtime missing {marker}")
+    if latest:
+        head = subprocess.run(["git", "-C", str(gotrack_dir), "rev-parse", "HEAD"], capture_output=True, text=True)
+        if head.returncode or head.stdout.strip() != "842bdfeb61f7f15dd649172077cc72ad6a45d718":
+            errors.append("Latest MV-GoTrack must be pinned at 842bdfeb61f7f15dd649172077cc72ad6a45d718")
+        if args.require_articulated:
+            geometry = gotrack_dir / "utils/multiview_geometry.py"
+            source = geometry.read_text() if geometry.is_file() else ""
+            for symbol in ("robust_fit_articulated_pose_from_anchors", "reject_wrong_surface_anchors",
                            "fit_joint_displacement_weighted"):
-                if symbol not in geometry_source:
-                    errors.append(
-                        f"MV-GoTrack articulated patch is incomplete: {symbol} missing "
-                        f"from {geometry.name}")
-        else:
-            errors.append(f"missing required MV-GoTrack path: {geometry}")
+                if symbol not in source:
+                    errors.append(f"Articulated patch missing {symbol}")
+        for name, sha in (("bop_toolkit", "78940aed90b48209818875b3b2454d2ce88fa835"),
+                          ("dinov2", "e1277af2ba9496fbadf7aec6eba56e8d882d1e35")):
+            path = gotrack_dir / "external" / name
+            result = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True, text=True)
+            if result.returncode or result.stdout.strip() != sha:
+                errors.append(f"{name} must be initialized at {sha}")
     if not checkpoint.is_file():
         errors.append(f"missing GoTrack checkpoint: {checkpoint}")
     elif args.checkpoint_sha256:
@@ -123,6 +124,9 @@ def _run_gotrack(args: argparse.Namespace, errors: list[str], checks: list[str])
 
     if str(gotrack_dir) not in sys.path:
         sys.path.insert(0, str(gotrack_dir))
+    for dependency in ("bop_toolkit", "dinov2"):
+        path = gotrack_dir / "external" / dependency
+        sys.path.insert(0, str(path))
     for name in (
         "torch", "torchvision", "cv2", "numpy", "trimesh", "nvdiffrast.torch",
         "hydra", "omegaconf", "pytorch_lightning", "faiss", "kornia", "open3d",
@@ -147,14 +151,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--component", choices=("gotrack", "sam3"), required=True)
     parser.add_argument("--gotrack-dir", default=str(DEFAULT_GOTRACK_DIR))
+    parser.add_argument("--backend", choices=("auto", "latest", "legacy"), default="auto")
+    parser.add_argument("--require-articulated", action="store_true")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--checkpoint-sha256", default=DEFAULT_CHECKPOINT_SHA256,
                         help="Pass an empty string to skip checksum validation.")
     parser.add_argument("--require-repo-sam3", action="store_true",
                         help="Fail if SAM3 is not imported from this repository's thirdparty checkout.")
-    parser.add_argument("--require-articulated", action="store_true",
-                        help=("Also require patches/MV-GoTrack-articulated.patch to be applied. "
-                              "Only the 7-DoF articulated pipeline needs it; 6-DoF runs do not."))
     parser.add_argument("--json", action="store_true", help="Print a machine-readable report.")
     args = parser.parse_args()
     errors: list[str] = []
