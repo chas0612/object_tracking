@@ -63,9 +63,11 @@ def shared_window(camera: Camera, articulation: Articulation,
 
 def mesh_overlay(image: np.ndarray, camera: Camera, articulation: Articulation,
                  pose: np.ndarray, theta: float, crop: bool = True,
-                 window: tuple[int, int, int, int] | None = None) -> np.ndarray:
+                 window: tuple[int, int, int, int] | None = None,
+                 scene=None, rendered=None) -> np.ndarray:
     """One view: the photograph with the posed mesh shaded over it and outlined."""
-    rendered = _render(_scene(articulation, pose, theta), camera)
+    if rendered is None:
+        rendered = _render(_scene(articulation, pose, theta) if scene is None else scene, camera)
     parts = rendered["parts"]
     canvas = cv2.resize(image, (camera.width, camera.height)).astype(np.float32)
 

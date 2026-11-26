@@ -16,6 +16,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent))
 from common import load_articulation, load_articulation_from_joint, load_cameras  # noqa: E402
 from render_overlay import mesh_overlay  # noqa: E402
+from make_synthetic import _scene  # noqa: E402
 
 
 DEFAULT_VIEWS = ["25452066", "22641023", "23263775", "23028333"]
@@ -42,6 +43,8 @@ def main() -> int:
     parser.add_argument("--max-frames", type=int, default=-1,
                         help="Render only the first N valid poses; -1 renders all.")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--include-held-poses", action="store_true",
+                        help="Keep finite fallback poses, visibly labelled, to preserve source frame alignment.")
     args = parser.parse_args()
 
     if not args.views:
@@ -58,7 +61,9 @@ def main() -> int:
     records_path = args.run_dir / args.object / "world_pose_records.json"
     records = json.loads(records_path.read_text(encoding="utf-8"))
     records = [row for row in records
-               if row.get("status") == "ok" and row.get("pose_world") is not None]
+               if (row.get("status") == "ok" or args.include_held_poses)
+               and row.get("pose_world") is not None
+               and np.isfinite(np.asarray(row['pose_world'])).all()]
     if not records:
         raise ValueError(f"No valid poses in {records_path}")
     if args.max_frames >= 0:
@@ -94,8 +99,17 @@ def main() -> int:
             if distortion.size not in (4, 5, 8, 12, 14) or not np.isfinite(distortion).all():
                 raise ValueError(f"{args.distortion_npy}: invalid OpenCV distortion vector")
 
-    video_dir = args.capture_dir / "undistorted_video"
-    captures = {cid: cv2.VideoCapture(str(video_dir / f"{cid}.avi")) for cid in args.views}
+    inline_reader = None
+    if (args.capture_dir / "inline_undistort.json").is_file():
+        if dynamic_requested:
+            raise ValueError("Inline undistortion currently supports static calibrated cameras only")
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+        from autodex.tracking.latest_gotrack import CaptureReader
+        inline_reader = CaptureReader(args.capture_dir, args.views, args.scale)
+        captures = {}
+    else:
+        video_dir = args.capture_dir / "undistorted_video"
+        captures = {cid: cv2.VideoCapture(str(video_dir / f"{cid}.avi")) for cid in args.views}
     unopened = [cid for cid, capture in captures.items() if not capture.isOpened()]
     if unopened:
         raise FileNotFoundError(f"Cannot open undistorted videos for {unopened}")
@@ -121,15 +135,20 @@ def main() -> int:
             frame_index = int(row["frame_index"])
             pose = np.asarray(row["pose_world"], dtype=np.float64)
             theta = float(row.get("joint_value", row.get("theta_rad", 0.0)))
+            frame_scene = _scene(articulation, pose, theta)
+            inline_images = (inline_reader.read(frame_index) if inline_reader is not None else None)
             panels = []
-            for camera_id in args.views:
-                capture = captures[camera_id]
-                if next_frames[camera_id] != frame_index:
-                    capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-                ok, image = capture.read()
-                if not ok:
-                    raise RuntimeError(f"Cannot read {camera_id} frame {frame_index}")
-                next_frames[camera_id] = frame_index + 1
+            for view_index, camera_id in enumerate(args.views):
+                if inline_images is not None:
+                    image = cv2.cvtColor(inline_images[view_index], cv2.COLOR_RGB2BGR)
+                else:
+                    capture = captures[camera_id]
+                    if next_frames[camera_id] != frame_index:
+                        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                    ok, image = capture.read()
+                    if not ok:
+                        raise RuntimeError(f"Cannot read {camera_id} frame {frame_index}")
+                    next_frames[camera_id] = frame_index + 1
                 camera = cameras[camera_id]
                 if camera_id == args.dynamic_camera_id:
                     camera = type(camera)(
@@ -144,11 +163,17 @@ def main() -> int:
                                            interpolation=cv2.INTER_AREA)
                         image = cv2.undistort(image, camera.K, distortion, None, camera.K)
                 panel = mesh_overlay(image, camera, articulation,
-                                     pose, theta, crop=False)
+                                     pose, theta, crop=False, scene=frame_scene)
                 if panel.shape[1] != tile_w or panel.shape[0] != tile_h:
                     panel = cv2.resize(panel, (tile_w, tile_h))
                 cv2.putText(panel, f"{camera_id}  f{frame_index}", (8, 24),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+                held = " (held)" if row.get("theta_observed") is False else ""
+                label = f"joint {articulation.display(theta):.1f} {articulation.joint_unit}{held}"
+                if row.get('status') != 'ok': label += f" [{row.get('status', 'unknown')}]"
+                color = (0, 80, 255) if row.get('status') != 'ok' else (255, 255, 255)
+                cv2.putText(panel, label, (8, tile_h - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
                 panels.append(panel)
             blank = np.zeros((tile_h, tile_w, 3), dtype=np.uint8)
             panels.extend(blank.copy() for _ in range(columns * rows - len(panels)))
@@ -159,6 +184,8 @@ def main() -> int:
         writer.release()
         for capture in captures.values():
             capture.release()
+        if inline_reader is not None:
+            inline_reader.close()
 
     print(f"wrote {len(records)} frames to {args.output}", flush=True)
     return 0
