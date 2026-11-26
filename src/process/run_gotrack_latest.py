@@ -26,7 +26,11 @@ def main():
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--num-anchors", type=int, default=256)
     parser.add_argument("--articulation-json")
+    parser.add_argument("--articulated-stability-profile", type=Path,
+                        help="Opt-in bounded joint/body fit and explicit body quality gates (JSON).")
     parser.add_argument("--anchor-bank-path")
+    parser.add_argument("--body-flow-bootstrap", action="store_true",
+                        help="Opt-in real-RGB static-anchor LK/multiview body motion prior.")
     parser.add_argument("--init-joint-value", type=float)
     parser.add_argument("--joint-anchor-json")
     parser.add_argument("--theta-extrapolate-max-deg", type=float)
@@ -50,6 +54,11 @@ def main():
         parser.error("--official-config must name an existing JSON file")
     if args.articulation_json and args.backend != "trifit":
         parser.error("Articulated tracking requires --backend trifit")
+    if args.body_flow_bootstrap and not args.articulation_json:
+        parser.error('--body-flow-bootstrap requires articulation')
+    if args.articulated_stability_profile is not None:
+        if not args.articulation_json or not args.articulated_stability_profile.is_file():
+            parser.error("--articulated-stability-profile requires articulation and an existing JSON file")
     if not args.articulation_json and args.num_anchors not in (128, 256):
         parser.error("Rigid tracking supports 128 or 256 anchors")
     if not args.articulation_json and (args.joint_residual_ratio is not None or args.min_moving_anchors is not None or args.max_joint_step_deg is not None):

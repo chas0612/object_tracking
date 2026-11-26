@@ -277,6 +277,11 @@ def run_capture(args):
             # Optional per-run observation gates, not changes to the runtime or
             # its defaults. Rigid trackers never consume these parameters.
             cfg.update(joint_observation_overrides(args))
+            if getattr(args, 'body_flow_bootstrap', False): cfg['body_flow_bootstrap'] = True
+            stability = getattr(args, "articulated_stability_profile", None)
+            if stability is not None:
+                cfg['articulated_stability'] = json.loads(Path(stability).read_text())
+                write_json(output / 'articulated_stability_profile.json', cfg['articulated_stability'])
             step_cap = getattr(args, "max_joint_step_deg", None)
             if step_cap is not None:
                 if not hinge:
@@ -296,12 +301,27 @@ def run_capture(args):
                                    bridge_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                                    joint_step_guard_sha256=(hashlib.sha256(
                                        Path(__file__).with_name("joint_step_guard.py").read_bytes()).hexdigest()
-                                       if cfg.get("max_joint_step_deg") is not None else None)))
+                                       if cfg.get("max_joint_step_deg") is not None else None),
+                                   articulated_stability_sha256=(hashlib.sha256(
+                                       Path(__file__).with_name('articulated_stability.py').read_bytes()).hexdigest()
+                                       if 'articulated_stability' in cfg else None),
+                                   robust_rays_sha256=(hashlib.sha256(
+                                       Path(__file__).with_name('robust_rays.py').read_bytes()).hexdigest()
+                                       if cfg.get('articulated_stability',{}).get('robust_ray_consensus') else None),
+                                   body_flow_bootstrap_sha256=(hashlib.sha256(
+                                       Path(__file__).with_name('body_flow_bootstrap.py').read_bytes()).hexdigest()
+                                       if cfg.get('body_flow_bootstrap') else None)))
         write_json(output / "adapter_config.json", cfg)
         with working_directory(root):
             adapter = adapter_cls(cfg)
             t = time.perf_counter()
             adapter.initialize(1, Path(args.mesh_path), reader.K, reader.T_c_w)
+            stability_backend = None
+            if articulated and 'articulated_stability' in cfg:
+                from autodex.tracking.articulated_stability import StableArticulatedBackend
+                stability_backend = StableArticulatedBackend(
+                    adapter, cfg['articulated_stability'], output / 'stability_diagnostics')
+                adapter._fusion_backend = stability_backend
             if articulated and getattr(args, "max_joint_step_deg", None) is not None:
                 from autodex.tracking.joint_step_guard import JointStepGuard
                 adapter._fusion_backend = JointStepGuard(
@@ -322,15 +342,34 @@ def run_capture(args):
             adapter.synchronize()
             warmup_sec = time.perf_counter() - t
             adapter.reset()
+            if stability_backend is not None:
+                stability_backend.reset_support_history()
+            bootstrap = None
+            if cfg.get('body_flow_bootstrap', False):
+                from autodex.tracking.body_flow_bootstrap import BodyFlowBootstrap
+                bootstrap = BodyFlowBootstrap(adapter, reader.K, reader.T_c_w,
+                    visible_only=cfg.get('articulated_stability',{}).get('body_flow_visible_only',False),
+                    min_views=int(cfg.get('articulated_stability',{}).get('min_view_support',2)))
             for step, index in enumerate(indices):
                 if articulated:
                     adapter.set_frame(index)
                 images = seed_images if step == 0 else reader.read(index, args.frame_order == "reverse")
+                flow_health = {}
+                if bootstrap is not None:
+                    proposal, flow_health = bootstrap.propose(images)
+                    if proposal is not None: prior = proposal
+                if articulated and 'articulated_stability' in cfg:
+                    adapter.flow_prior_health=flow_health.copy()
                 adapter.synchronize()
                 t = time.perf_counter()
                 for _ in range(max(1, args.first_frame_num_iters) if step == 0 else 1):
                     result = adapter.step(images, reader.K, reader.T_c_w, prior)
                     prior = homogeneous(result.pose_T_w_o)
+                if stability_backend is not None:
+                    stability_backend.commit_support(result.status,result.health)
+                result.health.update(flow_health)
+                if bootstrap is not None:
+                    bootstrap.update(images, prior)
                 adapter.synchronize()
                 latency = (time.perf_counter() - t) * 1000
                 records.append(world_record(index, reader.fps, prior, result, latency))

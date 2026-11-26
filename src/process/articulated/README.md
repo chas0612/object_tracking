@@ -7,6 +7,127 @@ The seed accepts both the legacy blue-box `measured` joint file and the promoted
 `parts` + `joints[]` mesh schema. Exactly one parent-child joint is required; a
 multi-joint file is rejected rather than partially tracked.
 
+## Opt-in articulated stability checks (latest runtime)
+
+`run_case.sh --articulated-stability-profile FILE --body-flow-bootstrap` enables
+the experimental public-bridge stability path. Neither option is enabled by
+default; the private MV-GoTrack runtime and rigid tracking are not edited by
+this path. It does not run FoundationStereo on each frame.
+
+The stability fit bounds the joint inside each alternating body/joint solve,
+refits the body at the returned coordinate, trims/refits outliers, and checks
+static support, total support, residuals and body motion before accepting a
+candidate. Individual camera rays incompatible with the current search prior
+are removed before triangulation; this is a local search gate, not proof that
+the remaining correspondences are correct. A soft rotation prior helps when
+the static part is nearly a line and roll is weakly observable.
+
+An additional opt-in `flow_consistency_gate: true` checks a 3D body's correction
+against the independent RGB-flow prior, but only when LK triangulation has at
+least `min_flow_inliers` (default 60) inliers. The limits are
+`max_flow_correction_m` (default 0.008 m) and `max_flow_correction_deg` (default
+10 degrees). This addresses cases where flow measures a nearly stationary tool
+but accepted 3D fits walk it 10--15 mm every frame, below the older 50 mm gate.
+A disagreement rejects the 3D measurement; the actual flow-prior fallback and
+held joint remain visibly labelled, not silently converted to measured poses.
+This is not proof that LK tracked the correct surface and can introduce lag if
+the flow prior itself underestimates true motion. It is disabled by default.
+
+`part_support_gate: true` additionally compares each part's current inlier count
+with a causal median of recent accepted support. `min_static_support_ratio` and
+`min_moving_support_ratio` default to 0.4. A static-support collapse rejects the
+body measurement (`static_support_drop`); a moving-support collapse holds the
+previous joint, refits the body from static anchors and reports `theta_rejected`
+with `joint_rejection_reason=moving_support_drop`. Absolute support/RMS gates
+still apply. A held joint is not a successful 7-DoF measurement.
+
+The history contains at most `support_reference_window` (default 20) accepted
+frames per part. Measurements below `support_reference_update_ratio` (default
+0.8) of their reference do not update it; rejected bodies and held joints never
+teach the corresponding reference. Warmup history is cleared, repeated same-frame
+fits count once, and forward/reverse processes bootstrap independently. No future
+frame is consulted. The first accepted state establishes support, not accuracy.
+Legitimate visibility changes can trigger rejection and cause lag; coherent wrong
+matches with high support still pass. The option is disabled by default.
+
+New logs distinguish `body_observed` from `theta_observed`, and retain reference,
+retention and candidate counts. Inlier support-view/parallax summaries are saved
+per part. Diagnostic NPZs include aligned anchor IDs, support-view counts and ray
+angles for rejected bodies/held joints; these are measured support statistics,
+not a declaration that the correspondence identities are correct.
+
+Two additional experimental profile switches act **before** pose fitting:
+`ray_confidence_gate: true` drops individual observations below
+`ray_min_confidence` (default 0.2); `robust_ray_consensus: true` replaces
+all-ray least squares with deterministic full-set/pair hypotheses and a
+confidence-weighted camera-ray consensus. Both are **disabled by default**.
+Consensus requires `min_view_support` cameras, nondegenerate parallax
+(`consensus_min_angle_deg`, default 10 degrees), and at least
+`consensus_min_weight_fraction` (default 0.55) of the input confidence mass.
+Inlier rays are within `consensus_ray_mm` (default 8 mm) and are refitted;
+insufficient/ambiguous support is dropped, not replaced by prior-generated
+points. Residuals are confidence-weighted over the retained real observations.
+All public lengths are converted at the external-unit boundary, including
+prismatic metre/millimetre inputs. No per-frame stereo depth is added.
+
+Consensus input/kept-ray counts and rejected observations by internal camera
+index are recorded in `health`; use registration `camera_ids` to resolve serials.
+The new module hash is captured in `registration.json`. Camera/anchor support
+still does not establish correct object identity: coherent hand/background or
+cross-part matches can survive, and stricter consensus can discard correct
+noisy measurements.
+
+This profile replaces the legacy triangulation fusion fit. It now also applies
+the upstream surface-identity check before fitting, and checks the moving/static
+median residual ratio before declaring a joint measurement. Configure these
+with `wrong_surface_margin_m` (default 0.02 m) and `part_residual_ratio` (default
+3); `--joint-residual-ratio` is not consulted inside this backend. A rejected
+joint is held at its previous value and only the body is refitted. Candidate
+clamping is recorded separately from the returned held joint. The minimum
+moving-anchor setting still controls whether the joint is observable.
+
+Optional `body_from_static: true` estimates the body from static-part anchors
+only, then solves the moving-part joint. `min_view_support` raises the minimum
+number of views per triangulated anchor. `body_flow_visible_only: true` removes
+mesh-self-occluded LK anchors using a sampled z-buffer. It does **not** detect
+external hand occlusion. Thin tools can still produce coherent wrong matches,
+even with a small triangulation/fit residual; these checks are not recovery from
+an incorrect absolute pose.
+
+The optional body bootstrap uses static-part anchors, real-image forward/backward
+LK flow, multiview triangulation and a rigid fit to propose the next body/crop
+prior. It can fail or drift under occlusion; it is not an absolute pose estimator.
+Rejected articulated measurements keep their real fallback/held status. Inspect
+`health` in `world_pose_records.json`, not only completion markers.
+
+An example profile, with all lengths explicitly named by unit:
+
+```json
+{
+  "rotation_prior_radius_m": 0.008,
+  "min_static_inliers": 12,
+  "min_total_inliers": 20,
+  "min_inlier_fraction": 0.3,
+  "max_inlier_rms_mm": 12,
+  "max_body_rotation_deg": 35,
+  "max_body_translation_m": 0.05,
+  "fit_inlier_mm": 18,
+  "max_triangulation_residual_mm": 15,
+  "ray_prior_distance_m": 0.035,
+  "iterations": 60
+}
+```
+
+These parameters are tuning values, not a guarantee across objects or cameras.
+Joint limits still come from the joint file. A wrong end-for-end initial seed
+cannot be repaired merely by smoothing the trajectory: check the rendered joint
+origin against the physical hinge/spring before accepting a long run.
+
+Reported `mean_step_ms` excludes decode/remap/resize and the bootstrap proposal;
+`wall_sec` includes those costs.
+
+## Joint initialization and sparse depth
+
 **Both joint types are seeded here.** `real_hybrid.py` sweeps the joint coordinate in
 whatever unit that joint has — degrees for a hinge, millimetres for a slide — ranks
 FoundationPose proposals by multi-view silhouette IoU at each, and writes

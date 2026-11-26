@@ -23,6 +23,8 @@ usage() {
     echo "                        optional joint observation gates; defaults remain unchanged."
     echo "         --max-joint-step-deg N (latest only, opt-in revolute update rejection)"
     echo "         --first-frame-num-iters N (latest only, default: 5)"
+    echo "         --articulated-stability-profile FILE (latest only, opt-in JSON)"
+    echo "         --body-flow-bootstrap (latest only, opt-in real-RGB motion prior)"
     echo "         --joint-anchors FILE   depth-measured joint values to pin at named"
     echo "                        frames (make_joint_anchors.py). Second pass only:"
     echo "                        it needs body poses from a completed run."
@@ -75,6 +77,8 @@ JOINT_RESIDUAL_RATIO=""
 MIN_MOVING_ANCHORS=""
 MAX_JOINT_STEP_DEG=""
 FIRST_FRAME_NUM_ITERS=5
+STABILITY_PROFILE=""
+BODY_FLOW_BOOTSTRAP=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --tracker-backend) TRACKER_BACKEND=$2; shift 2 ;;
@@ -106,11 +110,13 @@ while [[ $# -gt 0 ]]; do
         --min-moving-anchors) MIN_MOVING_ANCHORS=$2; shift 2 ;;
         --max-joint-step-deg) MAX_JOINT_STEP_DEG=$2; shift 2 ;;
         --first-frame-num-iters) FIRST_FRAME_NUM_ITERS=$2; shift 2 ;;
+        --articulated-stability-profile) STABILITY_PROFILE=$2; shift 2 ;;
+        --body-flow-bootstrap) BODY_FLOW_BOOTSTRAP=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
-if [[ "$TRACKER_BACKEND" != latest && ( -n "$JOINT_RESIDUAL_RATIO" || -n "$MIN_MOVING_ANCHORS" || -n "$MAX_JOINT_STEP_DEG" || "$FIRST_FRAME_NUM_ITERS" != 5 ) ]]; then
+if [[ "$TRACKER_BACKEND" != latest && ( -n "$JOINT_RESIDUAL_RATIO" || -n "$MIN_MOVING_ANCHORS" || -n "$MAX_JOINT_STEP_DEG" || -n "$STABILITY_PROFILE" || "$BODY_FLOW_BOOTSTRAP" == 1 || "$FIRST_FRAME_NUM_ITERS" != 5 ) ]]; then
     echo "Joint observation gates and first-frame iterations require --tracker-backend latest" >&2
     exit 2
 fi
@@ -343,6 +349,8 @@ run_pass() {
     [[ -n "$JOINT_RESIDUAL_RATIO" ]] && extrap+=(--joint-residual-ratio "$JOINT_RESIDUAL_RATIO")
     [[ -n "$MIN_MOVING_ANCHORS" ]] && extrap+=(--min-moving-anchors "$MIN_MOVING_ANCHORS")
     [[ -n "$MAX_JOINT_STEP_DEG" ]] && extrap+=(--max-joint-step-deg "$MAX_JOINT_STEP_DEG")
+    [[ -n "$STABILITY_PROFILE" ]] && extrap+=(--articulated-stability-profile "$STABILITY_PROFILE")
+    [[ "$BODY_FLOW_BOOTSTRAP" == 1 ]] && extrap+=(--body-flow-bootstrap)
     if [[ "$TRACKER_BACKEND" == latest ]]; then
         "$CONDA_BIN" run -n gotrack --no-capture-output python -u \
             "$REPO/src/process/run_gotrack_latest.py" \
