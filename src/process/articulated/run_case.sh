@@ -10,9 +10,10 @@ usage() {
     echo "                        the mesh's units (metres here). The degree-denominated"
     echo "                        flags above are refused on a sliding joint, not"
     echo "                        reinterpreted, and vice versa."
-    echo "         --joint FILE   articulation file for the tracker (default: the mesh's)"
+    echo "         --joint FILE   articulation file for seed and tracker (default: the mesh's)"
     echo "         --mesh FILE    fused mesh override (default: ~/shared_data/mesh_new/NAME/NAME.obj)"
     echo "         --external-init-pose FILE --external-init-joint-value FILE"
+    echo "         --external-init-source TEXT (provenance label; not an accuracy claim)"
     echo "                        calibrated 6-DoF pose and scalar joint .npy files. This"
     echo "                        bypasses FoundationPose/stereo and evaluates tracking only."
     echo "         --direction both|forward|reverse   (default: both)"
@@ -60,6 +61,7 @@ JOINT_OVERRIDE=""
 MESH_OVERRIDE=""
 EXTERNAL_INIT_POSE=""
 EXTERNAL_INIT_JOINT=""
+EXTERNAL_INIT_SOURCE="externally supplied articulated state; accuracy unverified"
 DIRECTION=both
 CAMERAS_ARG=""
 INPUT_RESIZE_SCALE=1.0
@@ -87,6 +89,7 @@ while [[ $# -gt 0 ]]; do
         --mesh) MESH_OVERRIDE=$2; shift 2 ;;
         --external-init-pose) EXTERNAL_INIT_POSE=$2; shift 2 ;;
         --external-init-joint-value) EXTERNAL_INIT_JOINT=$2; shift 2 ;;
+        --external-init-source) EXTERNAL_INIT_SOURCE=$2; shift 2 ;;
         --direction) DIRECTION=$2; shift 2 ;;
         --cameras) CAMERAS_ARG=$2; shift 2 ;;
         --input-resize-scale) INPUT_RESIZE_SCALE=$2; shift 2 ;;
@@ -237,7 +240,7 @@ elif [[ ! -f "$HYBRID" ]]; then
         cd "$REPO"
         CUDA_VISIBLE_DEVICES="$GPU" "$CONDA_BIN" run -n object_6d --no-capture-output \
             python -u "$HERE/real_hybrid.py" \
-            --capture-dir "$CAPTURE_DIR" --frames "$SEED_FRAME" --object "$OBJECT" \
+            --capture-dir "$CAPTURE_DIR" --frames "$SEED_FRAME" --object "$OBJECT" --joint "$JOINT" \
             --output-root "$PROBE_ROOT" --refine-pairs 2 --budget-gib "$BUDGET_GIB" \
             "${theta_args[@]}"
     )
@@ -255,7 +258,7 @@ if [[ ${init_count:-0} -lt 1 && -n "$EXTERNAL_INIT_POSE" ]]; then
         "$HERE/make_external_gotrack_init.py" \
         --capture-dir "$CAPTURE_DIR" --frame-index "$SEED_FRAME" \
         --pose-npy "$EXTERNAL_INIT_POSE" --joint-value-npy "$EXTERNAL_INIT_JOINT" \
-        --joint-json "$JOINT" --out "$INIT"
+        --joint-json "$JOINT" --out "$INIT" --source "$EXTERNAL_INIT_SOURCE"
 elif [[ ${init_count:-0} -lt 1 ]]; then
     echo "[stage] gotrack_init"
     "$CONDA_BIN" run -n object_6d --no-capture-output python -u "$HERE/make_gotrack_init.py" \

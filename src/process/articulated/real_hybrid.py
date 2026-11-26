@@ -79,7 +79,7 @@ FP_ROOT = Path(os.environ.get(
     "FOUNDATIONPOSE_ROOT",
     REPO_ROOT / "autodex/perception/thirdparty/FoundationPose"))
 
-from common import (joint_grid, load_articulation, load_cameras,  # noqa: E402
+from common import (joint_grid, load_articulation, load_articulation_from_joint, load_cameras,  # noqa: E402
                     theta_grid)
 from depth_joint import DepthJointObjective  # noqa: E402
 from fit_rc import SilhouetteObjective, _from_pose, _to_pose  # noqa: E402
@@ -422,8 +422,14 @@ def _solve_frame(args, frame_index: int, articulation, full_cameras, estimators)
             continue
         mask = cv2.resize(mask_full, (camera.width, camera.height),
                           interpolation=cv2.INTER_AREA) > 127
+        # Prepared single-frame RGB and masks share intrinsics_undistort. This
+        # also supports inline remapping without storing a full corrected AVI.
+        prepared_bgr = (cv2.imread(str(frame_dir / "images" / f"{camera_id}.png"))
+                        if (args.capture_dir / "inline_undistort.json").is_file() else None)
+        if prepared_bgr is None:
+            prepared_bgr = _read_frame(video_dir / f"{camera_id}.avi", frame_index)
         rgb = cv2.cvtColor(cv2.resize(
-            _read_frame(video_dir / f"{camera_id}.avi", frame_index),
+            prepared_bgr,
             (camera.width, camera.height), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB)
         depth = depth[:camera.height, :camera.width]
         mask = mask[:depth.shape[0], :depth.shape[1]]
@@ -831,6 +837,8 @@ def main() -> int:
                              "depends on the frame; building them is most of a single run's "
                              "fixed cost.")
     parser.add_argument("--object", default="blue_plastic_box")
+    parser.add_argument("--joint", type=Path, default=None,
+                        help="Explicit articulation file, including part paths; otherwise uses mesh_new/OBJECT.")
     parser.add_argument(
         "--output-root", type=Path, default=None,
         help=("Root for frame_<index>/hybrid outputs. Depth is still read from "
@@ -952,7 +960,8 @@ def main() -> int:
         import mycpp
         estimater_module.mycpp = mycpp
 
-    articulation = load_articulation(args.object)
+    articulation = (load_articulation_from_joint(args.joint) if args.joint is not None
+                    else load_articulation(args.object))
     full_cameras = load_cameras(args.capture_dir)
 
     joint_lo, joint_hi = _joint_bounds(articulation, args)

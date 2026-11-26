@@ -113,6 +113,10 @@ def _overlay_sheet(path: Path, images_dir: Path, masks: dict[str, np.ndarray],
                       & (uv[:, 1] >= 0) & (uv[:, 1] < camera.height))
             image[uv[inside, 1], uv[inside, 0]] = colour
         tiles.append(image)
+    if not tiles:
+        raise ValueError('Cannot render overlay sheet without a usable view')
+    while len(tiles) < columns * rows:
+        tiles.append(np.zeros_like(tiles[0]))
     grid = np.vstack([np.hstack(tiles[i * columns:(i + 1) * columns]) for i in range(rows)])
     cv2.imwrite(str(path), grid)
 

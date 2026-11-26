@@ -72,7 +72,7 @@ def main() -> int:
     parser.add_argument("--joint-value-npy", type=Path, required=True)
     parser.add_argument("--joint-json", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--source", default="external articulated ground truth")
+    parser.add_argument("--source", default="externally supplied articulated state; accuracy unverified")
     args = parser.parse_args()
 
     if args.frame_index < 0:
