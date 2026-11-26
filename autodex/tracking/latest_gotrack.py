@@ -172,6 +172,27 @@ def adapter_config(root, args, views):
                observer_compile=args.observer_compile)
     # IRLS tables must fit the rig, including rigs with more than four cameras.
     cfg.update(infoform_gpu_v_pad=views, infoform_gpu_a_pad=max(256, args.num_anchors))
+    official_override = getattr(args, "official_config", None)
+    if official_override:
+        path = Path(official_override).expanduser().resolve()
+        # Copy the resolved experiment input into its output. Never edit the
+        # pinned runtime's shared config; later comparisons must be reproducible.
+        raw = json.loads(path.read_text())
+        snapshot = Path(args.output_root).resolve() / "official_config_resolved.json"
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        write_json(snapshot, raw)
+        cfg.update(official_config_path=str(snapshot),
+                   official_config_sha256=hashlib.sha256(snapshot.read_bytes()).hexdigest())
+    return cfg
+
+
+def joint_observation_overrides(args):
+    """Per-run articulated overrides; absence preserves upstream defaults."""
+    cfg = {}
+    if getattr(args, "joint_residual_ratio", None) is not None:
+        cfg["theta_residual_ratio"] = args.joint_residual_ratio
+    if getattr(args, "min_moving_anchors", None) is not None:
+        cfg["min_moving_anchors"] = args.min_moving_anchors
     return cfg
 
 
@@ -253,6 +274,14 @@ def run_capture(args):
                        articulated_num_anchors=args.num_anchors, init_joint_value=float(initial_joint),
                        articulated_anchor_bank_path=args.anchor_bank_path, joint_anchors=anchors,
                        joint_extrapolate_max=float(np.radians(degree_cap or 0) if hinge else (metre_cap or 0)))
+            # Optional per-run observation gates, not changes to the runtime or
+            # its defaults. Rigid trackers never consume these parameters.
+            cfg.update(joint_observation_overrides(args))
+            step_cap = getattr(args, "max_joint_step_deg", None)
+            if step_cap is not None:
+                if not hinge:
+                    raise ValueError("--max-joint-step-deg requires a revolute joint")
+                cfg["max_joint_step_deg"] = float(step_cap)
         registration = create(output / "registration.json", "capture runtime migration",
                               dict(config=cfg, camera_ids=args.camera_ids, frame_indices=indices,
                                    mesh=str(Path(args.mesh_path).resolve()), init_pose=prior.tolist(),
@@ -264,12 +293,19 @@ def run_capture(args):
                                            root / "utils/renderer_nvdiffrast.py",
                                            root / "utils/anchor_bank.py", root / "utils/anchor_tracking.py",
                                            root / "utils/multiview_geometry.py") if p.is_file()},
-                                   bridge_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()))
+                                   bridge_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                                   joint_step_guard_sha256=(hashlib.sha256(
+                                       Path(__file__).with_name("joint_step_guard.py").read_bytes()).hexdigest()
+                                       if cfg.get("max_joint_step_deg") is not None else None)))
         write_json(output / "adapter_config.json", cfg)
         with working_directory(root):
             adapter = adapter_cls(cfg)
             t = time.perf_counter()
             adapter.initialize(1, Path(args.mesh_path), reader.K, reader.T_c_w)
+            if articulated and getattr(args, "max_joint_step_deg", None) is not None:
+                from autodex.tracking.joint_step_guard import JointStepGuard
+                adapter._fusion_backend = JointStepGuard(
+                    adapter._fusion_backend, adapter, np.radians(args.max_joint_step_deg))
             initialize_sec = time.perf_counter() - t
             bank = adapter._anchor_cache[1]
             # The upstream producer bank has no mesh-face/barycentric fields.

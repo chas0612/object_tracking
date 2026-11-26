@@ -19,6 +19,10 @@ usage() {
     echo "         --direction both|forward|reverse   (default: both)"
     echo "         --cameras all|\"ID ID ...\"   (default: the built-in twelve)"
     echo "         --input-resize-scale N --camera-micro-batch-size N"
+    echo "         --joint-residual-ratio N --min-moving-anchors N (latest only)"
+    echo "                        optional joint observation gates; defaults remain unchanged."
+    echo "         --max-joint-step-deg N (latest only, opt-in revolute update rejection)"
+    echo "         --first-frame-num-iters N (latest only, default: 5)"
     echo "         --joint-anchors FILE   depth-measured joint values to pin at named"
     echo "                        frames (make_joint_anchors.py). Second pass only:"
     echo "                        it needs body poses from a completed run."
@@ -67,6 +71,10 @@ CAMERAS_ARG=""
 INPUT_RESIZE_SCALE=1.0
 CAMERA_MICRO_BATCH_SIZE=0
 TRACKER_BACKEND=latest
+JOINT_RESIDUAL_RATIO=""
+MIN_MOVING_ANCHORS=""
+MAX_JOINT_STEP_DEG=""
+FIRST_FRAME_NUM_ITERS=5
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --tracker-backend) TRACKER_BACKEND=$2; shift 2 ;;
@@ -94,10 +102,18 @@ while [[ $# -gt 0 ]]; do
         --cameras) CAMERAS_ARG=$2; shift 2 ;;
         --input-resize-scale) INPUT_RESIZE_SCALE=$2; shift 2 ;;
         --camera-micro-batch-size) CAMERA_MICRO_BATCH_SIZE=$2; shift 2 ;;
+        --joint-residual-ratio) JOINT_RESIDUAL_RATIO=$2; shift 2 ;;
+        --min-moving-anchors) MIN_MOVING_ANCHORS=$2; shift 2 ;;
+        --max-joint-step-deg) MAX_JOINT_STEP_DEG=$2; shift 2 ;;
+        --first-frame-num-iters) FIRST_FRAME_NUM_ITERS=$2; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+if [[ "$TRACKER_BACKEND" != latest && ( -n "$JOINT_RESIDUAL_RATIO" || -n "$MIN_MOVING_ANCHORS" || -n "$MAX_JOINT_STEP_DEG" || "$FIRST_FRAME_NUM_ITERS" != 5 ) ]]; then
+    echo "Joint observation gates and first-frame iterations require --tracker-backend latest" >&2
+    exit 2
+fi
 
 if [[ -z "$CAPTURE_DIR" || -z "$OBJECT" || -z "$SEED_FRAME" || -z "$RUN_NAME" ]]; then
     usage >&2
@@ -324,6 +340,9 @@ run_pass() {
     [[ -n "$THETA_EXTRAP" ]] && extrap+=(--theta-extrapolate-max-deg "$THETA_EXTRAP")
     [[ -n "$JOINT_EXTRAP" ]] && extrap+=(--joint-extrapolate-max "$JOINT_EXTRAP")
     [[ -n "$JOINT_ANCHORS" ]] && extrap+=(--joint-anchor-json "$JOINT_ANCHORS")
+    [[ -n "$JOINT_RESIDUAL_RATIO" ]] && extrap+=(--joint-residual-ratio "$JOINT_RESIDUAL_RATIO")
+    [[ -n "$MIN_MOVING_ANCHORS" ]] && extrap+=(--min-moving-anchors "$MIN_MOVING_ANCHORS")
+    [[ -n "$MAX_JOINT_STEP_DEG" ]] && extrap+=(--max-joint-step-deg "$MAX_JOINT_STEP_DEG")
     if [[ "$TRACKER_BACKEND" == latest ]]; then
         "$CONDA_BIN" run -n gotrack --no-capture-output python -u \
             "$REPO/src/process/run_gotrack_latest.py" \
@@ -334,6 +353,7 @@ run_pass() {
             --init-pose-source "$INIT" --anchor-bank-path "$BANK" \
             --articulation-json "$JOINT" --num-anchors 512 \
             --input-resize-scale "$INPUT_RESIZE_SCALE" \
+            --first-frame-num-iters "$FIRST_FRAME_NUM_ITERS" \
             --frame-order "$order" "${span[@]}" "${extrap[@]}" \
             --max-frames "$MAX_FRAMES" --camera-ids "${CAMERAS[@]}"
         return
