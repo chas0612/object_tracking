@@ -32,6 +32,7 @@ import socket
 import subprocess
 import sys
 import time
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -43,6 +44,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts import distribute_foundpose_gotrack as legacy
+from src.process.stereo_foundationpose_init_capture import (
+    BACKEND as STEREO_BACKEND,
+    add_scheduler_arguments,
+    scheduler_config,
+    stereo_init_command,
+)
 
 
 PHASES = ("mask", "foundpose", "gotrack", "debug")
@@ -74,7 +81,7 @@ def _paths(shared: Path, schedule: Path, task: dict[str, Any]) -> dict[str, Path
     return {
         "episode": episode,
         "mesh": shared / task["mesh_rel"],
-        "assets": shared / task["assets_rel"],
+        **({"assets": shared / task["assets_rel"]} if "assets_rel" in task else {}),
         "attempt": attempt,
         "frame": attempt / f"foundpose_frame_{frame_index:06d}",
         "init": attempt / "foundpose_init",
@@ -249,7 +256,19 @@ def _recovery_namespace(manifest: dict[str, Any]) -> SimpleNamespace:
     ):
         values[key] = manifest[key]
     values["inline_gotrack_undistort"] = True
+    if manifest.get("init_backend") == STEREO_BACKEND:
+        values["stereo_init_command"] = partial(stereo_init_command, manifest["stereo_init"])
     return SimpleNamespace(**values)
+
+
+def _stereo_options(manifest: dict[str, Any]) -> dict[str, Any]:
+    config = manifest["stereo_init"]
+    return {
+        "pairs": config["pairs"],
+        "runtime_root": Path(config["runtime_root"]).expanduser(),
+        "engine": Path(config["engine"]).expanduser() if config["engine"] else None,
+        "silhouette_iters": config["silhouette_iters"],
+    }
 
 
 def _run_phase_task(
@@ -293,24 +312,33 @@ def _run_phase_task(
                 from src.process.mask import process_episode_sam3_frame
 
                 prompts = task.get("sam3_prompts") or [task["source_object"].replace("_", " ")]
+                stereo = manifest.get("init_backend") == STEREO_BACKEND
+                minimum = max(2 if stereo else 1, int(manifest["min_sam3_mask_views"]))
                 success = False
                 with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
                     for prompt in prompts:
-                        done, _, _ = process_episode_sam3_frame(
+                        done, _, skipped = process_episode_sam3_frame(
                             seg=sam_segmentor,
                             capture_dir=paths["episode"],
                             prompt=prompt,
                             frame_index=int(task["init_frame_index"]),
                             output_dir=paths["frame"],
+                            serials=task.get("calibrated_camera_ids"),
                             video_dir=paths["episode"] / "videos",
                             undistort_frame=True,
                         )
                         task["sam3_prompt_used"] = prompt
-                        if done >= int(manifest["min_sam3_mask_views"]):
+                        if done + (skipped if stereo else 0) >= minimum:
                             success = True
                             break
                 if not success:
                     raise RuntimeError(f"SAM3 masks below minimum for prompts={prompts}")
+            elif phase == "foundpose" and manifest.get("init_backend") == STEREO_BACKEND:
+                from src.process.stereo_foundationpose_init_capture import initialize
+
+                with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+                    initialize(paths["episode"], paths["frame"], paths["mesh"], task["object_name"],
+                               paths["init"], int(task["init_frame_index"]), **_stereo_options(manifest))
             elif phase == "foundpose":
                 from src.process.foundpose_init_capture import main as foundpose_main
 
@@ -367,7 +395,7 @@ def _run_phase_task(
                     recovered = legacy._attempt_tail_recovery(
                         schedule_dir=schedule, task=task,
                         attempt_dir=paths["attempt"], episode=paths["episode"],
-                        mesh=paths["mesh"], assets=paths["assets"],
+                        mesh=paths["mesh"], assets=paths.get("assets"),
                         track_dir=paths["track"], gotrack=[sys.executable],
                         sam3=sam3_prefix,
                         prompts=task.get("sam3_prompts") or [task["source_object"].replace("_", " ")],
@@ -470,6 +498,7 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
     original_prompts = legacy._load_prompt_map(args.object_prompts_original_json)
     object_aliases = legacy._load_object_aliases(args.object_alias_json)
     object_episode_map = legacy._load_object_episode_map(args.object_episodes_json)
+    stereo = scheduler_config(args) if args.init_backend == STEREO_BACKEND else None
     discovery = SimpleNamespace(
         target_root_rel=args.target_root_rel,
         cache_root_rel=args.cache_root_rel,
@@ -486,6 +515,8 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
         init_frame_index=args.init_frame_index,
         object_prompts=object_prompts,
         object_prompts_original=original_prompts,
+        init_backend=args.init_backend,
+        stereo_pairs=stereo["pairs"] if stereo else (),
     )
     tasks, skipped = legacy._discover(shared, discovery)
     if args.dry_run:
@@ -509,6 +540,7 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
         "init_frame_index": args.init_frame_index,
         "reverse_stop_frame_index": args.reverse_stop_frame_index,
         "min_sam3_mask_views": args.min_sam3_mask_views,
+        "init_backend": args.init_backend,
         "foundpose_selection_mode": args.foundpose_selection_mode,
         "foundpose_candidate_rank": args.foundpose_candidate_rank,
         "foundpose_per_view_candidates": args.foundpose_per_view_candidates,
@@ -544,6 +576,8 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
         "skipped": skipped,
         "created_utc": legacy._now(),
     }
+    if stereo:
+        manifest["stereo_init"] = stereo
     _write(schedule / "manifest.json", manifest)
     for task in tasks:
         task.update({
@@ -674,13 +708,17 @@ def _launch(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
     if current["pending"] == 0 and not (args.retry_failed and current["failed"] > 0):
         print(f"[launch] phase={args.phase} has no runnable tasks: {current}", flush=True)
         return 0
+    manifest = _read(schedule / "manifest.json")
+    stereo = manifest.get("init_backend") == STEREO_BACKEND
     env_name = args.sam3_env if args.phase == "mask" else args.gotrack_env
     if args.phase == "foundpose":
+        if stereo:
+            env_name = manifest["stereo_init"]["env"]
         _prepare_foundpose_assignment(
             schedule,
             len(args.workers),
             args.retry_failed,
-            int(_read(schedule / "manifest.json")["max_attempts"]),
+            int(manifest["max_attempts"]),
         )
     for rank, spec in enumerate(args.workers):
         worker_id = legacy._safe_id(spec)
@@ -695,6 +733,8 @@ def _launch(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
         ]
         if args.retry_failed:
             common.append("--retry-failed")
+        if stereo:
+            common.extend(["--init-backend", STEREO_BACKEND])
         if spec == "local":
             command = [
                 str(Path.home() / "anaconda3/bin/conda"), "run",
@@ -811,6 +851,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--init-frame-index", type=int, default=30)
     parser.add_argument("--reverse-stop-frame-index", type=int, default=0)
     parser.add_argument("--min-sam3-mask-views", type=int, default=1)
+    add_scheduler_arguments(parser)
     parser.add_argument("--foundpose-selection-mode", choices=("silhouette", "consensus", "hybrid", "global"), default="silhouette")
     parser.add_argument("--foundpose-candidate-rank", type=int, default=0)
     parser.add_argument("--foundpose-per-view-candidates", type=int, default=5)

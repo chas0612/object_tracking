@@ -88,6 +88,7 @@ def _video_paths_by_stem(videos_dir: Path) -> dict[str, Path]:
 
 def _eligible_cameras(
     videos_dir: Path, min_frames: int, excluded: set[str], max_duration_skew_sec: float,
+    *, calibrated: set[str] | None = None,
 ) -> tuple[list[str], dict[str, dict[str, float | int]], dict[str, str], float | None]:
     """Keep normal-length videos and reject timeline outliers across cameras.
 
@@ -105,6 +106,8 @@ def _eligible_cameras(
         frames, fps, duration = int(info["frames"]), float(info["fps"]), float(info["duration_sec"])
         if camera_id in excluded:
             rejected[camera_id] = "manual_exclude"
+        elif calibrated is not None and camera_id not in calibrated:
+            rejected[camera_id] = "missing_calibration"
         elif frames < min_frames:
             rejected[camera_id] = f"frames<{min_frames}"
         elif fps <= 0 or duration <= 0:
@@ -162,6 +165,7 @@ def _write_init_pose_jsons(
 
 def _stage_input(
     capture_dir: Path, video_dir: Path, stage_dir: Path, *, inline_undistort: bool,
+    camera_ids: list[str] | None = None,
 ) -> None:
     stage_dir.mkdir()
     for name in ("cam_param",):
@@ -176,6 +180,8 @@ def _stage_input(
         # Keep its interface stable while allowing source captures stored as MP4.
         staged_videos.mkdir()
         for camera_id, source in _video_paths_by_stem(video_dir).items():
+            if camera_ids is not None and camera_id not in camera_ids:
+                continue
             (staged_videos / f"{camera_id}.avi").symlink_to(source.resolve())
     else:
         staged_videos.symlink_to(video_dir.resolve(), target_is_directory=True)
@@ -327,7 +333,7 @@ def parse_args() -> argparse.Namespace:
               "intermediate undistorted AVI; --video-dir must then point to raw videos/."),
     )
     parser.add_argument("--mesh", required=True, help="Object mesh in meters.")
-    parser.add_argument("--init-pose", required=True, help="FoundPose init_pose_world.npy.")
+    parser.add_argument("--init-pose", required=True, help="World-frame object pose (.npy, 4x4 or 3x4).")
     parser.add_argument("--init-frame-index", type=int, default=30,
                         help="Video frame represented by --init-pose. Default 30 avoids known stale frame-0 captures.")
     parser.add_argument("--reverse-stop-frame-index", type=int, default=0,
@@ -403,8 +409,11 @@ def main() -> int:
 
     pose = _as_pose_4x4(init_pose_path)
     excluded = set(args.exclude_cameras)
+    calibration_dir = capture_dir / "cam_param"
+    calibrated = set(json.loads((calibration_dir / "intrinsics.json").read_text(encoding="utf-8")))
+    calibrated &= set(json.loads((calibration_dir / "extrinsics.json").read_text(encoding="utf-8")))
     eligible, video_timings, rejected_cameras, median_duration = _eligible_cameras(
-        video_dir, args.min_video_frames, excluded, args.max_video_duration_skew_sec,
+        video_dir, args.min_video_frames, excluded, args.max_video_duration_skew_sec, calibrated=calibrated,
     )
     requested = list(args.camera_ids) if args.camera_ids else None
     if requested:
@@ -413,6 +422,8 @@ def main() -> int:
         if rejected:
             raise ValueError(f"Requested cameras are excluded, missing, short, or duration outliers: {rejected}")
     else:
+        if not eligible:
+            raise RuntimeError(f"No eligible calibrated cameras: {rejected_cameras}")
         if len(eligible) < args.num_cameras:
             if not args.allow_fewer_cameras:
                 raise RuntimeError(f"Only {len(eligible)} eligible cameras, need {args.num_cameras}: {eligible}; rejected={rejected_cameras}")
@@ -458,7 +469,7 @@ def main() -> int:
     final_records = output_dir / "gotrack_output" / args.object_name / "world_pose_records.json"
     _stage_input(
         capture_dir, video_dir, forward_stage_dir,
-        inline_undistort=bool(args.inline_undistort),
+        inline_undistort=bool(args.inline_undistort), camera_ids=selected,
     )
     _write_init_pose_jsons(forward_init_dir, selected, pose, args.init_frame_index)
 
@@ -522,7 +533,7 @@ def main() -> int:
                   f"{args.reverse_stop_frame_index}..{args.init_frame_index}", flush=True)
             _stage_input(
                 capture_dir, video_dir, reverse_stage_dir,
-                inline_undistort=bool(args.inline_undistort),
+                inline_undistort=bool(args.inline_undistort), camera_ids=selected,
             )
             _write_init_pose_jsons(reverse_init_dir, selected, pose, args.init_frame_index)
             reverse_cmd = track_common + [

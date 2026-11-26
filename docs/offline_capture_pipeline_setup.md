@@ -456,6 +456,10 @@ worker는 shared-storage atomic claim으로 episode 하나씩만 점유하며, �
 순서대로 실행한다: undistort → SAM3 frame-30 mask → FoundPose init → GoTrack
 정방향+역방향 병합. `--init-frame-index`로 seed를 바꿀 수 있다.
 
+새 메시의 온보딩을 생략하려면 queue 생성 시 `--init-backend stereo_foundationpose`를 선택한다.
+기존 episode 단위 worker도 stereo 초기화와 GoTrack을 순서대로 실행한다. 최대 4쌍 설정과
+워커별 모델 위치는 [stereo 초기화 설정](phased_foundpose_gotrack_pipeline.md#stereo-initialization-for-meshes-without-foundpose-assets)을 참고한다.
+
 `completed`는 더 이상 pose 하나만 있어도 되지 않는다. 기본적으로 valid pose coverage가
 50% 이상이고 마지막 missing 구간이 30 frame 이하여야 한다. 그보다 심한 중단은
 곧바로 task 전체 재시도로 넘기기 전에 기본 tail recovery를 시도한다. 반면 pose가 전 frame에

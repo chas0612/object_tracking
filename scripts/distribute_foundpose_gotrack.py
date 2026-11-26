@@ -38,6 +38,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,15 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from src.process.stereo_foundationpose_init_capture import (
+    BACKEND as STEREO_BACKEND,
+    add_scheduler_arguments,
+    load_calibration,
+    scheduler_config,
+    stereo_init_command,
+)
+
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -203,12 +213,14 @@ def _load_object_aliases(path_value: str | None) -> dict[str, str]:
     return payload
 
 
-def _prompt_candidates(object_name: str, args: argparse.Namespace) -> list[str]:
+def _prompt_candidates(object_name: str, args: argparse.Namespace, canonical: str | None = None) -> list[str]:
     """Prefer curated SAM3 text, then broad original text, then object name."""
     candidates = [
         args.object_prompts.get(object_name),
+        args.object_prompts.get(canonical) if canonical else None,
         args.object_prompts_original.get(object_name),
-        object_name.replace("_", " "),
+        args.object_prompts_original.get(canonical) if canonical else None,
+        (canonical or object_name).replace("_", " "),
     ]
     return list(dict.fromkeys(prompt for prompt in candidates if prompt))
 
@@ -222,7 +234,8 @@ def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[st
         mesh_roots.append(fallback_mesh_root)
     if not target_root.is_dir():
         raise FileNotFoundError(f"Target root is missing: {target_root}")
-    if not cache_root.is_dir():
+    stereo_init = getattr(args, "init_backend", "foundpose") == STEREO_BACKEND
+    if not stereo_init and not cache_root.is_dir():
         raise FileNotFoundError(f"Cache campaign root is missing: {cache_root}")
     objects = set(args.objects or [])
     episodes = set(args.episodes or [])
@@ -282,19 +295,34 @@ def _discover(shared_root: Path, args: argparse.Namespace) -> tuple[list[dict[st
             searched = ", ".join(str(root / object_name) for root in mesh_roots)
             skipped.append(f"{rel}: no unambiguous mesh under {searched}")
             continue
-        repre = _cache_repre(cache_root, object_name)
-        if not repre.is_file():
-            skipped.append(f"{rel}: FoundPose cache missing ({repre})")
-            continue
+        if stereo_init:
+            try:
+                intrinsic, extrinsic = load_calibration(episode_dir)
+            except (OSError, ValueError) as exc:
+                skipped.append(f"{rel}: could not read camera calibration ({exc})")
+                continue
+            video_ids = {file.stem for file in input_dir.iterdir()
+                         if file.suffix.lower() in {".avi", ".mp4", ".mov", ".mkv"}}
+            cameras = set(intrinsic) & set(extrinsic) & video_ids
+            if not any(set(pair) <= cameras for pair in args.stereo_pairs):
+                skipped.append(f"{rel}: no stereo pair with both videos and calibrations")
+                continue
+            cache_fields = {"calibrated_camera_ids": sorted(cameras)}
+        else:
+            repre = _cache_repre(cache_root, object_name)
+            if not repre.is_file():
+                skipped.append(f"{rel}: FoundPose cache missing ({repre})")
+                continue
+            cache_fields = {"assets_rel": str(repre.parents[4].relative_to(shared_root)),
+                            "cache_repre_rel": str(repre.relative_to(shared_root))}
         task_id = _safe_id(rel.as_posix())
         tasks.append({
             "task_id": task_id, "robot": robot_path, "object_name": object_name,
             "source_object": source_object, "episode": episode,
             "episode_rel": str(episode_dir.relative_to(shared_root)),
             "mesh_rel": str(mesh.relative_to(shared_root)),
-            "assets_rel": str(repre.parents[4].relative_to(shared_root)),
-            "cache_repre_rel": str(repre.relative_to(shared_root)),
-            "sam3_prompts": _prompt_candidates(source_object, args),
+            **cache_fields,
+            "sam3_prompts": _prompt_candidates(source_object, args, object_name if stereo_init else None),
             "static_images": bool(args.static_images),
             "init_frame_index": int(
                 args.init_frame_map.get(episode, args.init_frame_index)
@@ -463,10 +491,10 @@ def _gotrack_video_args(episode: Path, inline_undistort: bool) -> list[str]:
 
 def _attempt_tail_recovery(
     *, schedule_dir: Path, task: dict[str, Any], attempt_dir: Path, episode: Path,
-    mesh: Path, assets: Path, track_dir: Path, gotrack: list[str], sam3: list[str],
+    mesh: Path, assets: Path | None, track_dir: Path, gotrack: list[str], sam3: list[str],
     prompts: list[str], args: argparse.Namespace, log: Any,
 ) -> bool:
-    """Try late SAM3/FoundPose seeds, then run one validated reverse bridge."""
+    """Try late initialization seeds, then run one validated reverse bridge."""
     from autodex.tracking.tail_recovery import (
         assess_tail_recovery,
         descending_seed_frames,
@@ -486,6 +514,7 @@ def _attempt_tail_recovery(
     primary_manifest = _read_json(primary_manifest_path) if primary_manifest_path.is_file() else {}
     selected = [str(value) for value in primary_manifest.get("selected_cameras", [])]
     timings = primary_manifest.get("video_timings", {})
+    stereo_init_command = getattr(args, "stereo_init_command", None)
     common_last = min(
         (int(timings[camera]["frames"]) - 1 for camera in selected
          if camera in timings and int(timings[camera].get("frames", 0)) > 0),
@@ -529,9 +558,10 @@ def _attempt_tail_recovery(
                 "src/process/mask.py", "--capture_dir", str(episode),
                 "--frame-index", str(seed_frame), "--prompt", prompt,
                 "--frame-output-dir", str(frame_dir),
-            ] + _mask_video_args(episode, args.inline_gotrack_undistort)
-            if selected:
-                mask_command += ["--serials", *selected]
+            ] + _mask_video_args(episode, args.inline_gotrack_undistort or stereo_init_command is not None)
+            mask_cameras = task.get("calibrated_camera_ids", []) if stereo_init_command else selected
+            if mask_cameras:
+                mask_command += ["--serials", *mask_cameras]
             try:
                 _run_command(mask_command, log, REPO_ROOT)
             except subprocess.CalledProcessError as exc:
@@ -546,29 +576,34 @@ def _attempt_tail_recovery(
                 prompt_info["status"] = "insufficient_masks"
                 _atomic_json(manifest_path, recovery_manifest)
                 continue
-            try:
-                _run_command(_foundpose_command(
+            if stereo_init_command:
+                init_command = stereo_init_command(episode, frame_dir, mesh, task["object_name"], init_dir, seed_frame)
+            else:
+                init_command = _foundpose_command(
                     gotrack, capture=episode, frame_dir=frame_dir, mesh=mesh,
                     object_name=task["object_name"], assets=assets,
                     output_dir=init_dir, args=args,
-                ), log, REPO_ROOT)
+                )
+            init_label = "stereo" if stereo_init_command else "foundpose"
+            try:
+                _run_command(init_command, log, REPO_ROOT)
             except subprocess.CalledProcessError as exc:
-                prompt_info.update({"status": "foundpose_failed", "returncode": exc.returncode})
+                prompt_info.update({"status": f"{init_label}_failed", "returncode": exc.returncode})
                 _atomic_json(manifest_path, recovery_manifest)
                 continue
             result_path = init_dir / "result.json"
             result = _read_json(result_path) if result_path.is_file() else {}
-            foundpose_views = int(result.get("num_foundpose_candidates", 0))
-            min_foundpose_views = max(3, args.tail_recovery_min_mask_views // 2)
-            prompt_info["foundpose_views"] = foundpose_views
-            if foundpose_views < min_foundpose_views:
+            pose_views = int(result.get(f"num_{init_label}_candidates", 0))
+            min_pose_views = 1 if stereo_init_command else max(3, args.tail_recovery_min_mask_views // 2)
+            prompt_info[f"{init_label}_views"] = pose_views
+            if pose_views < min_pose_views:
                 prompt_info.update({
-                    "status": "insufficient_foundpose_views",
-                    "min_foundpose_views": min_foundpose_views,
+                    "status": f"insufficient_{init_label}_views",
+                    f"min_{init_label}_views": min_pose_views,
                 })
                 _atomic_json(manifest_path, recovery_manifest)
                 continue
-            prompt_info["status"] = "foundpose_succeeded"
+            prompt_info["status"] = f"{init_label}_succeeded"
             chosen = (seed_frame, init_dir, prompt)
             _atomic_json(manifest_path, recovery_manifest)
             break
@@ -576,7 +611,8 @@ def _attempt_tail_recovery(
             break
 
     if chosen is None:
-        recovery_manifest.update({"status": "failed", "reason": "no_late_foundpose_seed"})
+        reason = "no_late_stereo_seed" if stereo_init_command else "no_late_foundpose_seed"
+        recovery_manifest.update({"status": "failed", "reason": reason})
         _atomic_json(manifest_path, recovery_manifest)
         return False
 
@@ -655,7 +691,8 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
     if not static_images:
         _assert_episode_write_isolated(shared, episode, args.protected_root_rel)
     mesh = shared / task["mesh_rel"]
-    assets = shared / task["assets_rel"]
+    assets = shared / task["assets_rel"] if "assets_rel" in task else None
+    stereo_command = getattr(args, "stereo_init_command", None)
     attempt = int(task["attempts"])
     attempt_dir = (
         schedule_dir / "outputs" / task["task_id"] / f"attempt_{attempt:02d}"
@@ -719,6 +756,7 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                 _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
                 task["sam3_attempted_prompts"] = []
                 masks_available = False
+                min_masks = max(2, args.min_sam3_mask_views) if stereo_command else args.min_sam3_mask_views
                 for prompt in prompts:
                     task["sam3_prompt_current"] = prompt
                     task["sam3_attempted_prompts"].append(prompt)
@@ -729,17 +767,19 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                     ]
                     if static_images:
                         mask_command += ["--static-image-dir", str(episode / "raw/images")]
-                    elif args.foundpose_init_only or args.inline_gotrack_undistort:
+                    elif stereo_command or args.foundpose_init_only or args.inline_gotrack_undistort:
                         mask_command += ["--frame-index", str(init_frame_index),
                                          *_mask_video_args(episode, True)]
                     else:
                         mask_command += ["--frame-index", str(init_frame_index),
                                          "--video-dir", str(episode / "undistorted_video")]
+                    if stereo_command:
+                        mask_command += ["--serials", *task["calibrated_camera_ids"]]
                     _run_command(mask_command, log, REPO_ROOT)
                     metadata_path = frame_dir / "metadata.json"
                     metadata = _read_json(metadata_path) if metadata_path.is_file() else {}
                     mask_count = int(metadata.get("masks_written", 0)) + int(metadata.get("masks_skipped", 0))
-                    masks_available = mask_count >= args.min_sam3_mask_views
+                    masks_available = mask_count >= min_masks
                     if masks_available:
                         task["sam3_prompt_used"] = prompt
                         break
@@ -747,16 +787,20 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                     log.flush()
                 if not masks_available:
                     raise RuntimeError(
-                        f"SAM3 produced fewer than {args.min_sam3_mask_views} mask views "
+                        f"SAM3 produced fewer than {min_masks} mask views "
                         f"with prompts: {prompts}"
                     )
                 task["phase"] = "foundpose"
                 _atomic_json(_task_path(schedule_dir, task["task_id"]), task)
-                _run_command(_foundpose_command(
-                    gotrack, capture=episode, frame_dir=frame_dir, mesh=mesh,
-                    object_name=task["object_name"], assets=assets,
-                    output_dir=init_dir, args=args,
-                ), log, REPO_ROOT)
+                if stereo_command:
+                    command = stereo_command(episode, frame_dir, mesh, task["object_name"], init_dir, init_frame_index)
+                else:
+                    command = _foundpose_command(
+                        gotrack, capture=episode, frame_dir=frame_dir, mesh=mesh,
+                        object_name=task["object_name"], assets=assets,
+                        output_dir=init_dir, args=args,
+                    )
+                _run_command(command, log, REPO_ROOT)
             if args.foundpose_init_only:
                 result_path = init_dir / "result.json"
                 result = _read_json(result_path) if result_path.is_file() else {}
@@ -767,6 +811,8 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                     ),
                     "num_input_views": result.get("num_input_views"),
                     "num_foundpose_candidates": result.get("num_foundpose_candidates"),
+                    "num_stereo_candidates": result.get("num_stereo_candidates"),
+                    "init_backend": result.get("init_backend", "foundpose"),
                     "global_asymmetry_forced": result.get("global_asymmetry_forced"),
                     "global_asymmetry_detected": result.get("global_asymmetry_detected"),
                     "global_asymmetry_applied": result.get("global_asymmetry_applied"),
@@ -778,7 +824,7 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
                     np.savez_compressed(pose_path, frame_0=pose)
                     task["static_pose_rel"] = str(pose_path.relative_to(shared))
                 task.update({"status": "completed", "reason": None})
-                log.write("[init-only] FoundPose candidate generation completed; skipping GoTrack.\n")
+                log.write("[init-only] Initial pose saved.\n")
                 log.flush()
                 return task
             task["phase"] = "gotrack"
@@ -855,6 +901,11 @@ def _run_task(schedule_dir: Path, task: dict[str, Any], args: argparse.Namespace
 
 
 def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
+    stereo = scheduler_config(args) if args.init_backend == STEREO_BACKEND else None
+    if stereo:
+        if args.static_images:
+            raise ValueError("Stereo initialization requires video episodes; --static-images is unsupported.")
+        args.stereo_pairs = stereo["pairs"]
     tasks, skipped = _discover(shared, args)
     if args.init_frame_map:
         missing_frames = [
@@ -965,6 +1016,8 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
                                                 "reuse_foundpose_schedule_id": args.reuse_foundpose_schedule_id,
                                                 "static_images": args.static_images,
                                                 "inline_gotrack_undistort": args.inline_gotrack_undistort,
+                                                "init_backend": args.init_backend,
+                                                **({"stereo_init": stereo} if stereo else {}),
                                                 "object_aliases": args.object_aliases,
                                                 "debug_sheets": args.debug_sheets,
                                                 "debug_sheet_max_cameras": args.debug_sheet_max_cameras,
@@ -990,6 +1043,12 @@ def _init(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
 
 
 def _worker(args: argparse.Namespace, shared: Path, schedule: Path) -> int:
+    manifest = _read_json(schedule / "manifest.json")
+    if manifest.get("init_backend") == STEREO_BACKEND:
+        args.stereo_init_command = partial(
+            stereo_init_command, manifest["stereo_init"],
+            conda="conda" if args.local_worker else None,
+        )
     worker_id = args.worker_id or socket.gethostname()
     _atomic_json(schedule / "workers" / f"{_safe_id(worker_id)}.json", {"worker_id": worker_id, "status": "running", "started_utc": _now()})
     done = failed = 0
@@ -1105,6 +1164,9 @@ def _launch(args: argparse.Namespace, schedule: Path) -> int:
                    "--max-frames", str(args.max_frames), "--max-attempts", str(args.max_attempts)]
         for protected_root_rel in args.protected_root_rel:
             command.extend(["--protected-root-rel", protected_root_rel])
+        if manifest.get("init_backend") == STEREO_BACKEND:
+            # Older worker code rejects this flag instead of consuming stereo tasks.
+            command.extend(["--init-backend", STEREO_BACKEND])
         command.append("--debug-sheets" if args.debug_sheets else "--no-debug-sheets")
         command.append("--tail-recovery" if args.tail_recovery else "--no-tail-recovery")
         command.append(
@@ -1205,6 +1267,7 @@ def main() -> int:
     p.add_argument("--workers", nargs="+", default=None); p.add_argument("--worker-id", default=None)
     p.add_argument("--remote-repo-rel", default="object_tracking"); p.add_argument("--connect-timeout", type=int, default=10)
     p.add_argument("--gotrack-env", default="gotrack"); p.add_argument("--sam3-env", default="sam3")
+    add_scheduler_arguments(p)
     p.add_argument("--object-prompts-json", default=str(Path.home() / "sam3/object_prompts.json"),
                    help="Curated object-to-SAM3-prompt JSON. Missing file is allowed.")
     p.add_argument("--object-prompts-original-json", default=str(Path.home() / "sam3/object_prompts_original.json"),
@@ -1247,7 +1310,7 @@ def main() -> int:
     p.add_argument("--foundpose-global-dino-score-margin", type=float, default=0.02)
     p.add_argument("--foundpose-global-dino-inlier-threshold-px", type=float, default=10.0)
     p.add_argument("--foundpose-init-only", action="store_true",
-                   help="Stop after SAM3 + FoundPose candidate generation; skip GoTrack and debug sheets.")
+                   help="Stop after SAM3 and initial pose estimation; skip GoTrack and debug sheets.")
     p.add_argument(
         "--inline-gotrack-undistort", action=argparse.BooleanOptionalAction, default=True,
         help=("Use raw videos for init-frame extraction and remap decoded GoTrack frames "

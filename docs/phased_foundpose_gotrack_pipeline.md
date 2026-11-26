@@ -75,8 +75,63 @@ python -u scripts/distribute_foundpose_gotrack_phased.py \
 
 Primary GoTrack completeness checks and tail recovery retain the legacy
 pipeline's thresholds. Tail recovery is exceptional and deliberately uses
-isolated SAM3/FoundPose subprocesses rather than keeping those earlier phase
-models resident during the GoTrack phase.
+isolated SAM3 and initialization subprocesses during the GoTrack phase.
+
+## Stereo initialization for meshes without FoundPose assets
+
+Select `--init-backend stereo_foundationpose` when creating the schedule.
+The `foundpose` phase name and `foundpose_init/` output layout are shared with
+existing schedules. The phase initializes directly from the metric mesh and
+does not require `foundpose_assets`, templates, or DINO. Tail recovery uses the
+same initialization backend saved in the schedule manifest.
+
+```bash
+python -u scripts/distribute_foundpose_gotrack_phased.py \
+  --mode init --schedule-id kist_stereo_blue_box_01 \
+  --target-root-rel capture/kist_worldmodel \
+  --objects blue_plastic_box --episodes 0 \
+  --init-backend stereo_foundationpose
+```
+
+Use `launch-all` or the same four phase launches as above. The stereo init
+phase defaults to the `object_6d` conda environment and reads the TensorRT
+FoundationStereo runtime from `~/object-6d-tracking` on each worker. The
+runtime checkout must provide `tracking/core/depth_estimator.py` and a CUDA
+compatible TensorRT plan at
+`thirdparty/FoundationStereo/pretrained_models/foundation_stereo.plan`.
+The initializer uses the `object_tracking` FoundationPose code. It looks for
+the two weight sets and a `mycpp` extension matching the worker's Python in
+that checkout, then uses the assets in the worker's `~/object-6d-tracking`
+installation when needed. The worker does not need extra links inside its repo.
+Override worker settings at queue creation with `--stereo-env`,
+`--stereo-runtime-root` and `--stereo-engine`. Quote home-relative overrides
+such as `'~/object-6d-tracking'` so each worker expands its own home directory.
+
+The episode-by-episode `scripts/distribute_foundpose_gotrack.py` scheduler
+accepts the same init options. Create the queue with `--mode init` and
+`--init-backend stereo_foundationpose`, then launch it with `--mode launch`
+and `--workers ...`. Worker processes read the stereo settings from the queue
+manifest. Each episode worker runs both initialization and tracking and needs
+both runtimes. With the phased scheduler, separate `--mode launch --phase ...`
+commands can assign different lists to `foundpose` and `gotrack` when only some
+workers have the pinned `MV-GoTrack-next` checkout and checkpoint.
+
+By default the scheduler considers the four rig stereo pairs. Repeat
+`--stereo-pair LEFT RIGHT` to supply a different ordered set of up to four
+pairs. A pair needs both videos, both camera calibrations and a SAM3 mask in
+the left view. Pairs with different encoded frame counts or FPS are skipped,
+since same-index frames cannot be assumed aligned. SAM3, multiview silhouette
+refinement and GoTrack may use calibrated cameras outside the stereo pairs.
+On KIST, the two uncalibrated ego cameras are excluded and three rig pairs
+remain on episodes with matching video timelines.
+
+Each pair contributes one world-frame FoundationPose proposal. The init step
+ranks proposals by trimmed multiview silhouette IoU and refines the best
+proposal (also the runner-up when the initial robust IoUs differ by at most
+0.03). `--stereo-silhouette-iters` controls the iteration count, which defaults
+to 60. The selected `init_pose_world.npy`, pre-refinement pose, candidate bank
+and pair diagnostics are saved in `foundpose_init/`. Numbered capture folders
+can be matched to their mesh and SAM3 prompt with `--object-alias-json`.
 
 ## Inline undistortion
 
