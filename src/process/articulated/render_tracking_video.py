@@ -16,7 +16,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent))
 from common import load_articulation, load_articulation_from_joint, load_cameras  # noqa: E402
 from render_overlay import mesh_overlay  # noqa: E402
-from make_synthetic import _scene  # noqa: E402
+from make_synthetic import _scene, _render  # noqa: E402
 
 
 DEFAULT_VIEWS = ["25452066", "22641023", "23263775", "23028333"]
@@ -45,6 +45,8 @@ def main() -> int:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--include-held-poses", action="store_true",
                         help="Keep finite fallback poses, visibly labelled, to preserve source frame alignment.")
+    parser.add_argument('--review-json',type=Path,default=None,
+                        help='Per-source-frame RGB edge/mesh contour support diagnostics, not ground-truth validation.')
     args = parser.parse_args()
 
     if not args.views:
@@ -130,6 +132,7 @@ def main() -> int:
     if not writer.isOpened():
         raise RuntimeError(f"Cannot create {args.output}")
 
+    review=[]
     try:
         for row in tqdm(records, desc="articulated reprojection"):
             frame_index = int(row["frame_index"])
@@ -138,6 +141,8 @@ def main() -> int:
             frame_scene = _scene(articulation, pose, theta)
             inline_images = (inline_reader.read(frame_index) if inline_reader is not None else None)
             panels = []
+            diagnostic=dict(frame_index=frame_index,status=row.get('status'),fit_status=row.get('fit_status'),
+                joint_observed=row.get('theta_observed'),body_flow_supported=row.get('health',{}).get('body_flow_bootstrap'),views={})
             for view_index, camera_id in enumerate(args.views):
                 if inline_images is not None:
                     image = cv2.cvtColor(inline_images[view_index], cv2.COLOR_RGB2BGR)
@@ -162,8 +167,26 @@ def main() -> int:
                         image = cv2.resize(image, (camera.width, camera.height),
                                            interpolation=cv2.INTER_AREA)
                         image = cv2.undistort(image, camera.K, distortion, None, camera.K)
+                rendered=None
+                if args.review_json is not None:
+                    rendered=_render(frame_scene,camera)
+                    review_image = image
+                    if image.shape[:2] != (camera.height, camera.width):
+                        review_image = cv2.resize(image, (camera.width, camera.height),
+                                                  interpolation=cv2.INTER_AREA)
+                    gray = cv2.cvtColor(review_image, cv2.COLOR_BGR2GRAY)
+                    edges=cv2.Canny(gray,40,100)
+                    distance=cv2.distanceTransform(255-edges,cv2.DIST_L2,3)
+                    view_metrics={}
+                    for part,name in [(0,'body'),(1,'moving')]:
+                        mask=(rendered['parts']==part).astype('uint8')
+                        boundary=cv2.morphologyEx(mask,cv2.MORPH_GRADIENT,np.ones((3,3),np.uint8)).astype(bool)
+                        d=distance[boundary]
+                        view_metrics[name]=dict(boundary_pixels=len(d),median_edge_distance_px=float(np.median(d)) if len(d) else None,
+                            edge_support_within_2px=float(np.mean(d<=2)) if len(d) else None)
+                    diagnostic['views'][camera_id]=view_metrics
                 panel = mesh_overlay(image, camera, articulation,
-                                     pose, theta, crop=False, scene=frame_scene)
+                                     pose, theta, crop=False, scene=frame_scene,rendered=rendered)
                 if panel.shape[1] != tile_w or panel.shape[0] != tile_h:
                     panel = cv2.resize(panel, (tile_w, tile_h))
                 cv2.putText(panel, f"{camera_id}  f{frame_index}", (8, 24),
@@ -180,12 +203,19 @@ def main() -> int:
             grid_rows = [np.hstack(panels[start:start + columns])
                          for start in range(0, len(panels), columns)]
             writer.write(np.vstack(grid_rows))
+            if args.review_json is not None:review.append(diagnostic)
     finally:
         writer.release()
         for capture in captures.values():
             capture.release()
         if inline_reader is not None:
             inline_reader.close()
+
+    if args.review_json is not None:
+        args.review_json.parent.mkdir(parents=True,exist_ok=True)
+        args.review_json.write_text(json.dumps(dict(diagnostic_only=True,
+            caution='Every rendered frame checked against real RGB edges; occlusion/background edges can cause false scores. Visual review still required.',
+            frames=review),indent=2,allow_nan=False)+'\n')
 
     print(f"wrote {len(records)} frames to {args.output}", flush=True)
     return 0

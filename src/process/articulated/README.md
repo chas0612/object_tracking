@@ -123,6 +123,11 @@ Joint limits still come from the joint file. A wrong end-for-end initial seed
 cannot be repaired merely by smoothing the trajectory: check the rendered joint
 origin against the physical hinge/spring before accepting a long run.
 
+For full-frame review, `render_tracking_video.py --include-held-poses` retains
+finite fallback rows and labels held coordinates/status instead of dropping
+their source frames. `--review-json FILE` adds contour-to-RGB-edge diagnostics
+for every encoded frame. Background edges and occlusion can fool those scores;
+use them to select review frames, not to automatically declare tracking success.
 Reported `mean_step_ms` excludes decode/remap/resize and the bootstrap proposal;
 `wall_sec` includes those costs.
 
